@@ -241,6 +241,8 @@ test('ToolSearch: select: loads exact names and reports the ones it cannot', asy
   const all = search(MCP);
   const everything = await all.run({ query: `SELECT: ${MCP.map((t) => t.name.toUpperCase()).join(',')}`, max_results: 1 });
   assert.equal(resultNames(everything.content).length, MCP.length);
+  const spaced = await search(MCP).run({ query: 'select: mcp__jira__search mcp__docs__find' });
+  assert.deepEqual(resultNames(spaced.content), ['mcp__jira__search', 'mcp__docs__find']);
   const short = await search(MCP).run({ query: 'select:post_message' });
   assert.deepEqual(resultNames(short.content), ['mcp__slack__post_message']);
   assert.match(short.content, /This tool is now available to call\./);

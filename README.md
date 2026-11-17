@@ -469,7 +469,11 @@ A turn should survive the ordinary failures of a long session. These follow what
 
 ## What is not here
 
-coco aims to match the day-to-day experience of Claude Code, not every feature. Not included: IDE extensions, a plugin marketplace, OS-level sandboxing of shell commands, vim key bindings, pasting images from the clipboard, and cloud or remote sessions. Windows works through a POSIX shell (WSL or Git Bash) and is less tested than Linux and macOS.
+coco aims to match the day-to-day experience of Claude Code, not every feature. [docs/PARITY.md](docs/PARITY.md) compares the two area by area: what matches, what is partial, and what is missing.
+
+The larger gaps: no OS-level sandboxing of shell commands, no `auto` permission mode, no nested or background subagents, no OAuth for remote MCP servers, no worktree sessions, no vim key bindings, custom key bindings or themes, no pasting images from the clipboard, and nothing that depends on Anthropic's cloud (web and remote sessions, IDE and browser extensions, plugins, scheduled tasks). Windows works through a POSIX shell (WSL or Git Bash) and is less tested than Linux and macOS.
+
+coco has been tested against a scripted model server, not against real models. Run `coco doctor --probe` to check yours.
 
 ## Development
 

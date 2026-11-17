@@ -189,7 +189,8 @@ export function toolSearchTool(getDeferred: () => Tool[], state: DeferralState):
       if (select) {
         const already: string[] = [];
         const unknown: string[] = [];
-        for (const wanted of query.slice(select[0].length).split(',').map((n) => n.trim()).filter(Boolean)) {
+        // Tool names contain no spaces, so names separated by spaces instead of commas are understood too.
+        for (const wanted of query.slice(select[0].length).split(/[,\s]+/).filter(Boolean)) {
           const tool = selectOne(deferred, wanted);
           if (tool) {
             if (!chosen.includes(tool)) chosen.push(tool);

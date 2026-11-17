@@ -192,12 +192,17 @@ export class App implements CommandIO {
     // Out of raw mode the terminal turns ctrl+c into a signal for us as well as for the editor.
     const ignore = (): void => {};
     process.on('SIGINT', ignore);
-    const status = await new Promise<number | null>((resolve) => {
-      const { shell, args } = shellPath();
-      const child = spawn(shell, args(`${editor} ${JSON.stringify(file)}`), { stdio: 'inherit', env: commandEnv() });
-      child.on('error', () => resolve(null));
-      child.on('close', (code) => resolve(code));
-    });
+    let status: number | null = null;
+    try {
+      status = await new Promise<number | null>((resolve) => {
+        const { shell, args } = shellPath();
+        const child = spawn(shell, args(`${editor} ${JSON.stringify(file)}`), { stdio: 'inherit', env: commandEnv() });
+        child.on('error', () => resolve(null));
+        child.on('close', (code) => resolve(code));
+      });
+    } catch {
+      // it could not even be started; the terminal still has to be taken back
+    }
     process.off('SIGINT', ignore);
     this.lent = false;
     if (this.exiting) return status;
