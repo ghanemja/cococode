@@ -375,7 +375,10 @@ function fakeRuntime(overrides: Partial<RuntimeHandle> = {}): RuntimeHandle & { 
       { name: 'explore', description: 'search' },
     ],
     skills: () => [{ name: 'deploy', description: 'ship it' }],
-    loadSkill: (name: string) => (name.toLowerCase() === 'deploy' ? { name: 'deploy', description: 'ship it', baseDir: '/skills/deploy', body: '\nRun the deploy script.\n' } : undefined),
+    invokeSkill: async (name: string, args: string) =>
+      name.toLowerCase() === 'deploy'
+        ? { name: 'deploy', baseDir: '/skills/deploy', content: renderSkill('deploy', '/skills/deploy', `\nRun the deploy script.\n${args.trim() ? `\nARGUMENTS: ${args.trim()}` : ''}`) }
+        : undefined,
     todosChanged: () => {
       runtime.todoChanges++;
     },
@@ -575,15 +578,26 @@ describe('Skill', () => {
     const res = await skillTool.execute({ skill: 'deploy' }, ctx);
     assert.equal(res.content, 'Skill "deploy" (files are in /skills/deploy):\n\nRun the deploy script.');
     assert.equal(res.summary, 'Loaded skill deploy');
-    assert.equal((await skillTool.execute({ skill: '/Deploy', args: ' to staging ' }, ctx)).content, 'Skill "deploy" (files are in /skills/deploy):\n\nRun the deploy script.\n\nArguments: to staging');
-    assert.equal(renderSkill('x', '/d', 'body\n', '  '), 'Skill "x" (files are in /d):\n\nbody');
+    assert.equal((await skillTool.execute({ skill: '/Deploy', args: ' to staging ' }, ctx)).content, 'Skill "deploy" (files are in /skills/deploy):\n\nRun the deploy script.\n\nARGUMENTS: to staging');
+    assert.equal(renderSkill('x', '/d', 'body\n'), 'Skill "x" (files are in /d):\n\nbody');
+  });
+
+  test('a skill marked to fork runs in a subagent and returns its report', async () => {
+    const runtime = fakeRuntime({ invokeSkill: async () => ({ name: 'audit', baseDir: '/s/audit', content: 'Audit the repo.', forkAgent: 'explore' }) });
+    const res = await skillTool.execute({ skill: 'audit' }, contextWith(runtime));
+    assert.equal(res.content, 'report for Skill audit');
+    assert.equal(res.summary, 'Ran skill audit in a subagent');
+    assert.deepEqual(runtime.subagentCalls.map((c) => [c.type, c.prompt, c.depth]), [['explore', 'Audit the repo.', 1]]);
+    // Inside a subagent there is no further nesting: the instructions are returned instead.
+    const nested = await skillTool.execute({ skill: 'audit' }, { ...contextWith(runtime), depth: 1 });
+    assert.equal(nested.content, 'Audit the repo.');
   });
 
   test('an unknown skill lists what exists', async () => {
     const res = await skillTool.execute({ skill: 'nope' }, contextWith(fakeRuntime()));
     assert.equal(res.isError, true);
     assert.match(res.content, /No skill named "nope"\. Available: deploy\./);
-    const none = await skillTool.execute({ skill: 'x' }, contextWith(fakeRuntime({ skills: () => [], loadSkill: () => undefined })));
+    const none = await skillTool.execute({ skill: 'x' }, contextWith(fakeRuntime({ skills: () => [], invokeSkill: async () => undefined })));
     assert.match(none.content, /No skills are installed/);
     assert.equal((await skillTool.execute({ skill: 'x' }, contextWith(undefined))).isError, true);
     assert.equal((await skillTool.execute({} as never, contextWith(fakeRuntime()))).isError, true);

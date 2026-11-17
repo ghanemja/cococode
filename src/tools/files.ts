@@ -431,7 +431,7 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
   }
   const check = examineFile(ctx, abs, bytes);
   if (check.state === 'directory' || check.state === 'unread') return { error: check.message! };
-  if (!bytes) return { error: `Could not read ${abs}: ${readError}` };
+  if (!bytes) return { error: `Could not read ${abs}: ${readError}. Check that it is a file you are allowed to read.` };
   const changed = check.state === 'changed';
 
   const problem = encodingProblem(bytes);

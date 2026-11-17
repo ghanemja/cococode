@@ -578,16 +578,20 @@ export class McpManager {
     return this.entries.filter((entry) => entry.resources && this.offered(entry)).map((entry) => entry.server.name);
   }
 
-  /** Resources of every connected server, or of one server when named. Never rejects: a server that fails contributes nothing. */
+  /**
+   * Resources of every server that offers them, or of one server when named.
+   * Listing is a use of the server, so a dropped connection is revived first.
+   * Never rejects: a server that fails contributes nothing.
+   */
   async listResources(server?: string): Promise<McpResource[]> {
     const lists = await Promise.all(
       this.entries.map(async (entry): Promise<McpResource[]> => {
-        if (server !== undefined && entry.server.name !== server) return [];
+        if (server !== undefined ? entry.server.name !== server : !entry.resources) return [];
         try {
-          // Naming a server is a use of it, so a dropped connection is revived; a sweep of all servers is not.
-          const client = server !== undefined ? await this.ready(entry) : entry.client?.connected ? entry.client : undefined;
+          const client = await this.ready(entry);
           if (!client) return [];
           const resources = await client.listResources();
+          entry.reconnects = 0;
           return resources
             .filter((r) => r && typeof r.uri === 'string')
             .map((r) => {

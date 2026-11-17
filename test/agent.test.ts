@@ -133,7 +133,7 @@ function harness(script: Turn[] | ((req: ChatRequest, i: number) => Turn), opts:
     runSubagent: async () => ({ text: 'sub done', toolUses: 0, tokens: 0 }),
     agentTypes: () => [{ name: 'general-purpose', description: 'general' }],
     skills: () => [],
-    loadSkill: () => undefined,
+    invokeSkill: async () => undefined,
     ...opts.runtime,
   };
   const tools = builtinTools();

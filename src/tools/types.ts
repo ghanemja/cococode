@@ -63,12 +63,15 @@ export interface SubagentResult {
   isError?: boolean;
 }
 
-export interface SkillInfo {
+/** A skill made ready to use: arguments, variables and inline commands are filled in. */
+export interface SkillInvocation {
   name: string;
-  description: string;
   /** Directory holding SKILL.md and any bundled files. */
   baseDir: string;
-  body: string;
+  /** The instructions to follow. */
+  content: string;
+  /** Set when the skill asks to run in a subagent of this type (context: fork). */
+  forkAgent?: string;
 }
 
 /**
@@ -79,7 +82,11 @@ export interface RuntimeHandle {
   runSubagent(req: SubagentRequest): Promise<SubagentResult>;
   agentTypes(): { name: string; description: string }[];
   skills(): { name: string; description: string }[];
-  loadSkill(name: string): SkillInfo | undefined;
+  /**
+   * Prepare a skill for use. `by` says who asked: skills can be hidden from the
+   * model or from the user, and then they do not resolve for that side.
+   */
+  invokeSkill(name: string, args: string, by: 'model' | 'user'): Promise<SkillInvocation | undefined>;
   askUser?(questions: AskQuestion[], signal: AbortSignal): Promise<Record<string, string> | null>;
   approvePlan?(plan: string, signal: AbortSignal): Promise<{ approved: boolean; feedback?: string }>;
   todosChanged?(): void;

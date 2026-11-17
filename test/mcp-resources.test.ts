@@ -184,15 +184,19 @@ test('resources: a cancelled read and a crashed server do not throw', async (t) 
   assert.equal(cancelled.isError, true);
   assert.match(cancelled.content, /Could not read mock:\/\/readme from MCP server "docs": the read was cancelled/);
 
-  // Kill the server through one of its tools; the resource tools stay on offer and the next read restarts it.
+  // Kill the server through one of its tools; the resource tools stay on offer and the next use restarts it.
   const crash = manager.tools().find((x) => x.name === 'mcp__docs__crash')!;
   assert.equal((await crash.execute({}, makeContext(root))).isError, true);
   assert.equal(manager.status()[0]!.status, 'failed');
   assert.equal(mcpResourceTools(manager).length, 2);
-  // A sweep of all servers does not reconnect anything; naming the server does.
-  assert.deepEqual(await list.execute({}, makeContext(root)), { content: 'No MCP resources are available.', summary: 'No resources' });
-  assert.equal(manager.status()[0]!.status, 'failed');
   const revived = await read.execute({ server: 'docs', uri: 'mock://readme' }, makeContext(root));
   assert.deepEqual(revived, { content: 'mock readme contents', summary: 'Read mock://readme' });
+  assert.equal(manager.status()[0]!.status, 'connected');
+
+  // Listing is a use as well.
+  assert.equal((await crash.execute({}, makeContext(root))).isError, true);
+  assert.equal(manager.status()[0]!.status, 'failed');
+  const listed = await list.execute({}, makeContext(root));
+  assert.equal(listed.summary, '1 resource');
   assert.equal(manager.status()[0]!.status, 'connected');
 });

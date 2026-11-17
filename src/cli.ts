@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { doctorReport } from './commands/builtin.ts';
 import { Controller, type ControllerOptions } from './core/controller.ts';
+import { parseAgentsJson, type AgentDefinition } from './config/extensions.ts';
 import { displayPath } from './config/paths.ts';
 import type { Settings, SettingsScope } from './config/settings.ts';
 import { getByPath, loadSettings, parseSettingValue, setByPath, settingsPath, updateSettingsFile } from './config/settings.ts';
@@ -45,6 +46,8 @@ Options:
       --append-system-prompt <text>    Add to the system prompt
       --append-system-prompt-file <file>   Same, read from a file
       --fallback-model <names>     Models to try, in order, when the main model fails (comma-separated)
+      --agent <name>               Run the session as this agent (its prompt, tools and model)
+      --agents <json>              Define subagents for this session: {"name": {"description": "...", "prompt": "..."}}
       --effort <level>             Reasoning level for models that take one (low, medium, high) or on/off
   -n, --name <name>                Name the session so it can be resumed by name
       --session-id <uuid>          Use a specific session id
@@ -87,7 +90,7 @@ interface ParsedArgs {
 const VALUE_FLAGS = new Set([
   'model', 'provider', 'base-url', 'api-key', 'context', 'max-output-tokens', 'tool-mode', 'permission-mode',
   'system-prompt', 'system-prompt-file', 'append-system-prompt', 'output-format', 'max-turns', 'settings',
-  'scope', 'transport', 'input-format', 'append-system-prompt-file', 'session-id', 'name', 'effort', 'fallback-model',
+  'scope', 'transport', 'input-format', 'append-system-prompt-file', 'session-id', 'name', 'effort', 'fallback-model', 'agent', 'agents',
   'debug-file',
 ]);
 const LIST_FLAGS = new Set(['allowedTools', 'allowed-tools', 'disallowedTools', 'disallowed-tools', 'tools', 'add-dir', 'mcp-config', 'env', 'header', 'image']);
@@ -429,6 +432,13 @@ export async function main(argv: string[]): Promise<number> {
       return fail(`Could not read --append-system-prompt-file: ${(err as Error).message}`);
     }
   }
+  let extraAgents: AgentDefinition[] | undefined;
+  const agentsJson = str(flags, 'agents');
+  if (agentsJson) {
+    const parsed = parseAgentsJson(agentsJson);
+    if (parsed.error) return fail(`--agents: ${parsed.error}`);
+    extraAgents = parsed.agents;
+  }
   const sessionId = str(flags, 'session-id');
   if (sessionId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
     return fail('--session-id must be a UUID, for example 123e4567-e89b-12d3-a456-426614174000.');
@@ -456,6 +466,8 @@ export async function main(argv: string[]): Promise<number> {
     sessionName: str(flags, 'name'),
     bare: Boolean(flags.bare || flags['safe-mode']),
     strictMcp: Boolean(flags['strict-mcp-config']),
+    extraAgents,
+    agent: str(flags, 'agent'),
   };
 
   let ctl: Controller;

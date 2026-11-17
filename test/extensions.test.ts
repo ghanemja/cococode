@@ -445,6 +445,11 @@ describe('expandSkill', () => {
     assert.equal(await expandSkill({ body: '$file $filename', argumentNames: ['filename', 'file'] }, 'N F', {}), 'F N');
   });
 
+  test('a number or name that runs into a word is not a placeholder', async () => {
+    const skill = { body: 'Budget $5k or $1M, the $0th and $2_x; $item[0] and $items; but $0, $0-$1 and ($item).', argumentNames: ['item'] };
+    assert.equal(await expandSkill(skill, 'A B', {}), 'Budget $5k or $1M, the $0th and $2_x; $item[0] and $items; but A, A-B and (A).');
+  });
+
   test('names may hold hyphens and underscores', async () => {
     const skill = { body: '$pr-number / $pr / $target_env / $pr-other', argumentNames: ['pr', 'pr-number', 'target_env'] };
     assert.equal(await expandSkill(skill, 'A B C', {}), 'B / A / C / A-other');
@@ -769,7 +774,7 @@ describe('extension loading', () => {
       assert.equal(agents.find((a) => a.name === 'explore')!.source, 'builtin');
     });
 
-    // Changed from "nested directories are not scanned": Claude Code scans agents/ subfolders recursively.
+    // Claude Code scans agents/ subfolders recursively, so a nested file is an agent like any other.
     test('project beats user; nested directories are scanned', () => {
       writeFiles(root, {
         '.coco/agents/dup.md': 'project',

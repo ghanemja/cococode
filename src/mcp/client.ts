@@ -425,8 +425,9 @@ class HttpTransport implements Transport {
       const hint = res.status === 401 || res.status === 403 ? ' (authentication required; set a header in the server config)' : '';
       const detail = body.trim() ? `: ${body.trim().slice(0, 300)}` : '';
       const error = new McpError(`HTTP ${res.status} ${res.statusText}${hint}${detail}`.trim(), res.status);
-      // 404 for a session the server issued means it expired or the server restarted: a new handshake is needed.
-      if (res.status === 404 && sentSession) this.onclose?.(error);
+      // 404 for a session the server issued means it expired or the server restarted. Some servers
+      // answer 400 "No valid session ID" instead. Either way this connection is over and a new handshake is needed.
+      if (sentSession && (res.status === 404 || (res.status === 400 && /session/i.test(body)))) this.onclose?.(error);
       throw error;
     }
 

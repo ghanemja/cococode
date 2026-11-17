@@ -730,7 +730,7 @@ export class App implements CommandIO {
   /** ctrl+s: set the prompt aside, or bring the last one set aside back into an empty prompt. */
   private toggleStash(): void {
     const ed = this.editor;
-    if (ed.stash()) this.setNotice('Prompt stashed (ctrl+s on an empty prompt brings it back)', 2500);
+    if (ed.stash()) this.setNotice('Prompt stashed · ctrl+s restores it', 2500);
     else if (ed.unstash()) this.setNotice(ed.stashCount ? `Stashed prompt restored (${ed.stashCount} more stashed)` : 'Stashed prompt restored', 2500);
     else this.setNotice('Nothing to stash', 1500);
     this.completionDismissed = ed.text;
@@ -1260,7 +1260,7 @@ export class App implements CommandIO {
     let found: string;
     if (search.match !== null) found = search.match.replace(/\s+/g, ' ');
     else if (search.query) found = c.yellow('no match');
-    else found = c.dim('type to search your prompts · ctrl+r for an older match · enter to keep · esc to cancel');
+    else found = c.dim('type to search history · enter accepts · esc cancels');
     const line = truncate(`${c.dim(label)}${search.query}${c.dim("':")} ${found}`, width);
     return { line, col: Math.min(Math.max(0, width - 1), stringWidth(label) + stringWidth(search.query)) };
   }

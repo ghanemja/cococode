@@ -495,17 +495,17 @@ export class Editor {
     }
   }
 
-  /** Add typed text to the query. The search continues from the current match, so it only narrows. */
+  /** Add typed text to the query: the match becomes the newest entry containing all of it. */
   searchInput(text: string): void {
     const s = this.searchState;
     const added = text.replace(/\s+/g, ' ');
     if (!s || !added) return;
     s.query += added;
     s.exhausted = false;
-    this.searchShow(this.searchFrom(s.index >= 0 ? s.index : this.history.length - 1));
+    this.searchShow(this.searchFrom(this.history.length - 1));
   }
 
-  /** Remove the last character of the query and search again from the newest entry. */
+  /** Remove the last character of the query; the match is again the newest entry containing it. */
   searchBackspace(): void {
     const s = this.searchState;
     if (!s || !s.query) return;

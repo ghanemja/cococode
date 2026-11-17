@@ -200,6 +200,51 @@ describe('subagents', () => {
     assert.ok(events.some((e) => e.type === 'tool_progress' && /Grep/.test(e.text)));
   });
 
+  test('agent files limit tools and turns, preload skills, and resolve without regard to case', async () => {
+    const { ctl, server } = await setup(
+      (req) => {
+        const system = String(req.body.messages[0].content);
+        if (/You only read\./.test(system)) return { toolCalls: [{ name: 'Glob', arguments: { pattern: '*.txt' } }] };
+        const toolResults = (req.body.messages as { role: string }[]).filter((m) => m.role === 'tool').length;
+        return toolResults === 0 ? { toolCalls: [{ name: 'Agent', arguments: { description: 'look', prompt: 'Look around.', subagent_type: 'READER' } }] } : { text: 'done' };
+      },
+      {
+        files: {
+          '.coco/agents/reader.md': '---\nname: reader\ndescription: Reads things\ndisallowedTools: Bash, Write, Edit\nmaxTurns: 2\nskills: house\nomitClaudeMd: true\n---\nYou only read.',
+          '.coco/skills/house/SKILL.md': '---\ndescription: House rules\n---\nAlways cite line numbers.',
+          'COCO.md': 'Project memory marker.',
+          'a.txt': 'x',
+        },
+      },
+    );
+    await collect(ctl.submit('go'));
+    const sub = server.requests.filter((r) => /You only read\./.test(String(r.body.messages[0].content)));
+    // maxTurns: 2 stops a subagent that would otherwise keep calling tools.
+    assert.equal(sub.length, 2);
+    const system = String(sub[0]!.body.messages[0].content);
+    assert.match(system, /Skill "house"[\s\S]*Always cite line numbers\./);
+    assert.doesNotMatch(system, /Project memory marker/);
+    const names = (sub[0]!.body.tools as { function: { name: string } }[]).map((t) => t.function.name);
+    assert.ok(names.includes('Read') && names.includes('Glob'));
+    assert.ok(!names.includes('Bash') && !names.includes('Write') && !names.includes('Edit') && !names.includes('Agent'));
+  });
+
+  test('--agent runs the main conversation as an agent; --agents defines agents for the session', async () => {
+    const { ctl, server } = await setup([{ text: 'ok' }], {
+      agent: 'Triage',
+      extraAgents: [{ name: 'triage', description: 'Sorts issues', prompt: 'You sort issues.', tools: ['Read', 'Grep', 'Agent'], source: 'flag' }],
+      files: { 'COCO.md': 'Project memory marker.' },
+    });
+    await collect(ctl.submit('hello'));
+    const system = String(server.requests[0]!.body.messages[0].content);
+    assert.match(system, /^You sort issues\./);
+    // Memory still applies, and subagents keep the full tool set.
+    assert.match(system, /Project memory marker/);
+    assert.deepEqual((server.requests[0]!.body.tools as { function: { name: string } }[]).map((t) => t.function.name).sort(), ['Agent', 'Grep', 'Read']);
+    assert.ok(ctl.sessionTools().some((t) => t.name === 'Edit'));
+    assert.throws(() => new Controller({ cwd: tempProject(), interactive: false, agent: 'nobody' }), /No agent named "nobody"/);
+  });
+
   test('custom agents are loaded from .coco/agents and .claude/agents', async () => {
     const { ctl } = await setup([], {
       files: {
@@ -312,7 +357,40 @@ describe('slash commands', () => {
     assert.match(lastMessage(server.requests[1]!, 'tool').content, /Run make deploy, then check the logs/);
     const outcome = await runSlash('/deploy now', ctl, fakeIO());
     assert.ok(outcome && outcome.type === 'prompt');
-    assert.match(outcome.prompt, /Run make deploy[\s\S]*Arguments: now/);
+    assert.match(outcome.prompt, /Run make deploy[\s\S]*ARGUMENTS: now/);
+  });
+
+  test('skill front matter decides who can use a skill, what it pre-approves and how arguments are filled in', async () => {
+    const { ctl } = await setup([], {
+      files: {
+        '.coco/skills/release/SKILL.md': '---\ndescription: Cut a release\ndisable-model-invocation: true\nargument-hint: <version>\nallowed-tools: Bash(git tag *)\n---\nTag $0 from ${COCO_SKILL_DIR}. Branch: !`git tag --list`. Other: !`id`.',
+        '.coco/skills/style/SKILL.md': '---\ndescription: House style\nuser-invocable: false\n---\nUse tabs.',
+      },
+    });
+    // The model sees only what it may load; the user sees only what they may type.
+    assert.deepEqual(ctl.skills().map((s) => s.name), ['style']);
+    assert.deepEqual(allCommands(ctl).filter((c) => c.kind === 'skill').map((c) => [c.name, c.argumentHint]), [['release', '<version>']]);
+    assert.equal(await ctl.invokeSkill('release', '', 'model'), undefined);
+    assert.deepEqual(await runSlash('/style', ctl, fakeIO()), { type: 'unknown', name: 'style' });
+
+    const granted = () => JSON.stringify(ctl.permissions.rules()).includes('git tag');
+    const before = granted();
+    const outcome = await runSlash('/release v2', ctl, fakeIO());
+    assert.ok(outcome && outcome.type === 'prompt');
+    assert.match(outcome.prompt, /Tag v2 from .*\.coco\/skills\/release\. Branch: .*\. Other: \[command not permitted: id\]\./);
+    assert.doesNotMatch(outcome.prompt, /ARGUMENTS:/);
+    assert.deepEqual([before, granted()], [false, true]);
+  });
+
+  test('a forked skill runs in a subagent and its report joins the conversation', async () => {
+    const { ctl, server } = await setup([{ text: 'Audit report: all clear.' }], {
+      files: { '.coco/skills/audit/SKILL.md': '---\ndescription: Audit the repository\ncontext: fork\nagent: Explore\n---\nList risky files in $ARGUMENTS.' },
+    });
+    const io = fakeIO();
+    assert.equal(await runSlash('/audit src', ctl, io), undefined);
+    assert.match(io.out.join('\n'), /Running \/audit in a explore subagent[\s\S]*Audit report: all clear\./);
+    assert.match(lastMessage(server.requests[0]!, 'user').content, /List risky files in src\./);
+    assert.match(String(ctl.agent.messages.at(-1)!.content), /<skill-result>\nAudit report: all clear\.\n<\/skill-result>/);
   });
 
   test('unknown commands are reported as unknown', async () => {

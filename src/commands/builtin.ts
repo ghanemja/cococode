@@ -6,18 +6,16 @@ import { fitTranscript } from '../agent/compact.ts';
 import { renderTranscript } from '../providers/textTools.ts';
 import { highlight } from '../ui/highlight.ts';
 import type { Controller } from '../core/controller.ts';
-import { expandCommand } from '../config/extensions.ts';
+import { expandCommand, userInvocableSkills } from '../config/extensions.ts';
 import { MEMORY_FILE, displayPath } from '../config/paths.ts';
 import type { SettingsScope } from '../config/settings.ts';
 import { getByPath, parseSettingValue, setByPath, updateSettingsFile } from '../config/settings.ts';
 import { appendMemory, memoryTargets } from '../memory/memory.ts';
 import { MODE_CYCLE, modeLabel } from '../permissions/manager.ts';
-import { analyzeCommand } from '../permissions/bash.ts';
-import { matchBashSpec, parseRule } from '../permissions/rules.ts';
 import { exportMarkdown, findSession, listSessions } from '../session/store.ts';
 import { findRipgrep } from '../tools/search.ts';
-import { renderSkill } from '../tools/meta.ts';
-import { runCommand } from '../tools/shell.ts';
+import { parseRule } from '../permissions/rules.ts';
+import { inlineBashRunner } from './inline.ts';
 import { PERMISSION_MODES, type PermissionMode } from '../types.ts';
 import { c, formatBytes, formatContext, formatCount, formatDuration, padEnd, plural } from '../ui/ansi.ts';
 import { contextBar, renderTodos } from '../ui/render.ts';
@@ -205,9 +203,10 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
         lines.push('', heading('Custom commands'));
         for (const cmd of ctl.commands) lines.push(`  ${c.cyan(padEnd(`/${cmd.name}${cmd.argumentHint ? ` ${cmd.argumentHint}` : ''}`, 28))}${cmd.description} ${c.dim(`(${cmd.source})`)}`);
       }
-      if (ctl.skillDefs.length) {
+      const skills = userInvocableSkills(ctl.skillDefs);
+      if (skills.length) {
         lines.push('', heading('Skills'));
-        for (const s of ctl.skillDefs) lines.push(`  ${c.cyan(padEnd(`/${s.name}`, 28))}${s.description}`);
+        for (const s of skills) lines.push(`  ${c.cyan(padEnd(`/${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ''}`, 28))}${s.description}`);
       }
       lines.push(
         '',
@@ -934,8 +933,8 @@ export function allCommands(ctl: Controller): ResolvedCommand[] {
     if (!taken.has(cmd.name)) out.push({ name: cmd.name, description: cmd.description, argumentHint: cmd.argumentHint, kind: 'custom' });
     taken.add(cmd.name);
   }
-  for (const s of ctl.skillDefs) {
-    if (!taken.has(s.name)) out.push({ name: s.name, description: s.description, kind: 'skill' });
+  for (const s of userInvocableSkills(ctl.skillDefs)) {
+    if (!taken.has(s.name)) out.push({ name: s.name, description: s.description, argumentHint: s.argumentHint, kind: 'skill' });
     taken.add(s.name);
   }
   for (const p of ctl.mcp?.prompts() ?? []) {
@@ -948,26 +947,6 @@ export function allCommands(ctl: Controller): ResolvedCommand[] {
 export function parseSlash(input: string): { name: string; args: string } | null {
   const m = /^\/([^\s]+)\s*([\s\S]*)$/.exec(input.trim());
   return m ? { name: m[1]!, args: m[2] ?? '' } : null;
-}
-
-/**
- * Run `!`cmd`` substitutions inside a custom command, but only when the
- * command's allowed-tools (or the session's rules) cover them.
- */
-function inlineBashRunner(ctl: Controller, allowed: string[] | undefined): (cmd: string) => Promise<string | null> {
-  const specs = (allowed ?? [])
-    .map((r) => parseRule(r))
-    .filter((r): r is NonNullable<ReturnType<typeof parseRule>> => r !== null && r.tool === 'Bash');
-  return async (cmd: string) => {
-    const analysis = analyzeCommand(cmd);
-    const covered =
-      ctl.permissions.mode === 'bypassPermissions' ||
-      specs.some((r) => r.spec === undefined) ||
-      (!analysis.hasSubstitution && analysis.commands.length > 0 && analysis.commands.every((simple) => specs.some((r) => r.spec !== undefined && matchBashSpec(r.spec, simple))));
-    if (!covered) return null;
-    const res = await runCommand(cmd, { cwd: ctl.session.cwd, env: ctl.settings.env, timeoutMs: 30_000, maxOutput: 10_000 });
-    return res.output;
-  };
 }
 
 /**
@@ -984,14 +963,13 @@ export async function runSlash(input: string, ctl: Controller, io: CommandIO): P
 
   const custom = ctl.commands.find((cmd) => cmd.name === name);
   if (custom) {
-    const prompt = await expandCommand(custom, args, inlineBashRunner(ctl, custom.allowedTools));
+    const prompt = await expandCommand(custom, args, inlineBashRunner(ctl, custom.allowedTools), { sessionId: ctl.session.id, projectDir: ctl.session.projectRoot });
     return { type: 'prompt', prompt, display: input.trim(), allowedTools: custom.allowedTools };
   }
 
-  const skill = ctl.loadSkill(name);
-  if (skill) {
-    return { type: 'prompt', prompt: renderSkill(skill.name, skill.baseDir, skill.body, args), display: input.trim() };
-  }
+  const skill = await ctl.invokeSkill(name, args, 'user');
+  if (skill?.forkAgent) return runForkedSkill(skill.name, skill.forkAgent, skill.content, input.trim(), ctl, io);
+  if (skill) return { type: 'prompt', prompt: skill.content, display: input.trim() };
 
   const mcp = /^mcp__(.+?)__(.+)$/.exec(name);
   if (mcp && ctl.mcp) {
@@ -1011,6 +989,28 @@ export async function runSlash(input: string, ctl: Controller, io: CommandIO): P
     }
   }
   return { type: 'unknown', name };
+}
+
+/**
+ * A skill marked `context: fork` runs in a subagent. Its report is shown and
+ * added to the conversation, so later prompts can refer to it.
+ */
+async function runForkedSkill(name: string, agent: string, content: string, typed: string, ctl: Controller, io: CommandIO): Promise<CommandOutcome> {
+  if (!ctl.client) {
+    io.print(c.red('Not connected to a model yet.'));
+    return;
+  }
+  io.print(c.dim(`Running /${name} in a ${agent} subagent…`));
+  const abort = new AbortController();
+  const res = await ctl.runSubagent({ type: agent, description: `Skill ${name}`, prompt: content, signal: abort.signal, depth: 1 });
+  io.print(res.isError ? c.red(res.text) : res.text || c.dim('(The skill returned no text.)'));
+  const message = {
+    role: 'user' as const,
+    isMeta: true,
+    content: `The user ran the skill ${typed} in a subagent. Its report:\n<skill-result>\n${res.text || '(no text)'}\n</skill-result>`,
+  };
+  ctl.agent.messages.push(message);
+  ctl.transcript.message(message);
 }
 
 /** Save a `#` note to a memory file chosen by the user. */

@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { after, beforeEach, describe, test } from 'node:test';
-import { bashOutputTool, bashTool, killShellTool } from '../src/tools/bash.ts';
+import { bashOutputTool, bashTool, filesShownBy, killShellTool } from '../src/tools/bash.ts';
+import { editTool, readTool } from '../src/tools/files.ts';
 import { ShellManager, clampOutput, commandEnv, runCommand, shellQuote } from '../src/tools/shell.ts';
 import type { ToolContext, ToolResult } from '../src/tools/types.ts';
 import { makeContext, tempProject } from './helpers.ts';
@@ -262,14 +265,18 @@ describe('Bash tool', () => {
     assert.equal((await sh('echo $DEPLOY_ENV')).content, 'staging');
   });
 
-  test('times out with a clear note (timeouts below one second are raised to one)', async () => {
+  test('a sleep that outlives its timeout is killed, with a clear note (timeouts below one second are raised to one)', async () => {
     const started = Date.now();
-    const res = await sh('echo begin; sleep 30', { timeout: 200 });
+    const res = await sh('sleep 30 & echo "child=$!"; wait', { timeout: 200 });
     const took = Date.now() - started;
     assert.equal(res.isError, true);
-    assert.match(res.content, /^begin\nCommand timed out after 1s and was killed\. For long-running processes use run_in_background\.$/);
+    assert.match(res.content, /^child=\d+\nCommand timed out after 1s and was killed\. For long-running processes use run_in_background\.$/);
     assert.equal(res.summary, 'Timed out after 1s');
     assert.ok(took >= 900 && took < 4000, `took ${took}ms`);
+    // Killed, not moved to the background: nothing is left running.
+    assert.deepEqual(ctx.session.shells.list(), []);
+    const child = Number(/child=(\d+)/.exec(res.content)![1]);
+    assert.equal(await waitFor(() => !alive(child)), true, 'the sleep survived the timeout');
   });
 
   test('the timeout is capped by bashMaxTimeoutMs', async () => {
@@ -431,5 +438,477 @@ describe('background shells', () => {
     assert.equal(bashOutputTool.isReadOnly({ bash_id: 'x' }), true);
     assert.equal(killShellTool.isReadOnly({ shell_id: 'x' }), false);
     assert.equal(bashOutputTool.label!({ bash_id: 'bash_3' }, ctx), 'bash_3');
+  });
+});
+
+describe('moving a running command to the background', () => {
+  let shells: ShellManager;
+  beforeEach(() => {
+    shells = ctx.session.shells;
+  });
+
+  /** Scratch files in which runCommand records the working directory of this process's commands. */
+  const cwdFiles = () => fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`coco-cwd-${process.pid}-`)).sort();
+  const pidIn = (text: string, name: string) => Number(new RegExp(`${name}=(\\d+)`).exec(text)?.[1]);
+
+  test('runCommand hands the process over at the timeout and returns with the output so far', async () => {
+    const command = 'echo early; echo "pid=$$"; sleep 0.6; echo late; sleep 30 & echo "child=$!"; wait';
+    const started = Date.now();
+    const res = await runCommand(command, { cwd: dir, timeoutMs: 150, shells, onTimeout: 'background' });
+    const took = Date.now() - started;
+    assert.ok(took >= 140 && took < 550, `took ${took}ms`);
+    assert.match(res.output, /^early\npid=\d+\n$/);
+    assert.equal(res.backgroundId, 'bash_1');
+    assert.equal(res.timedOut, true);
+    assert.equal(res.interrupted, false);
+    assert.equal(res.exitCode, null);
+    assert.equal(res.cwd, undefined);
+    const pid = pidIn(res.output, 'pid');
+    assert.equal(alive(pid), true, 'the command was killed');
+
+    // It is a background shell like any other, under the command as it was typed and its real start time.
+    const [listed] = shells.list();
+    assert.deepEqual([listed!.id, listed!.status, listed!.command, listed!.exitCode], ['bash_1', 'running', command, null]);
+    assert.ok(listed!.startedAt >= started && listed!.startedAt < started + 140, 'startedAt is when the command began');
+    assert.equal(shells.running(), 1);
+    assert.equal(shells.foregroundCount(), 0);
+
+    // The caller already has the output so far; reading returns what comes after it.
+    let later = '';
+    assert.equal(await waitFor(() => /child=\d+/.test((later += shells.read('bash_1')!.output))), true);
+    assert.match(later, /^late\nchild=\d+\n$/);
+    const child = pidIn(later, 'child');
+    assert.equal(alive(child), true);
+
+    assert.equal(shells.kill('bash_1'), true);
+    assert.equal(shells.list()[0]!.status, 'killed');
+    assert.equal(await waitFor(() => !alive(pid) && !alive(child)), true, 'a process survived KillShell');
+    assert.equal(shells.running(), 0);
+  });
+
+  test('a command moved to the background runs to its end and reports its exit code', async () => {
+    const before = cwdFiles();
+    const res = await runCommand('echo one; sleep 0.4; echo two; exit 3', { cwd: dir, timeoutMs: 150, shells, onTimeout: 'background' });
+    assert.equal(res.backgroundId, 'bash_1');
+    assert.equal(res.output, 'one\n');
+    assert.equal(await waitFor(() => shells.list()[0]!.status === 'failed'), true);
+    assert.deepEqual(shells.read('bash_1'), { output: 'two\n', status: 'failed', exitCode: 3 });
+    // The scratch file recording its working directory is not left behind.
+    assert.deepEqual(cwdFiles(), before);
+  });
+
+  test('the timeout still kills when there is no manager to take the command, and by default', async () => {
+    const orphan = await runCommand('echo "pid=$$"; sleep 30', { cwd: dir, timeoutMs: 150, killGraceMs: 100, onTimeout: 'background' });
+    assert.equal(orphan.timedOut, true);
+    assert.equal(orphan.backgroundId, undefined);
+    assert.equal(await waitFor(() => !alive(pidIn(orphan.output, 'pid'))), true);
+
+    const plain = await runCommand('echo "pid=$$"; sleep 30', { cwd: dir, timeoutMs: 150, killGraceMs: 100, shells });
+    assert.equal(plain.timedOut, true);
+    assert.equal(plain.backgroundId, undefined);
+    assert.equal(await waitFor(() => !alive(pidIn(plain.output, 'pid'))), true);
+    assert.deepEqual(shells.list(), []);
+    assert.equal(shells.foregroundCount(), 0);
+  });
+
+  test('an abort kills the command even though it could have been moved to the background', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const res = await runCommand('echo "pid=$$"; sleep 30', { cwd: dir, timeoutMs: 5000, killGraceMs: 100, signal: controller.signal, shells, onTimeout: 'background' });
+    assert.equal(res.interrupted, true);
+    assert.equal(res.timedOut, false);
+    assert.equal(res.backgroundId, undefined);
+    assert.equal(await waitFor(() => !alive(pidIn(res.output, 'pid'))), true);
+    assert.deepEqual(shells.list(), []);
+  });
+
+  test('a command that is being killed is not adopted by a timeout or a detach that comes too late', async () => {
+    const controller = new AbortController();
+    let out = '';
+    // Ignoring SIGTERM keeps it alive, dying, until the SIGKILL that follows the grace period.
+    const running = runCommand(`trap '' TERM; echo "pid=$$"; sleep 30`, {
+      cwd: dir,
+      timeoutMs: 250,
+      killGraceMs: 400,
+      signal: controller.signal,
+      shells,
+      onTimeout: 'background',
+      onData: (chunk) => (out += chunk),
+    });
+    assert.equal(await waitFor(() => /pid=\d+/.test(out)), true);
+    controller.abort();
+    assert.deepEqual(shells.detachForeground(), []);
+    const res = await running;
+    assert.equal(res.interrupted, true);
+    assert.equal(res.backgroundId, undefined);
+    assert.deepEqual(shells.list(), []);
+    assert.equal(await waitFor(() => !alive(pidIn(out, 'pid'))), true);
+  });
+
+  test('a command that finishes in time is untouched, and is then no longer in the foreground', async () => {
+    const running = runCommand('echo quick', { cwd: dir, timeoutMs: 5000, shells, onTimeout: 'background' });
+    assert.equal(shells.foregroundCount(), 1);
+    const res = await running;
+    assert.deepEqual(res, { output: 'quick\n', exitCode: 0, timedOut: false, interrupted: false, cwd: dir });
+    assert.equal(shells.foregroundCount(), 0);
+    assert.deepEqual(shells.detachForeground(), []);
+    assert.deepEqual(shells.list(), []);
+  });
+
+  test('adopt takes over a running process, keeps its earlier output and collects the rest', async () => {
+    const proc = spawn('bash', ['-c', 'echo one; sleep 0.4; echo two; sleep 30 & echo "child=$!"; wait'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let early = '';
+    const collect = (chunk: Buffer) => (early += chunk.toString());
+    proc.stdout!.on('data', collect);
+    assert.equal(await waitFor(() => early.includes('one')), true);
+    proc.stdout!.off('data', collect);
+
+    const before = Date.now();
+    const shell = shells.adopt(proc, 'the command', early);
+    assert.equal(shell.id, 'bash_1');
+    assert.equal(shells.has('bash_1'), true);
+    assert.deepEqual(shells.list().map((s) => [s.id, s.command, s.status, s.exitCode]), [['bash_1', 'the command', 'running', null]]);
+    assert.ok(shells.list()[0]!.startedAt >= before);
+    assert.equal(shells.running(), 1);
+    // Nobody has been given the earlier output yet, so the first read returns it too.
+    let text = '';
+    assert.equal(await waitFor(() => /child=\d+/.test((text += shells.read('bash_1')!.output))), true);
+    assert.match(text, /^one\ntwo\nchild=\d+\n$/);
+    assert.equal(shells.read('bash_1', /two/)!.output, '', 'nothing new since');
+
+    const child = pidIn(text, 'child');
+    shells.killAll();
+    assert.equal(shells.list()[0]!.status, 'killed');
+    assert.equal(await waitFor(() => !alive(proc.pid!) && !alive(child)), true, 'a process survived killAll');
+  });
+
+  test('adopt: output already passed on is not returned again, and a process that has ended is reported as ended', async () => {
+    const proc = spawn('bash', ['-c', 'echo one; sleep 0.3; echo two'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let early = '';
+    const collect = (chunk: Buffer) => (early += chunk.toString());
+    proc.stdout!.on('data', collect);
+    assert.equal(await waitFor(() => early.includes('one')), true);
+    proc.stdout!.off('data', collect);
+    shells.adopt(proc, 'two steps', early, { delivered: true, startedAt: 1234 });
+    assert.equal(shells.list()[0]!.startedAt, 1234);
+    assert.equal(await waitFor(() => shells.list()[0]!.status === 'completed'), true);
+    assert.deepEqual(shells.read('bash_1'), { output: 'two\n', status: 'completed', exitCode: 0 });
+
+    const gone = spawn('bash', ['-c', 'exit 5'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    await new Promise((done) => gone.on('close', done));
+    const ended = shells.adopt(gone, 'exit 5', 'its last words\n');
+    assert.equal(ended.id, 'bash_2');
+    assert.deepEqual(shells.read('bash_2'), { output: 'its last words\n', status: 'failed', exitCode: 5 });
+    assert.equal(shells.running(), 0);
+  });
+
+  test('Bash: a command still running at its timeout carries on in the background', async () => {
+    // The tool raises timeouts to at least a second; a lower ceiling keeps this test short.
+    ctx = makeContext(dir, { bashMaxTimeoutMs: 600 });
+    ctx.session.shells.killGraceMs = 100;
+    managers.push(ctx.session.shells);
+    const started = Date.now();
+    const res = await sh('echo begin; echo "pid=$$"; sleep 1; echo later; sleep 30 & echo "child=$!"; wait');
+    const took = Date.now() - started;
+    assert.ok(took >= 550 && took < 950, `took ${took}ms`);
+    const pid = pidIn(res.content, 'pid');
+    assert.equal(res.isError, false);
+    assert.equal(
+      res.content,
+      `begin\npid=${pid}\nCommand did not finish within its 1s timeout. It is still running in the background as bash_1; its output so far is above. ` +
+        'Use BashOutput with bash_id "bash_1" to follow it and KillShell to stop it.',
+    );
+    assert.equal(res.summary, 'Still running after 1s, moved to background (bash_1)');
+    assert.equal(alive(pid), true, 'the command was killed');
+
+    // More output arrives and is read with BashOutput; what the Bash result showed is not repeated.
+    let followed = '';
+    for (const end = Date.now() + 3000; !/child=\d+/.test(followed) && Date.now() < end; await sleep(20)) {
+      const next = await bashOutputTool.execute({ bash_id: 'bash_1' }, ctx);
+      assert.match(next.content, /^Status: running\n/);
+      if (!next.content.endsWith('(no new output)')) followed += `${next.content.slice('Status: running\n'.length)}\n`;
+    }
+    assert.match(followed, /^later\nchild=\d+\n$/);
+    const child = pidIn(followed, 'child');
+
+    assert.equal((await killShellTool.execute({ shell_id: 'bash_1' }, ctx)).content, 'Stopped bash_1.');
+    assert.equal(await waitFor(() => !alive(pid) && !alive(child)), true, 'a process survived KillShell');
+    assert.match((await bashOutputTool.execute({ bash_id: 'bash_1' }, ctx)).content, /^Status: killed/);
+    assert.equal(ctx.session.shells.running(), 0);
+  });
+});
+
+describe('detachForeground', () => {
+  const pidIn = (text: string, name: string) => Number(new RegExp(`${name}=(\\d+)`).exec(text)?.[1]);
+
+  test('with nothing running it moves nothing', async () => {
+    assert.equal(ctx.session.detachForeground(), 0);
+    await sh('echo finished');
+    assert.equal(ctx.session.detachForeground(), 0);
+    assert.deepEqual(ctx.session.shells.list(), []);
+  });
+
+  test('one running command is moved, and its Bash call returns at once', async () => {
+    const session = ctx.session;
+    let progress = '';
+    const watching: ToolContext = { ...ctx, get cwd() { return session.cwd; }, onProgress: (t) => (progress = t) };
+    const started = Date.now();
+    const call = bashTool.execute({ command: 'echo working; echo "pid=$$"; sleep 30' }, watching);
+    assert.equal(await waitFor(() => /pid=\d+\n/.test(progress)), true);
+    assert.equal(session.shells.foregroundCount(), 1);
+
+    assert.equal(session.detachForeground(), 1);
+    const res = await call;
+    assert.ok(Date.now() - started < 2500, 'the call did not return promptly');
+    const pid = pidIn(res.content, 'pid');
+    assert.equal(res.isError, false);
+    assert.equal(
+      res.content,
+      `working\npid=${pid}\nThe user moved this command to the background. It is still running in the background as bash_1; its output so far is above. ` +
+        'Use BashOutput with bash_id "bash_1" to follow it and KillShell to stop it.',
+    );
+    assert.equal(res.summary, 'Moved to background (bash_1)');
+    assert.equal(alive(pid), true, 'the command was killed');
+    assert.deepEqual(session.shells.list().map((s) => [s.id, s.status]), [['bash_1', 'running']]);
+
+    // Nothing is left in the foreground to move.
+    assert.equal(session.detachForeground(), 0);
+    session.shells.killAll();
+    assert.equal(await waitFor(() => !alive(pid)), true, 'the command survived killAll');
+  });
+
+  test('two running commands are both moved, each to its own shell', async () => {
+    const session = ctx.session;
+    // Starting with `sleep` only matters at the timeout: the user may move any command.
+    const first = sh('sleep 0.3; echo "a=$$"; sleep 30');
+    const second = sh('sleep 0.3; echo "b=$$"; sleep 30');
+    assert.equal(session.shells.foregroundCount(), 2);
+    assert.equal(session.detachForeground(), 2);
+    const results = await Promise.all([first, second]);
+    for (const [i, res] of results.entries()) {
+      const id = `bash_${i + 1}`;
+      assert.equal(res.isError, false);
+      assert.equal(
+        res.content,
+        `The user moved this command to the background. It is still running in the background as ${id}; it has printed nothing so far. ` +
+          `Use BashOutput with bash_id "${id}" to follow it and KillShell to stop it.`,
+      );
+    }
+    assert.equal(session.shells.running(), 2);
+    assert.equal(session.detachForeground(), 0);
+
+    // Each keeps running and is followed on its own.
+    let a = '';
+    let b = '';
+    assert.equal(await waitFor(() => /a=\d+\n/.test((a += session.shells.read('bash_1')!.output)) && /b=\d+\n/.test((b += session.shells.read('bash_2')!.output))), true);
+    assert.match(a, /^a=\d+\n$/);
+    assert.match(b, /^b=\d+\n$/);
+    session.shells.killAll();
+    assert.equal(await waitFor(() => !alive(pidIn(a, 'a')) && !alive(pidIn(b, 'b'))), true, 'a command survived killAll');
+  });
+});
+
+describe('reading a file through the shell counts as reading it', () => {
+  const file = (rel: string) => path.join(dir, rel);
+  const put = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(file(rel)), { recursive: true });
+    fs.writeFileSync(file(rel), content);
+  };
+  const wasRead = (rel: string) => ctx.session.readFiles.get(file(rel));
+
+  test('cat with output marks the file as read, so Edit needs no separate Read', async () => {
+    put('a.txt', 'alpha\nbeta\n');
+    const input = { file_path: 'a.txt', old_string: 'alpha', new_string: 'ALPHA' };
+    assert.match((await editTool.execute(input, ctx)).content, /You must Read a\.txt before changing it/);
+    assert.equal((await sh('cat a.txt')).content, 'alpha\nbeta');
+    // The same record the Read tool makes.
+    const viaShell = wasRead('a.txt');
+    await readTool.execute({ file_path: 'a.txt' }, ctx);
+    assert.deepEqual(viaShell, wasRead('a.txt'));
+    assert.equal(viaShell?.partial, false);
+    assert.match(viaShell!.hash!, /^[0-9a-f]{64}$/);
+
+    ctx.session.readFiles.clear();
+    await sh('cat a.txt');
+    assert.equal((await editTool.execute(input, ctx)).isError, undefined);
+    assert.equal(fs.readFileSync(file('a.txt'), 'utf8'), 'ALPHA\nbeta\n');
+  });
+
+  test('a file too long to be shown whole is recorded as read in part', async () => {
+    ctx = makeContext(dir, { maxToolOutputChars: 300 });
+    put('long.txt', Array.from({ length: 200 }, (_, i) => `row ${i + 1}`).join('\n'));
+    assert.match((await sh('cat long.txt')).content, /All of it is saved at /);
+    assert.equal(wasRead('long.txt')?.partial, true);
+  });
+
+  test('cat of an empty file prints nothing, and does not count', async () => {
+    put('empty.txt', '');
+    put('blank.txt', '\n\n');
+    put('a.txt', 'alpha\n');
+    assert.equal((await sh('cat empty.txt')).content, '(no output)');
+    assert.equal((await sh('cat blank.txt')).content, '(no output)');
+    assert.equal((await sh('cat a.txt > /dev/null')).content, '(no output)');
+    assert.equal(ctx.session.readFiles.size, 0);
+  });
+
+  test('output that went through a pipe, a substitution, a redirect or a chain does not count', async () => {
+    put('a.txt', 'alpha\nbeta\n');
+    const commands = [
+      'cat a.txt | grep alpha',
+      'cat $(echo a.txt)',
+      'cat `echo a.txt`',
+      'cat < a.txt',
+      'cat a.txt 2>/dev/null',
+      'cat a.txt && true',
+      'cat a.txt; echo done',
+      'echo first; cat a.txt',
+      '(cat a.txt)',
+      'F=a.txt; cat $F',
+      'cat a.tx?',
+      'grep alpha a.txt',
+      'wc -l a.txt',
+      "sed -n '/alpha/p' a.txt",
+      "sed 's/beta/gamma/' a.txt",
+    ];
+    for (const command of commands) {
+      const res = await sh(command);
+      assert.equal(res.isError, false, command);
+      assert.match(res.content, /alpha|2 a\.txt/, command);
+      assert.equal(ctx.session.readFiles.size, 0, command);
+    }
+  });
+
+  test('a command that failed, or was started in the background, records nothing', async () => {
+    put('a.txt', 'alpha\n');
+    const res = await sh('cat a.txt missing.txt');
+    assert.equal(res.isError, true);
+    assert.match(res.content, /^alpha\n/);
+    await sh('cat a.txt', { run_in_background: true });
+    assert.equal(await waitFor(() => ctx.session.shells.list()[0]!.status === 'completed'), true);
+    assert.equal(ctx.session.readFiles.size, 0);
+  });
+
+  test('head, tail, nl and sed -n views count, and an option value is not taken for a file', async () => {
+    put('a.txt', 'l1\nl2\nl3\nl4\n');
+    put('2', 'a file named like a line count\n');
+    const views: [string, boolean][] = [
+      ['head -n 2 a.txt', true],
+      ['head -2 a.txt', true],
+      ['tail -n 2 a.txt', true],
+      ['tail -n +2 a.txt', true],
+      ['tail -c 2 a.txt', true],
+      ["sed -n '1,2p' a.txt", true],
+      ['sed -n 2p a.txt', true],
+      ['nl a.txt', false],
+      ['nl -b a a.txt', false],
+      ['cat -n a.txt', false],
+      ['cat -- a.txt', false],
+      ['cat ./a.txt', false],
+      [`cat ${file('a.txt')}`, false],
+      ["cat 'a.txt'", false],
+    ];
+    for (const [command, partial] of views) {
+      ctx.session.readFiles.clear();
+      const res = await sh(command);
+      assert.equal(res.isError, false, command);
+      assert.deepEqual([...ctx.session.readFiles.keys()], [file('a.txt')], command);
+      assert.equal(wasRead('a.txt')!.partial, partial, command);
+    }
+    // Several files, one with a space in its name.
+    put('b c.txt', 'x\n');
+    ctx.session.readFiles.clear();
+    await sh('cat a.txt "b c.txt"');
+    assert.deepEqual([...ctx.session.readFiles.keys()].sort(), [file('a.txt'), file('b c.txt')]);
+  });
+
+  test('only regular files inside the working directories are recorded', async () => {
+    const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'coco-outside-')));
+    try {
+      fs.writeFileSync(path.join(outside, 'o.txt'), 'outside\n');
+      put('a.txt', 'inside\n');
+      assert.equal((await sh(`cat ${outside}/o.txt a.txt`)).content, 'outside\ninside');
+      assert.deepEqual([...ctx.session.readFiles.keys()], [file('a.txt')]);
+      // A link that leads out of the project is outside as well.
+      fs.symlinkSync(path.join(outside, 'o.txt'), file('link.txt'));
+      assert.equal((await sh('cat link.txt')).content, 'outside');
+      assert.equal(wasRead('link.txt'), undefined);
+      // A directory the user added is a working directory.
+      ctx.session.addDir(outside);
+      await sh(`cat ${outside}/o.txt`);
+      assert.equal(ctx.session.readFiles.has(path.join(outside, 'o.txt')), true);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('paths are resolved against the directory the command ran in', async () => {
+    put('sub/f.txt', 'x\n');
+    put('f.txt', 'other\n');
+    await sh('cd sub');
+    assert.equal((await sh('cat f.txt')).content, 'x');
+    assert.deepEqual([...ctx.session.readFiles.keys()], [file('sub/f.txt')]);
+  });
+
+  test('filesShownBy: which command lines only print files, and which files', () => {
+    const full = (...paths: string[]) => ({ paths, partial: false });
+    const part = (...paths: string[]) => ({ paths, partial: true });
+    assert.deepEqual(filesShownBy('cat a.txt'), full('a.txt'));
+    assert.deepEqual(filesShownBy('cat -n a.txt b.txt'), full('a.txt', 'b.txt'));
+    assert.deepEqual(filesShownBy('cat "a b.txt" c\\ d.txt'), full('a b.txt', 'c d.txt'));
+    assert.deepEqual(filesShownBy('cat -- -n'), full('-n'));
+    assert.deepEqual(filesShownBy('cat - x'), full('x'));
+    assert.deepEqual(filesShownBy('cat a.txt # just looking'), full('a.txt'));
+    // Words the shell rewrites name nothing that can be known in advance.
+    assert.deepEqual(filesShownBy('cat "$HOME/x" y*.txt {a,b}.txt z'), full('z'));
+    assert.deepEqual(filesShownBy('head -n 20 src/x.ts'), part('src/x.ts'));
+    assert.deepEqual(filesShownBy('head -n20 x'), part('x'));
+    assert.deepEqual(filesShownBy('head --lines 20 x'), part('x'));
+    assert.deepEqual(filesShownBy('head --lines=20 x'), part('x'));
+    assert.deepEqual(filesShownBy('head -qn 5 x y'), part('x', 'y'));
+    assert.deepEqual(filesShownBy('tail -c 100 x'), part('x'));
+    assert.deepEqual(filesShownBy('tail +5 x'), part('x'));
+    assert.deepEqual(filesShownBy("sed -n '10,20p' x y"), part('x', 'y'));
+    assert.deepEqual(filesShownBy("sed -n '$p' x"), part('x'));
+    assert.deepEqual(filesShownBy('nl -ba x'), full('x'));
+    assert.deepEqual(filesShownBy('nl -w 3 -s : x'), full('x'));
+    assert.deepEqual(filesShownBy('bat -r 1:20 --style plain -pp x.rs'), full('x.rs'));
+    assert.deepEqual(filesShownBy('less -N +G -p needle x'), full('x'));
+    const not = [
+      'cat a | head', 'cat a > b', 'cat a >> b', 'cat < a', 'cat a 2>&1', 'cat $(ls)', 'cat `ls`', 'cat <(echo a)', 'cat a && cat b', 'cat a; cat b', 'cat a\ncat b',
+      'cat a &', '(cat a)', '{ cat a; }', 'cat <<EOF\nx\nEOF', 'cat "unclosed', 'grep x a', 'wc -l a', 'ls a', 'echo a', 'FOO=1 cat a', '/bin/cat a', './cat a',
+      'sed -n /x/p a', 'sed -i 1p a', 'sed 1p a', "sed -n '1,2p'", "sed -n '1,2p;w out' a", 'toString a', '',
+    ];
+    for (const command of not) assert.equal(filesShownBy(command), null, JSON.stringify(command));
+  });
+});
+
+describe('oversized output from Bash', () => {
+  test('a successful command shows the first 2,000 characters and the last lines, and saves the rest', async () => {
+    const res = await sh('seq 1 20000');
+    assert.equal(res.isError, false);
+    const [shown, note] = res.content.split('\n\n[The output was ');
+    const [head, gap, tail] = shown!.split('\n\n');
+    assert.ok(head!.startsWith('1\n2\n3\n'));
+    assert.ok(head!.length > 1900 && head!.length <= 2000, `head is ${head!.length} characters`);
+    assert.match(head!, /\n\d+$/, 'the head ends with a whole line');
+    assert.match(gap!, /^\.\.\. \[\d+ characters truncated\] \.\.\.$/);
+    assert.ok(tail!.endsWith('19999\n20000'));
+    assert.ok(tail!.length > 400 && tail!.length <= 500, `tail is ${tail!.length} characters`);
+    assert.match(note!, /^108893 characters \(20000 lines\), so only its first \d+ characters and its last \d+ lines are shown above\. All of it is saved at /);
+    const saved = /All of it is saved at (\S+)\. Use Grep/.exec(note!)![1]!;
+    assert.equal(fs.readFileSync(saved, 'utf8'), Array.from({ length: 20000 }, (_, i) => String(i + 1)).join('\n'));
+    assert.equal(res.summary!.endsWith('lines of output'), true);
+  });
+
+  test('a failed command keeps its head and tail, up to 10,000 characters', async () => {
+    const res = await sh('seq 1 20000; exit 2');
+    assert.equal(res.isError, true);
+    assert.ok(res.content.endsWith(']\nExit code 2'));
+    const [shown, note] = res.content.split('\n\n[The output was ');
+    assert.ok(shown!.startsWith('1\n2\n3\n'));
+    assert.ok(shown!.endsWith('19999\n20000'));
+    assert.match(shown!, /\n\n\.\.\. \[\d+ characters truncated\] \.\.\.\n\n/);
+    assert.ok(shown!.length > 9_900 && shown!.length <= 10_000, `excerpt is ${shown!.length} characters`);
+    assert.match(note!, /^108893 characters \(20000 lines\), so only its beginning and end are shown above\. All of it is saved at /);
   });
 });

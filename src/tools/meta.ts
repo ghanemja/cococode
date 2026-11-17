@@ -203,9 +203,11 @@ export const agentTool: Tool<AgentInput> = {
     if (!ctx.runtime) return errorResult('Subagents are not available in this session.');
     if (ctx.depth >= 1) return errorResult('Subagents cannot start further subagents. Do the work directly.');
     const types = ctx.runtime.agentTypes();
-    const type = input.subagent_type?.trim() || 'general-purpose';
-    if (!types.some((t) => t.name === type)) {
-      return errorResult(`Unknown subagent_type "${type}". Available: ${types.map((t) => t.name).join(', ')}.`);
+    const wanted = input.subagent_type?.trim() || 'general-purpose';
+    // Models often write "Explore" for "explore": names compare without case.
+    const type = types.find((t) => t.name.toLowerCase() === wanted.toLowerCase())?.name;
+    if (!type) {
+      return errorResult(`Unknown subagent_type "${wanted}". Available: ${types.map((t) => t.name).join(', ')}.`);
     }
     const res = await ctx.runtime.runSubagent({
       type,
@@ -248,23 +250,28 @@ export const skillTool: Tool<SkillInput> = {
   label: (input) => input.skill,
   async execute(input, ctx): Promise<ToolResult> {
     const name = String(input.skill ?? '').replace(/^\//, '').trim();
-    const skill = ctx.runtime?.loadSkill(name);
+    const skill = await ctx.runtime?.invokeSkill(name, input.args ?? '', 'model');
     if (!skill) {
       const names = ctx.runtime?.skills().map((s) => s.name) ?? [];
       return errorResult(`No skill named "${name}".${names.length ? ` Available: ${names.join(', ')}.` : ' No skills are installed.'}`);
     }
-    return {
-      content: renderSkill(skill.name, skill.baseDir, skill.body, input.args),
-      summary: `Loaded skill ${skill.name}`,
-    };
+    // A skill marked `context: fork` does its work in a subagent and reports back.
+    if (skill.forkAgent && ctx.runtime && ctx.depth < 1) {
+      const res = await ctx.runtime.runSubagent({
+        type: skill.forkAgent,
+        description: `Skill ${skill.name}`,
+        prompt: skill.content,
+        signal: ctx.signal,
+        depth: ctx.depth + 1,
+        onProgress: ctx.onProgress,
+      });
+      return { content: res.text || '(The skill returned no text.)', isError: res.isError, summary: `Ran skill ${skill.name} in a subagent` };
+    }
+    return { content: skill.content, summary: `Loaded skill ${skill.name}` };
   },
 };
 
-export function renderSkill(name: string, baseDir: string, body: string, args?: string): string {
-  return [
-    `Skill "${name}" (files are in ${baseDir}):`,
-    '',
-    body.trim(),
-    ...(args?.trim() ? ['', `Arguments: ${args.trim()}`] : []),
-  ].join('\n');
+/** How a skill's instructions are presented to the model. */
+export function renderSkill(name: string, baseDir: string, body: string): string {
+  return [`Skill "${name}" (files are in ${baseDir}):`, '', body.trim()].join('\n');
 }

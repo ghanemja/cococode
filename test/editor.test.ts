@@ -732,3 +732,775 @@ describe('completion', () => {
     assert.equal(cmd.cursor, 6);
   });
 });
+
+describe('deleting the next word', () => {
+  test('kills from the cursor to the end of the next word, and yank brings it back', () => {
+    const ed = editor('git commit --amend', 4);
+    ed.killWordForward();
+    assert.equal(ed.text, 'git  --amend');
+    assert.equal(ed.cursor, 4);
+    ed.end();
+    ed.yank();
+    assert.equal(ed.text, 'git  --amendcommit');
+  });
+
+  test('skips the whitespace in front of the word', () => {
+    const ed = editor('alpha   beta gamma', 5);
+    ed.killWordForward();
+    assert.equal(ed.text, 'alpha gamma');
+    assert.equal(ed.cursor, 5);
+    ed.yank();
+    assert.equal(ed.text, 'alpha   beta gamma');
+  });
+
+  test('from inside a word only the rest of it goes', () => {
+    const ed = editor('refactor', 2);
+    ed.killWordForward();
+    assert.equal(ed.text, 're');
+    assert.equal(ed.cursor, 2);
+  });
+
+  test('crosses a line break to reach the next word', () => {
+    const ed = editor('one\ntwo three', 3);
+    ed.killWordForward();
+    assert.equal(ed.text, 'one three');
+    assert.equal(ed.cursor, 3);
+  });
+
+  test('at the end nothing happens and the previous kill is kept', () => {
+    const ed = editor('keep me', 4);
+    ed.killToEnd();
+    ed.killWordForward();
+    assert.equal(ed.text, 'keep');
+    ed.yank();
+    assert.equal(ed.text, 'keep me');
+    const blank = editor('word   ', 4);
+    blank.killWordForward(); // only spaces left: they go, like any other trailing text
+    assert.equal(blank.text, 'word');
+  });
+
+  test('never splits a character', () => {
+    const ed = editor(`a ${FAMILY}${THUMB} b`, 1);
+    ed.killWordForward();
+    assert.equal(ed.text, 'a b');
+    assertOnBoundary(ed, 'after killing a word of emoji');
+  });
+
+  test('a collapsed paste is one word, forwards and backwards', () => {
+    const big = Array.from({ length: 9 }, (_, i) => `row ${i}`).join('\n');
+    const ed = editor('see ');
+    ed.paste(big);
+    ed.insert(' please');
+    ed.cursor = 3;
+    ed.killWordForward();
+    assert.equal(ed.text, 'see please');
+    // The placeholder is in the kill ring with its content still attached.
+    ed.cursor = 3;
+    ed.yank();
+    assert.equal(ed.text, 'see [Pasted text #1 +9 lines] please');
+    assert.equal(ed.value(), `see ${big} please`);
+    ed.killWordBack();
+    assert.equal(ed.text, 'see  please');
+    assert.equal(ed.cursor, 4);
+    assert.equal(ed.value(), 'see  please');
+  });
+});
+
+describe('undo', () => {
+  /** An editor on a clock the test moves by hand. */
+  function clocked(): { ed: Editor; wait(ms: number): void } {
+    let time = 1_000_000;
+    return { ed: new Editor({ now: () => time }), wait: (ms) => void (time += ms) };
+  }
+
+  /** Undo until nothing is left, returning the text after each step. */
+  function unwind(ed: Editor): string[] {
+    const seen: string[] = [];
+    while (ed.undo()) seen.push(ed.text);
+    return seen;
+  }
+
+  test('with nothing done there is nothing to undo', () => {
+    const ed = editor();
+    assert.equal(ed.canUndo, false);
+    assert.equal(ed.undo(), false);
+    assert.equal(ed.text, '');
+  });
+
+  test('characters typed one after another are one step', () => {
+    const ed = editor();
+    for (const ch of 'hello world') ed.insert(ch);
+    assert.equal(ed.canUndo, true);
+    assert.equal(ed.undo(), true);
+    assert.equal(ed.text, '');
+    assert.equal(ed.cursor, 0);
+    assert.equal(ed.undo(), false);
+  });
+
+  test('a pause in the typing starts a new step', () => {
+    const { ed, wait } = clocked();
+    for (const ch of 'first') ed.insert(ch);
+    wait(999);
+    ed.insert(' ');
+    wait(1000);
+    for (const ch of 'second') {
+      ed.insert(ch);
+      wait(400); // slow typing is still one run: the pause is measured between keys
+    }
+    assert.equal(ed.text, 'first second');
+    assert.deepEqual(unwind(ed), ['first ', '']);
+  });
+
+  test('moving the cursor between keystrokes starts a new step', () => {
+    const ed = editor();
+    ed.insert('world');
+    ed.home();
+    ed.insert('hello ');
+    assert.equal(ed.text, 'hello world');
+    ed.undo();
+    assert.equal(ed.text, 'world');
+    assert.equal(ed.cursor, 0, 'the cursor goes back to where the edit was made');
+    ed.undo();
+    assert.equal(ed.text, '');
+  });
+
+  test('a run of backspaces is one step, apart from the typing before it', () => {
+    const ed = editor();
+    ed.insert('abcdef');
+    ed.backspace();
+    ed.backspace();
+    ed.backspace();
+    assert.equal(ed.text, 'abc');
+    ed.undo();
+    assert.equal(ed.text, 'abcdef');
+    assert.equal(ed.cursor, 6);
+    ed.undo();
+    assert.equal(ed.text, '');
+  });
+
+  test('a run of forward deletes is one step, and typing after it another', () => {
+    const ed = editor();
+    ed.insert('abcdef');
+    ed.cursor = 1;
+    ed.del();
+    ed.del();
+    ed.insert('X');
+    assert.equal(ed.text, 'aXdef');
+    assert.deepEqual(unwind(ed), ['adef', 'abcdef', '']);
+  });
+
+  test('pastes, kills and yanks are each a step of their own', () => {
+    const ed = editor();
+    ed.insert('one ');
+    ed.paste('two ');
+    ed.paste('three');
+    ed.insert('!');
+    assert.equal(ed.text, 'one two three!');
+    ed.killWordBack();
+    ed.killWordBack();
+    assert.equal(ed.text, 'one ');
+    ed.yank();
+    ed.yank();
+    assert.equal(ed.text, 'one two two ');
+    ed.cursor = 4;
+    ed.killToEnd();
+    ed.home();
+    ed.killWordForward();
+    assert.equal(ed.text, ' ');
+    assert.deepEqual(unwind(ed), ['one ', 'one two two ', 'one two ', 'one ', 'one two ', 'one two three!', 'one two three', 'one two ', 'one ', '']);
+  });
+
+  test('accepting a completion is a step, so undo gives back what was typed', () => {
+    const ed = editor();
+    ed.insert('look at @sr');
+    ed.replaceRange(ed.completionToken()!.start, '@src/ui/app.ts ');
+    ed.insert('now');
+    assert.equal(ed.text, 'look at @src/ui/app.ts now');
+    ed.undo();
+    assert.equal(ed.text, 'look at @src/ui/app.ts ');
+    ed.undo();
+    assert.equal(ed.text, 'look at @sr');
+    assert.equal(ed.cursor, 11);
+    assert.deepEqual(ed.completionToken(), { kind: 'file', query: 'sr', start: 8 });
+  });
+
+  test('each history recall is a step, and navigation carries on from where undo leaves it', () => {
+    const ed = editor();
+    ed.setHistory(['first', 'second', 'third']);
+    ed.insert('draft');
+    ed.historyPrev();
+    ed.historyPrev();
+    assert.equal(ed.text, 'second');
+    ed.undo();
+    assert.equal(ed.text, 'third');
+    // Still on the newest entry: up continues to the one before it, down returns to the draft.
+    ed.historyPrev();
+    assert.equal(ed.text, 'second');
+    ed.undo();
+    ed.historyNext();
+    assert.equal(ed.text, 'draft');
+    ed.undo();
+    assert.equal(ed.text, 'third');
+    ed.undo();
+    assert.equal(ed.text, 'draft');
+    assert.equal(ed.cursor, 5);
+    // Back on the draft itself, not on a history entry.
+    assert.equal(ed.historyNext(), false);
+    ed.undo();
+    assert.equal(ed.text, '');
+    assert.equal(ed.undo(), false);
+  });
+
+  test('editing a recalled entry and undoing returns to the entry, then to the draft', () => {
+    const ed = editor();
+    ed.setHistory(['run the tests']);
+    ed.insert('half a thought');
+    ed.historyPrev();
+    ed.insert(' again');
+    assert.deepEqual(unwind(ed), ['run the tests', 'half a thought', '']);
+  });
+
+  test('an edit that changes nothing adds no step', () => {
+    const ed = editor();
+    ed.insert('abc');
+    ed.home();
+    ed.backspace();
+    ed.killToStart();
+    ed.killWordBack();
+    ed.end();
+    ed.del();
+    ed.killToEnd();
+    ed.killWordForward();
+    ed.insert('');
+    ed.paste('');
+    const fresh = editor('abc');
+    fresh.yank(); // nothing killed yet
+    assert.equal(fresh.canUndo, false);
+    assert.deepEqual(unwind(ed), ['']);
+  });
+
+  test('typing after an undo is a new step, not part of the one before', () => {
+    const ed = editor();
+    ed.insert('abc');
+    ed.killToStart();
+    ed.undo();
+    assert.equal(ed.text, 'abc');
+    ed.insert('d');
+    ed.insert('e');
+    assert.deepEqual(unwind(ed), ['abc', '']);
+  });
+
+  test('the number of steps kept is bounded: the oldest are dropped', () => {
+    const ed = editor();
+    for (let i = 0; i < 250; i++) ed.paste(`${i} `);
+    const full = ed.text;
+    const seen = unwind(ed);
+    assert.equal(seen.length, 100);
+    // What is left is the state 100 steps back, not the empty prompt.
+    assert.equal(ed.text, Array.from({ length: 150 }, (_, i) => `${i} `).join(''));
+    assert.ok(full.startsWith(ed.text));
+    assert.equal(ed.canUndo, false);
+  });
+
+  test('clear() forgets every step: a submitted prompt cannot be undone into the next one', () => {
+    const ed = editor();
+    ed.insert('sent to the model');
+    ed.killWordBack();
+    ed.clear();
+    assert.equal(ed.canUndo, false);
+    assert.equal(ed.undo(), false);
+    assert.equal(ed.text, '');
+    ed.insert('next');
+    assert.deepEqual(unwind(ed), ['']);
+  });
+
+  test('discard() empties the prompt but can be undone', () => {
+    const ed = editor();
+    ed.setHistory(['old']);
+    ed.insert('typed with care');
+    ed.cursor = 5;
+    ed.discard();
+    assert.equal(ed.isEmpty, true);
+    assert.equal(ed.cursor, 0);
+    ed.discard(); // already empty: not a step
+    ed.undo();
+    assert.equal(ed.text, 'typed with care');
+    assert.equal(ed.cursor, 5);
+    // Discarding a recalled entry leaves history navigation at the newest entry again.
+    ed.discard();
+    ed.historyPrev();
+    assert.equal(ed.text, 'old');
+    ed.discard();
+    ed.historyPrev();
+    assert.equal(ed.text, 'old');
+  });
+
+  test('set() is a new starting point that undo does not go back past', () => {
+    const ed = editor();
+    ed.insert('before');
+    ed.set('loaded');
+    assert.equal(ed.canUndo, false);
+    ed.insert(' and edited');
+    assert.deepEqual(unwind(ed), ['loaded']);
+  });
+
+  describe('with collapsed pastes', () => {
+    const big = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n');
+
+    test('undoing a paste removes the placeholder, and what is sent no longer has it', () => {
+      const ed = editor();
+      ed.insert('review: ');
+      ed.paste(big);
+      assert.equal(ed.text, 'review: [Pasted text #1 +12 lines]');
+      ed.undo();
+      assert.equal(ed.text, 'review: ');
+      assert.equal(ed.value(), 'review: ');
+    });
+
+    test('undoing the backspace that removed a paste restores the placeholder and its content', () => {
+      const ed = editor();
+      ed.insert('review: ');
+      ed.paste(big);
+      ed.backspace();
+      assert.equal(ed.value(), 'review: ');
+      ed.undo();
+      assert.equal(ed.text, 'review: [Pasted text #1 +12 lines]');
+      assert.equal(ed.cursor, ed.text.length);
+      assert.equal(ed.value(), `review: ${big}`);
+    });
+
+    test('a second paste after an undone one gets a number of its own', () => {
+      const ed = editor();
+      ed.paste(big);
+      ed.undo();
+      ed.paste(big.toUpperCase());
+      assert.equal(ed.text, '[Pasted text #2 +12 lines]');
+      assert.equal(ed.value(), big.toUpperCase());
+    });
+
+    test('a killed placeholder can be yanked back after undoing past its paste', () => {
+      const ed = editor();
+      ed.paste(big);
+      ed.killToStart();
+      ed.undo(); // the kill
+      ed.undo(); // the paste
+      assert.equal(ed.text, '');
+      ed.yank();
+      assert.equal(ed.text, '[Pasted text #1 +12 lines]');
+      assert.equal(ed.value(), big);
+    });
+
+    test('undo walks back through typing around a paste in order', () => {
+      const ed = editor();
+      ed.insert('a ');
+      ed.paste(big);
+      ed.insert(' b');
+      assert.deepEqual(unwind(ed), ['a [Pasted text #1 +12 lines]', 'a ', '']);
+    });
+
+    test('a discarded prompt comes back with its paste intact', () => {
+      const ed = editor();
+      ed.insert('explain ');
+      ed.paste(big);
+      ed.discard();
+      assert.equal(ed.value(), '');
+      ed.undo();
+      assert.equal(ed.value(), `explain ${big}`);
+    });
+  });
+});
+
+describe('replacing the whole prompt', () => {
+  test('is one undo step and leaves the cursor at the end', () => {
+    const ed = editor();
+    ed.insert('first draft');
+    ed.replaceAll('rewritten\nin an editor');
+    assert.equal(ed.text, 'rewritten\nin an editor');
+    assert.equal(ed.cursor, ed.text.length);
+    ed.undo();
+    assert.equal(ed.text, 'first draft');
+  });
+
+  test('line endings and tabs are normalised like typed text', () => {
+    const ed = editor();
+    ed.replaceAll('a\r\nb\rc\td');
+    assert.equal(ed.text, 'a\nb\nc  d');
+  });
+
+  test('a paste that comes back untouched keeps its placeholder; a changed one is plain text', () => {
+    const big = Array.from({ length: 8 }, (_, i) => `\tcode ${i}`).join('\n');
+    const ed = editor();
+    ed.insert('fix this: ');
+    ed.paste(big);
+    ed.replaceAll(`please fix this: ${big}\nthanks`);
+    assert.equal(ed.text, 'please fix this: [Pasted text #1 +8 lines]\nthanks');
+    assert.equal(ed.value(), `please fix this: ${big}\nthanks`, 'the tabs of the paste survive');
+    ed.replaceAll(`please fix this: ${big.replace('code 3', 'CODE 3')}`);
+    assert.ok(!ed.text.includes('[Pasted text'));
+    assert.ok(ed.value().includes('CODE 3'));
+    assert.equal(ed.value(), ed.text);
+  });
+
+  test('replacing with the same text is not a step', () => {
+    const ed = editor();
+    ed.replaceAll('same');
+    ed.replaceAll('same');
+    ed.undo();
+    assert.equal(ed.text, '');
+    assert.equal(ed.canUndo, false);
+  });
+});
+
+describe('reverse history search', () => {
+  const HISTORY = ['fix the login bug', 'add tests for the parser', 'Explain how LOGIN works', 'refactor the screen module', 'add tests for the parser'];
+
+  function searching(draft = ''): Editor {
+    const ed = editor();
+    ed.setHistory(HISTORY);
+    if (draft) ed.insert(draft);
+    ed.searchStart();
+    return ed;
+  }
+
+  test('no search is open until one is started', () => {
+    const ed = editor('text');
+    assert.equal(ed.search, null);
+    // The search operations do nothing on their own.
+    ed.searchInput('x');
+    ed.searchBackspace();
+    ed.searchOlder();
+    ed.searchCancel();
+    assert.equal(ed.searchAccept(), false);
+    assert.equal(ed.text, 'text');
+    assert.equal(ed.search, null);
+  });
+
+  test('an empty query matches nothing and leaves the prompt alone', () => {
+    const ed = searching('my draft');
+    assert.deepEqual(ed.search, { query: '', match: null, exhausted: false });
+    assert.equal(ed.text, 'my draft');
+  });
+
+  test('typing narrows to the most recent entry containing the query, ignoring case', () => {
+    const ed = searching('my draft');
+    ed.searchInput('t');
+    assert.equal(ed.search!.match, 'add tests for the parser');
+    ed.searchInput('h');
+    ed.searchInput('e');
+    assert.deepEqual(ed.search, { query: 'the', match: 'add tests for the parser', exhausted: false });
+    ed.searchInput(' s');
+    assert.equal(ed.search!.match, 'refactor the screen module');
+    const cased = searching();
+    cased.searchInput('login');
+    assert.equal(cased.search!.match, 'Explain how LOGIN works');
+    const upper = searching();
+    upper.searchInput('FIX THE');
+    assert.equal(upper.search!.match, 'fix the login bug');
+  });
+
+  test('the match is previewed in the buffer with the cursor at its end', () => {
+    const ed = searching('my draft');
+    ed.searchInput('screen');
+    assert.equal(ed.text, 'refactor the screen module');
+    assert.equal(ed.cursor, ed.text.length);
+  });
+
+  test('asking again moves to the next older match and skips repeats of the one shown', () => {
+    const ed = searching();
+    ed.searchInput('e');
+    const seen = [ed.search!.match];
+    for (let i = 0; i < 3; i++) {
+      ed.searchOlder();
+      seen.push(ed.search!.match);
+    }
+    assert.deepEqual(seen, ['add tests for the parser', 'refactor the screen module', 'Explain how LOGIN works', 'add tests for the parser']);
+    assert.equal(ed.search!.exhausted, false);
+  });
+
+  test('with no older match the current one stays and the search says so', () => {
+    const ed = searching('draft');
+    ed.searchInput('login');
+    ed.searchOlder();
+    assert.deepEqual(ed.search, { query: 'login', match: 'fix the login bug', exhausted: false });
+    ed.searchOlder();
+    assert.deepEqual(ed.search, { query: 'login', match: 'fix the login bug', exhausted: true });
+    assert.equal(ed.text, 'fix the login bug');
+    // Typing more searches afresh and clears the flag.
+    ed.searchInput(' b');
+    assert.deepEqual(ed.search, { query: 'login b', match: 'fix the login bug', exhausted: false });
+  });
+
+  test('typing after stepping back finds the newest entry for the longer query again', () => {
+    const ed = editor();
+    ed.setHistory(['alpha one', 'beta one', 'alpha two', 'alpha three']);
+    ed.searchStart();
+    ed.searchInput('alpha');
+    ed.searchOlder();
+    ed.searchOlder();
+    assert.equal(ed.search!.match, 'alpha one');
+    ed.searchInput(' t');
+    assert.equal(ed.search!.match, 'alpha three');
+    ed.searchOlder();
+    assert.equal(ed.search!.match, 'alpha two');
+  });
+
+  test('a query nothing contains has no match, and the buffer shows the prompt from before', () => {
+    const ed = editor('my draft', 2);
+    ed.setHistory(HISTORY);
+    ed.searchStart();
+    ed.searchInput('parser');
+    ed.searchInput('zz');
+    assert.deepEqual(ed.search, { query: 'parserzz', match: null, exhausted: false });
+    assert.equal(ed.text, 'my draft');
+    assert.equal(ed.cursor, 2);
+    ed.searchOlder(); // nothing to step through
+    assert.equal(ed.search!.match, null);
+    assert.equal(ed.search!.exhausted, false);
+  });
+
+  test('backspace edits the query, and the match is the newest entry for what is left', () => {
+    const ed = searching('my draft');
+    ed.searchInput('login');
+    ed.searchOlder();
+    assert.equal(ed.search!.match, 'fix the login bug');
+    ed.searchInput('x');
+    assert.equal(ed.search!.match, null);
+    ed.searchBackspace();
+    assert.deepEqual(ed.search, { query: 'login', match: 'Explain how LOGIN works', exhausted: false });
+    for (let i = 0; i < 5; i++) ed.searchBackspace();
+    assert.deepEqual(ed.search, { query: '', match: null, exhausted: false });
+    assert.equal(ed.text, 'my draft');
+    ed.searchBackspace(); // nothing left to remove
+    assert.deepEqual(ed.search, { query: '', match: null, exhausted: false });
+  });
+
+  test('backspace removes a whole character from the query', () => {
+    const ed = searching();
+    ed.searchInput(`a${THUMB}`);
+    ed.searchBackspace();
+    assert.equal(ed.search!.query, 'a');
+  });
+
+  test('pasted text joins the query with its line breaks flattened', () => {
+    const ed = searching();
+    ed.searchInput('tests\nfor');
+    assert.equal(ed.search!.query, 'tests for');
+    assert.equal(ed.search!.match, 'add tests for the parser');
+  });
+
+  test('accepting puts the match in the prompt and ends the search', () => {
+    const ed = searching('my draft');
+    ed.searchInput('screen');
+    assert.equal(ed.searchAccept(), true);
+    assert.equal(ed.search, null);
+    assert.equal(ed.text, 'refactor the screen module');
+    assert.equal(ed.cursor, ed.text.length);
+  });
+
+  test('accepting is one undo step back to the prompt from before', () => {
+    const ed = searching();
+    ed.searchCancel();
+    ed.insert('my draft');
+    ed.searchStart();
+    ed.searchInput('log');
+    ed.searchInput('i');
+    ed.searchOlder();
+    ed.searchAccept();
+    assert.equal(ed.text, 'fix the login bug');
+    ed.undo();
+    assert.equal(ed.text, 'my draft');
+    ed.undo();
+    assert.equal(ed.text, '');
+    assert.equal(ed.undo(), false);
+  });
+
+  test('cancelling restores the prompt and the cursor, and adds no undo step', () => {
+    const ed = searching();
+    ed.searchCancel();
+    ed.insert('my draft');
+    ed.cursor = 3;
+    ed.searchStart();
+    ed.searchInput('parser');
+    assert.equal(ed.text, 'add tests for the parser');
+    ed.searchCancel();
+    assert.equal(ed.search, null);
+    assert.equal(ed.text, 'my draft');
+    assert.equal(ed.cursor, 3);
+    ed.undo();
+    assert.equal(ed.text, '');
+  });
+
+  test('accepting with no match gives the old prompt back', () => {
+    const ed = searching('my draft');
+    ed.searchInput('nothing like this');
+    assert.equal(ed.searchAccept(), false);
+    assert.equal(ed.search, null);
+    assert.equal(ed.text, 'my draft');
+    const untouched = searching('my draft');
+    assert.equal(untouched.searchAccept(), false);
+    assert.equal(untouched.text, 'my draft');
+  });
+
+  test('up and down carry on from an accepted match, ending at the draft', () => {
+    const ed = searching('my draft');
+    ed.searchInput('login');
+    ed.searchAccept();
+    assert.equal(ed.text, 'Explain how LOGIN works');
+    ed.historyPrev();
+    assert.equal(ed.text, 'add tests for the parser');
+    ed.historyNext();
+    ed.historyNext();
+    assert.equal(ed.text, 'refactor the screen module');
+    ed.historyNext();
+    ed.historyNext();
+    assert.equal(ed.text, 'my draft');
+    assert.equal(ed.historyNext(), false);
+  });
+
+  test('asking again with nothing typed repeats the previous search', () => {
+    const ed = searching();
+    ed.searchOlder(); // no earlier search to repeat
+    assert.deepEqual(ed.search, { query: '', match: null, exhausted: false });
+    ed.searchInput('parser');
+    ed.searchCancel();
+    ed.searchStart();
+    ed.searchOlder();
+    assert.deepEqual(ed.search, { query: 'parser', match: 'add tests for the parser', exhausted: false });
+  });
+
+  test('starting a search twice keeps the prompt saved by the first', () => {
+    const ed = searching('my draft');
+    ed.searchInput('screen');
+    ed.searchStart();
+    assert.equal(ed.search!.query, 'screen');
+    ed.searchCancel();
+    assert.equal(ed.text, 'my draft');
+  });
+
+  test('with no history every query fails', () => {
+    const ed = editor('draft');
+    ed.searchStart();
+    ed.searchInput('a');
+    assert.deepEqual(ed.search, { query: 'a', match: null, exhausted: false });
+    assert.equal(ed.searchAccept(), false);
+    assert.equal(ed.text, 'draft');
+  });
+
+  test('a prompt with a collapsed paste survives a search that was cancelled', () => {
+    const big = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n');
+    const ed = editor();
+    ed.setHistory(HISTORY);
+    ed.insert('explain ');
+    ed.paste(big);
+    ed.searchStart();
+    ed.searchInput('login');
+    ed.searchCancel();
+    assert.equal(ed.text, 'explain [Pasted text #1 +12 lines]');
+    assert.equal(ed.value(), `explain ${big}`);
+  });
+
+  test('multi-line entries are found by text on any of their lines', () => {
+    const ed = editor();
+    ed.setHistory(['one\ntwo words\nthree', 'other']);
+    ed.searchStart();
+    ed.searchInput('two w');
+    ed.searchAccept();
+    assert.equal(ed.text, 'one\ntwo words\nthree');
+  });
+
+  test('clear() ends a search', () => {
+    const ed = searching('draft');
+    ed.searchInput('login');
+    ed.clear();
+    assert.equal(ed.search, null);
+    assert.equal(ed.text, '');
+  });
+});
+
+describe('stash', () => {
+  test('stashing empties the prompt; restoring brings back the text and the cursor', () => {
+    const ed = editor();
+    ed.insert('half-written thought');
+    ed.cursor = 4;
+    assert.equal(ed.stashCount, 0);
+    assert.equal(ed.stash(), true);
+    assert.equal(ed.isEmpty, true);
+    assert.equal(ed.cursor, 0);
+    assert.equal(ed.stashCount, 1);
+    assert.equal(ed.unstash(), true);
+    assert.equal(ed.text, 'half-written thought');
+    assert.equal(ed.cursor, 4);
+    assert.equal(ed.stashCount, 0);
+  });
+
+  test('an empty prompt is not stashed, and there may be nothing to restore', () => {
+    const ed = editor();
+    assert.equal(ed.stash(), false);
+    assert.equal(ed.unstash(), false);
+    assert.equal(ed.stashCount, 0);
+  });
+
+  test('a stash is only restored into an empty prompt', () => {
+    const ed = editor();
+    ed.insert('parked');
+    ed.stash();
+    ed.insert('new text');
+    assert.equal(ed.unstash(), false);
+    assert.equal(ed.text, 'new text');
+    assert.equal(ed.stashCount, 1);
+  });
+
+  test('several stashes come back newest first', () => {
+    const ed = editor();
+    for (const text of ['one', 'two', 'three']) {
+      ed.insert(text);
+      ed.stash();
+    }
+    assert.equal(ed.stashCount, 3);
+    const back: string[] = [];
+    while (ed.unstash()) {
+      back.push(ed.text);
+      ed.clear();
+    }
+    assert.deepEqual(back, ['three', 'two', 'one']);
+  });
+
+  test('a stash outlives the prompt submitted in between, pastes included', () => {
+    const big = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n');
+    const ed = editor();
+    ed.insert('look at ');
+    ed.paste(big);
+    ed.stash();
+    ed.insert('quick question');
+    ed.addHistory(ed.text);
+    ed.clear(); // submitted
+    ed.unstash();
+    assert.equal(ed.text, 'look at [Pasted text #1 +12 lines]');
+    assert.equal(ed.value(), `look at ${big}`);
+  });
+
+  test('undo does not reach across a stash in either direction', () => {
+    const ed = editor();
+    ed.insert('parked');
+    ed.stash();
+    assert.equal(ed.undo(), false, 'the stashed text is not undone back into the prompt');
+    ed.unstash();
+    assert.equal(ed.undo(), false, 'and a restored prompt is not undone away');
+    assert.equal(ed.text, 'parked');
+    ed.insert(' and more');
+    ed.undo();
+    assert.equal(ed.text, 'parked');
+  });
+
+  test('history navigation starts from the newest entry after a restore', () => {
+    const ed = editor();
+    ed.setHistory(['old one', 'old two']);
+    ed.historyPrev();
+    ed.historyPrev();
+    ed.stash();
+    ed.unstash();
+    assert.equal(ed.text, 'old one');
+    ed.historyPrev();
+    assert.equal(ed.text, 'old two');
+  });
+});

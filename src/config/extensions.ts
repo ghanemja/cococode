@@ -7,6 +7,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { ParsedDocument } from '../util/frontmatter.ts';
 import { asList, asString, parseFrontmatter, stripBom } from '../util/frontmatter.ts';
 import { expandHome, projectConfigDirs, userConfigDirs } from './paths.ts';
 
@@ -51,6 +52,15 @@ function markdownFiles(dir: string, recursive: boolean): string[] {
   return out;
 }
 
+/** Read and parse one extension file. Undefined when it cannot be read, so one bad file never stops a loader. */
+function readDocument(file: string): ParsedDocument | undefined {
+  try {
+    return parseFrontmatter(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
 // ------------------------------------------------------------ field values
 
 type Fields = Record<string, unknown>;
@@ -75,7 +85,7 @@ function textOf(value: unknown): string | undefined {
   return String(value).trim() || undefined;
 }
 
-function flag(value: unknown): boolean | undefined {
+function boolOf(value: unknown): boolean | undefined {
   if (typeof value === 'boolean') return value;
   if (typeof value !== 'string') return undefined;
   if (/^(true|yes|on)$/i.test(value.trim())) return true;
@@ -176,13 +186,9 @@ export function loadCommands(projectRoot: string, claudeCompat: boolean): Custom
       const rel = path.relative(dir, file).replace(/\.md$/, '');
       const name = rel.split(path.sep).join(':');
       if (commands.has(name)) continue;
-      let content: string;
-      try {
-        content = fs.readFileSync(file, 'utf8');
-      } catch {
-        continue;
-      }
-      const { data, body } = parseFrontmatter(content);
+      const doc = readDocument(file);
+      if (!doc) continue;
+      const { data, body } = doc;
       const firstLine = body.trim().split('\n')[0]?.replace(/^#+\s*/, '').slice(0, 100) ?? '';
       commands.set(name, {
         name,
@@ -230,8 +236,10 @@ export interface ExpansionContext {
  *                       argument, only $1..$9 exist, and $0 is ordinary text;
  *                     skills (SKILL.md) follow the current documentation: $N is
  *                       short for $ARGUMENTS[N], so $0 is the first argument
- *                       and $1 the second, with any number of digits.
- *   $name           skills only: an argument named in the `arguments` field
+ *                       and $1 the second, with any number of digits. A number
+ *                       that runs into a word (`$5k`) is ordinary text.
+ *   $name           skills only: an argument named in the `arguments` field;
+ *                   `$names` and `$name[0]` are ordinary text
  *   ${COCO_SESSION_ID}  ${COCO_SKILL_DIR}  ${COCO_PROJECT_DIR}
  *                   also spelled with CLAUDE_; left as typed when the value is unknown
  *   \$...           a backslash keeps a placeholder as text: `\$1.00` stays `$1.00`
@@ -239,8 +247,9 @@ export interface ExpansionContext {
  *   ```!            a fenced block opened this way runs as one script and is
  *                   replaced by its output
  *
- * If no placeholder received any of the arguments, they are appended as
- * `ARGUMENTS: <value>`.
+ * If no placeholder received any of the arguments (the body has none, or
+ * each one names an argument that was not given), what was typed is appended
+ * as `ARGUMENTS: <value>` so that it is never lost.
  *
  * The body is cut into literal text and commands first, and every piece is
  * then substituted in a single pass. So only commands written in the file
@@ -249,10 +258,8 @@ export interface ExpansionContext {
  */
 
 interface TemplateOptions {
-  /** The number that names the first argument in `$N`: 1 in command files, 0 in skills. */
-  firstNumber: 0 | 1;
-  /** Any number of digits after `$` (skills), or exactly one of 1-9 (commands). */
-  manyDigits: boolean;
+  /** Decides how `$N` is read: `$1`..`$9` counted from 1 in a command file, any `$N` counted from 0 in a skill. */
+  kind: 'command' | 'skill';
   argumentNames?: string[];
   variables: Record<string, string | undefined>;
   runBash?: (cmd: string) => Promise<string | null>;
@@ -266,6 +273,7 @@ const ARGUMENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 async function expandTemplate(body: string, args: string, opts: TemplateOptions): Promise<string> {
   const positional = splitArgs(args);
   const trimmedArgs = args.trim();
+  const firstNumber = opts.kind === 'skill' ? 0 : 1;
 
   // Names keep the position they were declared at, even when an earlier one is unusable.
   const positionOf = new Map<string, number>();
@@ -278,11 +286,11 @@ async function expandTemplate(body: string, args: string, opts: TemplateOptions)
   const placeholder = new RegExp(
     '(?<escaped>\\\\)?(?:' +
       [
-        ...(names.length > 0 ? [`\\$(?<name>${names.join('|')})(?![A-Za-z0-9_])`] : []),
+        ...(names.length > 0 ? [`\\$(?<name>${names.join('|')})(?![\\[A-Za-z0-9_])`] : []),
         '\\$ARGUMENTS\\[(?<index>\\d+)\\]',
         '\\$(?<all>ARGUMENTS)',
         '\\$\\{(?:COCO|CLAUDE)_(?<variable>SESSION_ID|SKILL_DIR|PROJECT_DIR)\\}',
-        opts.manyDigits ? '\\$(?<number>\\d+)' : '\\$(?<number>[1-9])',
+        opts.kind === 'skill' ? '\\$(?<number>\\d+)(?![A-Za-z0-9_])' : '\\$(?<number>[1-9])',
       ].join('|') +
       ')',
     'g',
@@ -302,7 +310,7 @@ async function expandTemplate(body: string, args: string, opts: TemplateOptions)
       if (groups.index !== undefined) return argument(positional[Number(groups.index)]);
       if (groups.all !== undefined) return argument(trimmedArgs);
       if (groups.variable !== undefined) return opts.variables[groups.variable] || match;
-      return argument(positional[Number(groups.number) - opts.firstNumber]);
+      return argument(positional[Number(groups.number) - firstNumber]);
     });
 
   const pieces: { text: string; kind: 'text' | 'inline' | 'block' }[] = [];
@@ -352,8 +360,7 @@ export function expandCommand(
   context: ExpansionContext = {},
 ): Promise<string> {
   return expandTemplate(command.body, args, {
-    firstNumber: 1,
-    manyDigits: false,
+    kind: 'command',
     variables: { SESSION_ID: context.sessionId, SKILL_DIR: command.path ? path.dirname(command.path) : undefined, PROJECT_DIR: context.projectDir },
     runBash: runBash ?? context.runBash,
   });
@@ -370,8 +377,7 @@ export function expandSkill(
   ctx: ExpansionContext = {},
 ): Promise<string> {
   return expandTemplate(skill.body, args, {
-    firstNumber: 0,
-    manyDigits: true,
+    kind: 'skill',
     argumentNames: skill.argumentNames,
     variables: { SESSION_ID: ctx.sessionId, SKILL_DIR: skill.baseDir, PROJECT_DIR: ctx.projectDir },
     runBash: ctx.runBash,
@@ -457,10 +463,10 @@ function agentOptions(data: Fields): Partial<AgentDefinition> {
     permissionMode: textOf(field(data, 'permission-mode')),
     maxTurns: positiveInt(field(data, 'max-turns')),
     skills: stringList(field(data, 'skills')),
-    omitMemory: flag(field(data, 'omit-claude-md')),
+    omitMemory: boolOf(field(data, 'omit-claude-md')),
     effort: textOf(field(data, 'effort')),
     initialPrompt: textOf(field(data, 'initial-prompt')),
-    background: flag(field(data, 'background')),
+    background: boolOf(field(data, 'background')),
     color: textOf(field(data, 'color')),
   };
 }
@@ -482,14 +488,9 @@ export function loadAgents(projectRoot: string, claudeCompat: boolean, sessionAg
   for (const { dir, source } of sourceDirs(projectRoot, claudeCompat, 'agents')) {
     const depth = (file: string) => path.relative(dir, file).split(path.sep).length;
     for (const file of markdownFiles(dir, true).sort((a, b) => depth(a) - depth(b))) {
-      let content: string;
-      try {
-        content = fs.readFileSync(file, 'utf8');
-      } catch {
-        continue;
-      }
-      const { data, body } = parseFrontmatter(content);
-      if (!body.trim()) continue;
+      const doc = readDocument(file);
+      if (!doc || !doc.body.trim()) continue;
+      const { data, body } = doc;
       add(
         compact({
           name: textOf(data.name) ?? path.basename(file, '.md'),
@@ -568,12 +569,12 @@ export function parseAgentsJson(input: string, readFile: (p: string) => string =
       continue;
     }
     // A tool list that cannot be read must not quietly become "all tools".
-    const badList = ['tools', 'disallowedTools'].find((k) => {
-      const list = value[k];
-      return list !== undefined && list !== null && typeof list !== 'string' && !(Array.isArray(list) && list.every((item) => typeof item === 'string'));
+    const badList = ['tools', 'disallowed-tools'].find((k) => {
+      const list = field(value, k);
+      return list !== undefined && typeof list !== 'string' && !(Array.isArray(list) && list.every((item) => typeof item === 'string'));
     });
     if (badList) {
-      problems.push(`agent "${name}": "${badList}" must be a list of tool names or a comma-separated string`);
+      problems.push(`agent "${name}": "${badList === 'tools' ? 'tools' : 'disallowedTools'}" must be a list of tool names or a comma-separated string`);
       continue;
     }
     agents.push(
@@ -635,13 +636,9 @@ export function loadSkills(projectRoot: string, claudeCompat: boolean): SkillDef
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const baseDir = path.join(dir, entry.name);
-      let content: string;
-      try {
-        content = fs.readFileSync(path.join(baseDir, 'SKILL.md'), 'utf8');
-      } catch {
-        continue;
-      }
-      const { data, body } = parseFrontmatter(content);
+      const doc = readDocument(path.join(baseDir, 'SKILL.md'));
+      if (!doc) continue;
+      const { data, body } = doc;
       const name = textOf(data.name) ?? entry.name;
       if (skills.has(name)) continue;
       skills.set(
@@ -652,8 +649,8 @@ export function loadSkills(projectRoot: string, claudeCompat: boolean): SkillDef
           whenToUse: textOf(field(data, 'when-to-use')),
           argumentHint: hintText(field(data, 'argument-hint')),
           argumentNames: nameList(field(data, 'arguments')),
-          disableModelInvocation: flag(field(data, 'disable-model-invocation')) ?? false,
-          userInvocable: flag(field(data, 'user-invocable')) ?? true,
+          disableModelInvocation: boolOf(field(data, 'disable-model-invocation')) ?? false,
+          userInvocable: boolOf(field(data, 'user-invocable')) ?? true,
           allowedTools: toolList(field(data, 'allowed-tools')),
           disallowedTools: toolList(field(data, 'disallowed-tools')),
           model: localModel(data.model),
@@ -736,13 +733,9 @@ export function loadOutputStyles(projectRoot: string, claudeCompat: boolean): Ou
   const styles = new Map<string, OutputStyle>();
   for (const { dir, source } of sourceDirs(projectRoot, claudeCompat, 'output-styles')) {
     for (const file of markdownFiles(dir, false)) {
-      let text: string;
-      try {
-        text = fs.readFileSync(file, 'utf8');
-      } catch {
-        continue;
-      }
-      const { data, body } = parseFrontmatter(text);
+      const doc = readDocument(file);
+      if (!doc) continue;
+      const { data, body } = doc;
       const name = (asString(data.name) ?? path.basename(file, '.md')).toLowerCase();
       if (styles.has(name) || !body.trim()) continue;
       styles.set(name, { name, description: asString(data.description) ?? '', prompt: body.trim(), source });

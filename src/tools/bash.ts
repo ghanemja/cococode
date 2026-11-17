@@ -117,9 +117,10 @@ export function filesShownBy(command: string): { paths: string[]; partial: boole
 /**
  * Reading a file through the shell is reading it: after `cat file` has shown
  * the model the content, Edit must not demand a Read of the same file. Records
- * every regular file inside the working directories that the command printed.
+ * every regular file inside the working directories that the command printed;
+ * `clipped` says the output was too long to be shown to the model in full.
  */
-function recordShellReads(ctx: ToolContext, command: string, cwd: string): void {
+function recordShellReads(ctx: ToolContext, command: string, cwd: string, clipped: boolean): void {
   const shown = filesShownBy(command);
   if (!shown) return;
   for (const p of shown.paths) {
@@ -129,7 +130,7 @@ function recordShellReads(ctx: ToolContext, command: string, cwd: string): void 
     } catch {
       continue; // not a file after all
     }
-    recordRead(ctx, abs, shown.partial);
+    recordRead(ctx, abs, shown.partial || clipped);
   }
 }
 
@@ -214,8 +215,10 @@ export const bashTool: Tool<BashInput> = {
     else if (res.timedOut) {
       notes.push(`Command timed out after ${formatDuration(timeoutMs)} and was killed. For long-running processes use run_in_background.`);
     } else if (res.exitCode !== 0) notes.push(`Exit code ${res.exitCode}`);
-    // What a plain `cat` printed, the model has read.
-    else if (full) recordShellReads(ctx, command, cwd);
+    else if (full) {
+      // What a plain `cat` printed, the model has read (in part, if it was too long to show whole).
+      recordShellReads(ctx, command, cwd, full.length > maxOutput);
+    }
 
     const lineCount = output ? output.split('\n').length : 0;
     if (!output && notes.length === 0) output = '(no output)';

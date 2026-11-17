@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { Key } from '../src/ui/keys.ts';
-import { KeyParser } from '../src/ui/keys.ts';
+import { CHORD_TIMEOUT_MS, ChordPrefix, KeyParser } from '../src/ui/keys.ts';
 
 const ESC = '\x1b';
 const PASTE_START = `${ESC}[200~`;
@@ -375,5 +375,119 @@ describe('chunking does not change the result', () => {
       offset += point.length;
       assert.deepEqual(parseInChunks([input.slice(0, offset), input.slice(offset)]), whole, `split at ${offset}`);
     }
+  });
+});
+
+describe('the keys behind the editing shortcuts', () => {
+  test('control keys: editor, search, stash, tasks, suspend', () => {
+    assert.deepEqual(parse('\x07'), ['ctrl+g']);
+    assert.deepEqual(parse('\x12'), ['ctrl+r']);
+    assert.deepEqual(parse('\x13'), ['ctrl+s']);
+    assert.deepEqual(parse('\x14'), ['ctrl+t']);
+    assert.deepEqual(parse('\x1a'), ['ctrl+z']);
+  });
+
+  test('undo: ctrl+_ is byte 0x1f, which is also what ctrl+shift+- sends', () => {
+    assert.deepEqual(parse('\x1f'), ['ctrl+_']);
+    assert.deepEqual(parse('ab\x1f\x1fc'), ['char:ab', 'ctrl+_', 'ctrl+_', 'char:c']);
+  });
+
+  test('undo in terminals that report the modifiers separately', () => {
+    // kitty: the key is "-" with ctrl+shift, or the shifted character "_" with ctrl.
+    assert.deepEqual(parse(`${ESC}[45;6u`), ['ctrl+shift+-']);
+    assert.deepEqual(parse(`${ESC}[95;5u`), ['ctrl+_']);
+    assert.deepEqual(parse(`${ESC}[95;6u`), ['ctrl+shift+_']);
+    // xterm modifyOtherKeys
+    assert.deepEqual(parse(`${ESC}[27;5;95~`), ['ctrl+_']);
+    assert.deepEqual(parse(`${ESC}[27;6;45~`), ['ctrl+shift+-']);
+    // Plain ctrl+- is a different key there.
+    assert.deepEqual(parse(`${ESC}[45;5u`), ['ctrl+-']);
+  });
+
+  test('ctrl+x ctrl+e arrives as two keys, together or apart', () => {
+    assert.deepEqual(parse('\x18\x05'), ['ctrl+x', 'ctrl+e']);
+    assert.deepEqual(parseInChunks(['\x18', '\x05']), ['ctrl+x', 'ctrl+e']);
+    assert.deepEqual(parse('a\x18\x05b'), ['char:a', 'ctrl+x', 'ctrl+e', 'char:b']);
+    assert.deepEqual(parse(`${ESC}[120;5u${ESC}[101;5u`), ['ctrl+x', 'ctrl+e']);
+  });
+
+  test('alt+letter is ESC then the letter: model picker, thinking, word delete', () => {
+    assert.deepEqual(parse(`${ESC}p`), ['alt+p']);
+    assert.deepEqual(parse(`${ESC}t`), ['alt+t']);
+    assert.deepEqual(parse(`${ESC}d`), ['alt+d']);
+    assert.deepEqual(parse(`${ESC}P`), ['alt+shift+p']);
+    assert.deepEqual(parse(`x${ESC}py`), ['char:x', 'alt+p', 'char:y']);
+    assert.deepEqual(partial(ESC, 'p'), { keys: ['alt+p'], pending: false });
+    // The same keys from terminals that send them as CSI sequences.
+    assert.deepEqual(parse(`${ESC}[112;3u`), ['alt+p']);
+    assert.deepEqual(parse(`${ESC}[116;3u`), ['alt+t']);
+    assert.deepEqual(parse(`${ESC}[27;3;100~`), ['alt+d']);
+  });
+
+  test('ESC and a letter typed separately are escape and text, not alt', () => {
+    const parser = new KeyParser();
+    assert.deepEqual(parser.feed(ESC).map(show), []);
+    assert.deepEqual(parser.flush().map(show), ['escape']);
+    assert.deepEqual(parser.feed('p').map(show), ['char:p']);
+  });
+
+  test('alt+delete and ctrl+delete, for deleting a word forwards', () => {
+    assert.deepEqual(parse(`${ESC}[3;3~`), ['alt+delete']);
+    assert.deepEqual(parse(`${ESC}[3;5~`), ['ctrl+delete']);
+  });
+
+  test('"?" is ordinary text to the parser', () => {
+    assert.deepEqual(parse('?'), ['char:?']);
+    assert.deepEqual(parse('why?'), ['char:why?']);
+  });
+});
+
+describe('chord prefix', () => {
+  test('the key right after the prefix completes the chord', () => {
+    const chord = new ChordPrefix();
+    chord.arm(1000);
+    assert.equal(chord.pending(1200), true);
+    assert.equal(chord.take(1200), true);
+  });
+
+  test('without the prefix a key is just a key', () => {
+    const chord = new ChordPrefix();
+    assert.equal(chord.pending(0), false);
+    assert.equal(chord.take(0), false);
+  });
+
+  test('the prefix covers one key only', () => {
+    const chord = new ChordPrefix();
+    chord.arm(1000);
+    assert.equal(chord.take(1100), true);
+    assert.equal(chord.take(1200), false);
+    assert.equal(chord.pending(1200), false);
+  });
+
+  test('a prefix nobody followed up on lapses', () => {
+    const chord = new ChordPrefix();
+    chord.arm(1000);
+    assert.equal(chord.pending(1000 + CHORD_TIMEOUT_MS), true);
+    assert.equal(chord.pending(1001 + CHORD_TIMEOUT_MS), false);
+    assert.equal(chord.take(1001 + CHORD_TIMEOUT_MS), false);
+    const quick = new ChordPrefix(50);
+    quick.arm(0);
+    assert.equal(quick.take(51), false);
+    quick.arm(100);
+    assert.equal(quick.take(150), true);
+  });
+
+  test('pressing the prefix again restarts the wait', () => {
+    const chord = new ChordPrefix(100);
+    chord.arm(0);
+    chord.arm(90);
+    assert.equal(chord.take(180), true);
+  });
+
+  test('by default the clock is the real one', () => {
+    const chord = new ChordPrefix();
+    chord.arm();
+    assert.equal(chord.take(), true);
+    assert.equal(chord.take(), false);
   });
 });

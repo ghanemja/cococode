@@ -77,6 +77,8 @@ export interface Settings {
   smallModel?: string;
   /** Models to try, in order, for the rest of a turn when the session model fails. */
   fallbackModel?: string | string[];
+  /** Run the main conversation as this agent (its prompt, tools and model). */
+  agent?: string;
 
   /** Context window in tokens. Detected from the server when unset. */
   contextWindow?: number;

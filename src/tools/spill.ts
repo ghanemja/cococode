@@ -46,6 +46,12 @@ function tailOf(content: string, max: number): string {
   return lineStart >= 0 && lineStart < tail.length - 1 ? tail.slice(lineStart + 1) : tail;
 }
 
+/** The head and tail of the text with the marker for what is missing between them: `max` characters at most, all told. */
+function excerptOf(content: string, max: number): string {
+  const marker = `\n\n... [${content.length} characters truncated] ...\n\n`.length;
+  return clampOutput(content, Math.max(0, max - marker));
+}
+
 /**
  * Keep an oversized tool result usable. Text within `max` characters is
  * returned as it is. Beyond that the whole text is saved to a file the model
@@ -74,7 +80,7 @@ export function spillOutput(sessionId: string, callId: string, content: string, 
   let shown: string;
   let what: string;
   if (options.failed) {
-    shown = clampOutput(content, Math.min(max, FAILED_EXCERPT));
+    shown = excerptOf(content, Math.min(max, FAILED_EXCERPT));
     what = 'only its beginning and end are shown above';
   } else {
     const tailMax = Math.min(PREVIEW_TAIL, Math.floor(max * 0.2));

@@ -48,3 +48,11 @@ export function filterTools(tools: Tool[], names: string[] | undefined): Tool[] 
   const wanted = new Set(names.map((n) => alias[n.toLowerCase()] ?? n.toLowerCase()));
   return tools.filter((t) => wanted.has(t.name.toLowerCase()) || [...wanted].some((w) => w.startsWith('mcp__') && t.name.toLowerCase().startsWith(w)));
 }
+
+/** Apply an agent's `disallowedTools`: drop tools named there. Entries with a spec, such as Bash(rm *), are permission rules and are ignored here. */
+export function withoutTools(tools: Tool[], names: string[] | undefined): Tool[] {
+  if (!names || names.length === 0) return tools;
+  const alias: Record<string, string> = { task: 'agent', ls: 'glob', multiedit: 'edit', todoread: 'todowrite' };
+  const banned = new Set(names.filter((n) => !n.includes('(')).map((n) => alias[n.toLowerCase()] ?? n.toLowerCase()));
+  return tools.filter((t) => !banned.has(t.name.toLowerCase()));
+}

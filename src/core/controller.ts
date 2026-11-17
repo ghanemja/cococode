@@ -9,7 +9,7 @@ import type { AgentEvent, PermissionAnswer, PermissionPrompt } from '../agent/lo
 import { Agent } from '../agent/loop.ts';
 import { buildSubagentPrompt, buildSystemPrompt, gatherEnv, type EnvInfo } from '../agent/systemPrompt.ts';
 import type { AgentDefinition, CustomCommand, OutputStyle, SkillDefinition } from '../config/extensions.ts';
-import { loadAgents, loadCommands, loadOutputStyles, loadSkills, BUILTIN_AGENTS, BUILTIN_STYLES } from '../config/extensions.ts';
+import { expandSkill, findAgent, loadAgents, loadCommands, loadOutputStyles, loadSkills, modelVisibleSkills, skillListing, userInvocableSkills, BUILTIN_AGENTS, BUILTIN_STYLES } from '../config/extensions.ts';
 import { configDir, displayPath, expandHome, readJsonFile, writeJsonFile } from '../config/paths.ts';
 import type { LoadedSettings, Settings } from '../config/settings.ts';
 import { DEFAULTS, loadSettings, mergeSettings, updateSettingsFile } from '../config/settings.ts';
@@ -27,8 +27,10 @@ import type { SessionSummary } from '../session/store.ts';
 import { Transcript, cleanupOldSessions, loadSession } from '../session/store.ts';
 import { looksBinary } from '../tools/fsutil.ts';
 import { walkFiles } from '../tools/search.ts';
-import { builtinTools, filterTools } from '../tools/registry.ts';
-import type { AskQuestion, RuntimeHandle, SkillInfo, SubagentRequest, SubagentResult, Tool, ToolContext } from '../tools/types.ts';
+import { inlineBashRunner } from '../commands/inline.ts';
+import { renderSkill } from '../tools/meta.ts';
+import { builtinTools, filterTools, withoutTools } from '../tools/registry.ts';
+import type { AskQuestion, RuntimeHandle, SkillInvocation, SubagentRequest, SubagentResult, Tool, ToolContext } from '../tools/types.ts';
 import type { ContentPart, ImagePart, Message, PermissionMode, UserMessage } from '../types.ts';
 import { messageText } from '../types.ts';
 import { VERSION } from '../version.ts';
@@ -69,6 +71,8 @@ export interface ControllerOptions {
   strictMcp?: boolean;
   /** Subagents defined for this session only (--agents). */
   extraAgents?: AgentDefinition[];
+  /** Run the main conversation as this agent: its prompt, tools and model (--agent). */
+  agent?: string;
 }
 
 const SUBAGENT_EXCLUDED = new Set(['Agent', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']);
@@ -121,6 +125,18 @@ export class Controller implements RuntimeHandle {
     this.hooks = this.makeHooks();
     this.sessionName = opts.sessionName;
     this.reloadExtensions();
+    const main = this.mainAgent();
+    if (opts.agent && !main) {
+      throw new Error(`No agent named "${opts.agent}". Available: ${this.agentDefs.map((a) => a.name).join(', ')}.`);
+    }
+    // The agent's model applies unless one was asked for on the command line.
+    if (main?.model && !opts.overrides?.model) this.settings.model = main.model;
+  }
+
+  /** The agent the main conversation runs as, when --agent (or the `agent` setting) names one. */
+  mainAgent(): AgentDefinition | undefined {
+    const name = this.opts.agent ?? this.settings.agent;
+    return name ? findAgent(this.agentDefs, name) : undefined;
   }
 
   /** Name shown in session lists and accepted by --resume. Written with the first message. */
@@ -192,8 +208,7 @@ export class Controller implements RuntimeHandle {
     }
     this.commands = loadCommands(root, this.claudeCompat);
     // Agents given on the command line win over files of the same name.
-    const flagged = this.opts.extraAgents ?? [];
-    this.agentDefs = [...flagged, ...loadAgents(root, this.claudeCompat).filter((a) => !flagged.some((f) => f.name === a.name))];
+    this.agentDefs = loadAgents(root, this.claudeCompat, this.opts.extraAgents ?? []);
     this.skillDefs = loadSkills(root, this.claudeCompat);
     this.styles = loadOutputStyles(root, this.claudeCompat);
     this.memory = loadMemory(root, this.claudeCompat, this.memoryExcludes());
@@ -400,15 +415,22 @@ export class Controller implements RuntimeHandle {
    * out: plan approval outside plan mode, skills when none are installed,
    * notebook editing in a project without notebooks.
    */
-  tools(): Tool[] {
+  sessionTools(): Tool[] {
     const hidden = new Set<string>();
     // Entering plan mode is offered outside it, leaving it only inside it.
     hidden.add(this.permissions.mode === 'plan' ? 'EnterPlanMode' : 'ExitPlanMode');
     if (this.permissions.mode === 'bypassPermissions' || this.permissions.mode === 'dontAsk') hidden.add('EnterPlanMode');
-    if (this.skillDefs.length === 0) hidden.add('Skill');
+    if (modelVisibleSkills(this.skillDefs).length === 0) hidden.add('Skill');
     if (!this.projectHasNotebooks()) hidden.add('NotebookEdit');
     const all = [...this.builtin.filter((t) => !hidden.has(t.name)), ...(this.mcp?.tools() ?? [])];
     return filterTools(all, this.opts.toolFilter);
+  }
+
+  /** What the main conversation is offered: the session's tools, narrowed when it runs as an agent. */
+  tools(): Tool[] {
+    const all = this.sessionTools();
+    const main = this.mainAgent();
+    return main ? withoutTools(filterTools(all, main.tools), main.disallowedTools) : all;
   }
 
   private hasNotebooks: boolean | undefined;
@@ -440,7 +462,7 @@ export class Controller implements RuntimeHandle {
       skills: this.skills(),
       agents: this.tools().some((t) => t.name === 'Agent') ? this.agentTypes() : [],
       mcpInstructions: (this.mcp?.status() ?? []).filter((s) => s.instructions).map((s) => ({ server: s.name, text: s.instructions! })),
-      override: this.opts.systemPrompt,
+      override: this.opts.systemPrompt ?? this.mainAgent()?.prompt,
       append: this.opts.appendSystemPrompt,
     });
   }
@@ -807,18 +829,38 @@ export class Controller implements RuntimeHandle {
     return this.agentDefs.map((a) => ({ name: a.name, description: a.description }));
   }
 
+  /**
+   * Skills the model may load, as listed in the system prompt. The list is paid
+   * for on every request, so descriptions shrink to fit about 2% of the window.
+   */
   skills(): { name: string; description: string }[] {
-    return this.skillDefs.map((s) => ({ name: s.name, description: s.description }));
+    const visible = modelVisibleSkills(this.skillDefs);
+    if (visible.length === 0) return [];
+    const window = this.client?.profile.contextWindow ?? this.settings.contextWindow ?? DEFAULTS.contextWindow;
+    const budget = Math.max(1500, Math.floor(window * 3.5 * 0.02));
+    const each = Math.max(60, Math.min(250, Math.floor(budget / visible.length) - 24));
+    return visible.map((s) => ({ name: s.name, description: skillListing(s, each) }));
   }
 
-  loadSkill(name: string): SkillInfo | undefined {
+  async invokeSkill(name: string, args: string, by: 'model' | 'user'): Promise<SkillInvocation | undefined> {
     const wanted = name.toLowerCase();
-    const skill = this.skillDefs.find((s) => s.name.toLowerCase() === wanted);
+    const pool = by === 'model' ? modelVisibleSkills(this.skillDefs) : userInvocableSkills(this.skillDefs);
+    const skill = pool.find((s) => s.name.toLowerCase() === wanted);
     if (!skill) return undefined;
-    // Loading a skill is invoking it: remember it (most recent last) for compaction.
+    const body = await expandSkill(skill, args, {
+      sessionId: this.session.id,
+      projectDir: this.session.projectRoot,
+      // Arguments may come from the model, so the runner judges the final command text.
+      runBash: inlineBashRunner(this, skill.allowedTools),
+    });
+    const content = renderSkill(skill.name, skill.baseDir, body);
+    if (skill.fork) return { name: skill.name, baseDir: skill.baseDir, content, forkAgent: findAgent(this.agentDefs, skill.agent ?? '')?.name ?? 'general-purpose' };
+    // Tools the skill pre-approves stay approved for the rest of the session.
+    for (const rule of skill.allowedTools ?? []) this.permissions.addRule('allow', rule);
+    // Using a skill is worth remembering (most recent last) so it survives compaction.
     this.invokedSkills.delete(skill.name);
-    this.invokedSkills.set(skill.name, skill.body);
-    return { name: skill.name, description: skill.description, baseDir: skill.baseDir, body: skill.body };
+    this.invokedSkills.set(skill.name, content);
+    return { name: skill.name, baseDir: skill.baseDir, content };
   }
 
   get askUser(): RuntimeHandle['askUser'] {
@@ -842,7 +884,7 @@ export class Controller implements RuntimeHandle {
   }
 
   async runSubagent(req: SubagentRequest): Promise<SubagentResult> {
-    const def = this.agentDefs.find((a) => a.name === req.type) ?? this.agentDefs.find((a) => a.name === 'general-purpose')!;
+    const def = findAgent(this.agentDefs, req.type ?? 'general-purpose') ?? findAgent(this.agentDefs, 'general-purpose')!;
     let client = this.client;
     if (def.model && def.model !== client.model) {
       try {
@@ -851,16 +893,30 @@ export class Controller implements RuntimeHandle {
         client = this.client; // fall back to the session model
       }
     }
-    const tools = filterTools(
-      this.tools().filter((t) => !SUBAGENT_EXCLUDED.has(t.name)),
-      def.tools,
+    // Start from everything the session has (not the main agent's subset), then apply this agent's own limits.
+    const tools = withoutTools(
+      filterTools(
+        this.sessionTools().filter((t) => !SUBAGENT_EXCLUDED.has(t.name)),
+        def.tools,
+      ),
+      def.disallowedTools,
     );
+    // Skills named in the agent file are loaded up front: the subagent starts with their instructions.
+    const preloaded: string[] = [];
+    for (const name of def.skills ?? []) {
+      const skill = this.skillDefs.find((s) => s.name.toLowerCase() === name.toLowerCase());
+      if (!skill) continue;
+      const body = await expandSkill(skill, '', { sessionId: this.session.id, projectDir: this.session.projectRoot });
+      preloaded.push(renderSkill(skill.name, skill.baseDir, body));
+    }
     let startContext = '';
     if (this.hooks.has('SubagentStart')) {
       const started = await this.hooks.run('SubagentStart', { agent_type: def.name }, def.name, req.signal);
       startContext = started.additionalContext ?? '';
     }
-    const system = [buildSubagentPrompt(def.prompt, { ...this.env, cwd: this.session.cwd }, this.memoryText), startContext].filter(Boolean).join('\n\n');
+    const system = [buildSubagentPrompt(def.prompt, { ...this.env, cwd: this.session.cwd }, def.omitMemory ? '' : this.memoryText), ...preloaded, startContext]
+      .filter(Boolean)
+      .join('\n\n');
     const agent = new Agent({
       client,
       tools: () => tools,
@@ -872,7 +928,7 @@ export class Controller implements RuntimeHandle {
       settings: this.settings,
       depth: req.depth,
       requestPermission: this.ui.requestPermission ? (p) => this.ui.requestPermission!(p) : undefined,
-      maxTurns: 60,
+      maxTurns: def.maxTurns ?? 60,
     });
 
     let toolUses = 0;
