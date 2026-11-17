@@ -11,7 +11,8 @@ import { addMcpServer, loadMcpServers, mcpConfigPath, removeMcpServer } from './
 import { NO_SERVER_HELP, ProviderError, detectServers, rankModels } from './providers/index.ts';
 import { findSession, listSessions } from './session/store.ts';
 import { enableDebug } from './util/debug.ts';
-import { PERMISSION_MODES, type ImagePart, type PermissionMode } from './types.ts';
+import { PERMISSION_MODES, type ImagePart, type JsonSchema, type PermissionMode } from './types.ts';
+import { structuredOutputPrompt } from './util/structured.ts';
 import { c, formatBytes, formatCount, formatDuration, padEnd, plural, setColorEnabled } from './ui/ansi.ts';
 import type { OutputFormat } from './ui/print.ts';
 import { APP_NAME, VERSION } from './version.ts';
@@ -60,9 +61,12 @@ Options:
       --debug-file <path>          Write that log to a file instead
       --output-format <fmt>        With -p: text (default), json or stream-json
       --max-turns <n>              With -p: stop after n model turns
+      --json-schema <schema|file>  With -p: require the final answer to be JSON matching this schema
+      --input-format <fmt>         With -p: text (default) or stream-json (one JSON user message per line on stdin)
       --image <files...>           With -p: attach images (vision models only)
       --mcp-config <files...>      Extra MCP server definitions (JSON files or strings)
       --settings <file|json>       Extra settings to load
+      --setting-sources <list>     Settings files to read: user, project, local (comma-separated; default all)
       --no-session-persistence     Do not save a transcript
       --verbose                    Show full tool output
       --no-color                   Disable colours
@@ -90,7 +94,7 @@ interface ParsedArgs {
 const VALUE_FLAGS = new Set([
   'model', 'provider', 'base-url', 'api-key', 'context', 'max-output-tokens', 'tool-mode', 'permission-mode',
   'system-prompt', 'system-prompt-file', 'append-system-prompt', 'output-format', 'max-turns', 'settings',
-  'scope', 'transport', 'input-format', 'append-system-prompt-file', 'session-id', 'name', 'effort', 'fallback-model', 'agent', 'agents',
+  'scope', 'transport', 'input-format', 'append-system-prompt-file', 'session-id', 'name', 'effort', 'fallback-model', 'agent', 'agents', 'setting-sources', 'json-schema',
   'debug-file',
 ]);
 const LIST_FLAGS = new Set(['allowedTools', 'allowed-tools', 'disallowedTools', 'disallowed-tools', 'tools', 'add-dir', 'mcp-config', 'env', 'header', 'image']);
@@ -432,6 +436,28 @@ export async function main(argv: string[]): Promise<number> {
       return fail(`Could not read --append-system-prompt-file: ${(err as Error).message}`);
     }
   }
+  let settingSources: ('user' | 'project' | 'local')[] | undefined;
+  const sourcesFlag = str(flags, 'setting-sources');
+  if (sourcesFlag !== undefined) {
+    const names = sourcesFlag.split(',').map((s) => s.trim()).filter(Boolean);
+    const bad = names.filter((n) => !['user', 'project', 'local'].includes(n));
+    if (bad.length) return fail(`--setting-sources takes user, project and local (got "${bad.join(', ')}").`);
+    settingSources = names as ('user' | 'project' | 'local')[];
+  }
+  let jsonSchema: JsonSchema | undefined;
+  const schemaFlag = str(flags, 'json-schema');
+  if (schemaFlag) {
+    try {
+      const text = schemaFlag.trim().startsWith('{') ? schemaFlag : fs.readFileSync(path.resolve(schemaFlag), 'utf8');
+      jsonSchema = JSON.parse(text) as JsonSchema;
+      if (typeof jsonSchema !== 'object' || jsonSchema === null || Array.isArray(jsonSchema)) throw new Error('it must be a JSON object');
+    } catch (err) {
+      return fail(`--json-schema: ${(err as Error).message}`);
+    }
+    appendSystemPrompt = [appendSystemPrompt, structuredOutputPrompt(jsonSchema)].filter(Boolean).join('\n\n');
+  }
+  const inputFormat = str(flags, 'input-format') ?? 'text';
+  if (!['text', 'stream-json'].includes(inputFormat)) return fail('--input-format must be text or stream-json.');
   let extraAgents: AgentDefinition[] | undefined;
   const agentsJson = str(flags, 'agents');
   if (agentsJson) {
@@ -468,6 +494,7 @@ export async function main(argv: string[]): Promise<number> {
     strictMcp: Boolean(flags['strict-mcp-config']),
     extraAgents,
     agent: str(flags, 'agent'),
+    settingSources,
   };
 
   let ctl: Controller;
@@ -512,12 +539,14 @@ export async function main(argv: string[]): Promise<number> {
   const promptArg = positional.join(' ').trim();
 
   if (!interactive) {
-    const stdinText = piped ? (await readStdin()).trim() : '';
+    const streamInput = inputFormat === 'stream-json';
+    const stdinText = piped && !streamInput ? (await readStdin()).trim() : '';
     let prompt = promptArg;
     if (stdinText) prompt = prompt ? `${prompt}\n\n<stdin>\n${stdinText}\n</stdin>` : stdinText;
-    if (!prompt) return fail(`No prompt given. Usage: ${APP_NAME} -p "your prompt"   (or run ${APP_NAME} in a terminal for an interactive session)`);
+    if (!prompt && !streamInput) return fail(`No prompt given. Usage: ${APP_NAME} -p "your prompt"   (or run ${APP_NAME} in a terminal for an interactive session)`);
     const format = (str(flags, 'output-format') ?? 'text') as OutputFormat;
     if (!['text', 'json', 'stream-json'].includes(format)) return fail('--output-format must be text, json or stream-json.');
+    if (streamInput && format !== 'stream-json') return fail('--input-format stream-json needs --output-format stream-json.');
     if (format !== 'text') setColorEnabled(false);
     try {
       await ctl.connect();
@@ -529,10 +558,12 @@ export async function main(argv: string[]): Promise<number> {
     await ctl.connectMcp();
     for (const s of (ctl.mcp?.status() ?? []).filter((x) => x.status === 'failed')) process.stderr.write(`${c.yellow(`MCP server "${s.name}" failed: ${s.error ?? ''}`)}\n`);
     await ctl.runSessionHook('SessionStart', { source: resumed ? 'resume' : 'startup' }, resumed ? 'resume' : 'startup');
-    const { runPrint } = await import('./ui/print.ts');
+    const { runPrint, streamJsonPrompts } = await import('./ui/print.ts');
     const images = list(flags, 'image') ?? [];
     const code = await runPrint(ctl, {
       prompt,
+      input: streamInput ? streamJsonPrompts(process.stdin) : undefined,
+      jsonSchema,
       format,
       verbose: Boolean(flags.verbose),
       images: images.length ? loadImages(images) : undefined,

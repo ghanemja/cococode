@@ -4,7 +4,7 @@
  * output limit scaled to the context window, and the newer slash commands.
  */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
@@ -463,5 +463,101 @@ describe('bare mode and session options on the controller', () => {
     await collect(ctl.submit('hi'));
     assert.equal(ctl.session.id, id);
     assert.equal(path.basename(ctl.transcript.path), `${id}.jsonl`);
+  });
+});
+
+describe('headless structured output and streamed input', () => {
+  const CLI = path.join(import.meta.dirname, '..', 'bin', 'coco.js');
+  const SCHEMA = JSON.stringify({ type: 'object', properties: { files: { type: 'array', items: { type: 'string' } }, count: { type: 'number' } }, required: ['files', 'count'] });
+
+  /** Run the real CLI against a mock server. */
+  function cli(dir: string, server: MockServer, args: string[], stdin?: string): Promise<{ code: number; stdout: string; stderr: string }> {
+    return new Promise((resolve) => {
+      const env = { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'), NO_COLOR: '1' };
+      const child = spawn('node', [CLI, ...args, '--base-url', server.url, '--model', 'mock-model'], { cwd: dir, env, stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout!.on('data', (d) => (stdout += d));
+      child.stderr!.on('data', (d) => (stderr += d));
+      if (stdin !== undefined) child.stdin!.end(stdin);
+      child.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    });
+  }
+
+  async function mock(script: Script): Promise<MockServer> {
+    const server = await startMockServer(script);
+    servers.push(server);
+    return server;
+  }
+
+  test('--json-schema sends a reply of the wrong shape back until it matches', async () => {
+    const server = await mock([{ text: 'I found two files.' }, { text: '```json\n{"files": ["a.ts", "b.ts"], "count": "2"}\n```' }]);
+    const res = await cli(tempProject(), server, ['-p', 'list files', '--output-format', 'json', '--json-schema', SCHEMA]);
+    assert.equal(res.code, 0, res.stderr);
+    const out = JSON.parse(res.stdout);
+    assert.deepEqual(out.structured_output, { files: ['a.ts', 'b.ts'], count: 2 });
+    assert.equal(out.result, '{"files":["a.ts","b.ts"],"count":2}');
+    // The schema is in the system prompt, and the correction names what was wrong.
+    assert.match(String(server.requests[0]!.body.messages[0].content), /final message must be a single JSON value[\s\S]*"required":\["files","count"\]/);
+    assert.match(lastMessage(server.requests[1]!, 'user').content, /Problem: the reply is not valid JSON/);
+  });
+
+  test('--json-schema gives up with an error when the model never complies', async () => {
+    const server = await mock([{ text: '{"files": []}' }, { text: '{"files": []}' }, { text: '{"files": []}' }]);
+    const res = await cli(tempProject(), server, ['-p', 'list files', '--json-schema', SCHEMA]);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /did not match --json-schema: .*count/);
+    assert.equal(server.requests.length, 3);
+    assert.equal(res.stdout, '');
+  });
+
+  test('--input-format stream-json runs one turn per user message in the same session', async () => {
+    const server = await mock([{ text: 'first answer' }, { text: 'second answer' }]);
+    const lines = [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'question one' } }),
+      'not json',
+      JSON.stringify({ type: 'control_request', request: {} }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'question two' }] } }),
+    ];
+    const res = await cli(tempProject(), server, ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json'], `${lines.join('\n')}\n`);
+    assert.equal(res.code, 0, res.stderr);
+    const events = res.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(events.filter((e) => e.type === 'system' && e.subtype === 'init').length, 1);
+    assert.deepEqual(events.filter((e) => e.type === 'result').map((e) => e.result), ['first answer', 'second answer']);
+    assert.equal(new Set(events.filter((e) => e.type === 'result').map((e) => e.session_id)).size, 1);
+    // The second turn carries the first as history.
+    const second = (server.requests[1]!.body.messages as { role: string; content: string }[]).filter((m) => m.role !== 'system').map((m) => m.content);
+    assert.deepEqual(second, ['question one', 'first answer', 'question two']);
+    assert.match(res.stderr, /Ignored input line: not valid JSON/);
+    const mismatch = await cli(tempProject(), server, ['-p', '--input-format', 'stream-json'], '');
+    assert.match(mismatch.stderr, /needs --output-format stream-json/);
+  });
+
+  test('--setting-sources chooses which settings files apply', async () => {
+    const dir = tempProject();
+    writeFiles(dir, {
+      '.coco/settings.json': JSON.stringify({ outputStyle: 'explanatory' }),
+      '.coco/settings.local.json': JSON.stringify({ maxRetries: 3 }),
+    });
+    const all = new Controller({ cwd: dir, interactive: false });
+    const projectOnly = new Controller({ cwd: dir, interactive: false, settingSources: ['project'] });
+    const none = new Controller({ cwd: dir, interactive: false, settingSources: [] });
+    controllers.push(all, projectOnly, none);
+    assert.deepEqual([all.settings.outputStyle, all.settings.maxRetries], ['explanatory', 3]);
+    assert.deepEqual([projectOnly.settings.outputStyle, projectOnly.settings.maxRetries], ['explanatory', undefined]);
+    assert.deepEqual([none.settings.outputStyle, none.settings.maxRetries], [undefined, undefined]);
+    const server = await mock([]);
+    assert.match((await cli(dir, server, ['-p', 'x', '--setting-sources', 'user,everything'])).stderr, /--setting-sources takes user, project and local/);
+  });
+
+  test('--agents defines an agent and --agent runs the session as it', async () => {
+    const server = await mock([{ text: 'sorted' }]);
+    const agents = JSON.stringify({ triage: { description: 'Sorts issues', prompt: 'You sort issues.', tools: ['Read', 'Grep'] } });
+    const res = await cli(tempProject(), server, ['-p', 'go', '--agents', agents, '--agent', 'triage']);
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(String(server.requests[0]!.body.messages[0].content), /^You sort issues\./);
+    assert.deepEqual((server.requests[0]!.body.tools as { function: { name: string } }[]).map((t) => t.function.name).sort(), ['Grep', 'Read']);
+    assert.match((await cli(tempProject(), server, ['-p', 'go', '--agents', '{not json'])).stderr, /--agents: /);
+    assert.match((await cli(tempProject(), server, ['-p', 'go', '--agent', 'ghost'])).stderr, /No agent named "ghost"/);
   });
 });

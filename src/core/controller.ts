@@ -73,6 +73,8 @@ export interface ControllerOptions {
   extraAgents?: AgentDefinition[];
   /** Run the main conversation as this agent: its prompt, tools and model (--agent). */
   agent?: string;
+  /** Read only these settings files (--setting-sources). */
+  settingSources?: ('user' | 'project' | 'local')[];
 }
 
 const SUBAGENT_EXCLUDED = new Set(['Agent', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']);
@@ -116,7 +118,7 @@ export class Controller implements RuntimeHandle {
 
   constructor(opts: ControllerOptions) {
     this.opts = opts;
-    this.loaded = loadSettings({ projectRoot: opts.cwd, extra: opts.extraSettings, overrides: opts.overrides });
+    this.loaded = loadSettings({ projectRoot: opts.cwd, extra: opts.extraSettings, overrides: opts.overrides, sources: opts.settingSources });
     this.settings = this.loaded.merged;
     this.session = new SessionState({ id: opts.sessionId, cwd: opts.cwd, settings: this.settings });
     for (const dir of opts.addDirs ?? []) this.session.addDir(dir);

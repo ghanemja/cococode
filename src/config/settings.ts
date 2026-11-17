@@ -217,6 +217,8 @@ export interface LoadOptions {
   extra?: string;
   /** Flags and environment, applied last. */
   overrides?: Settings;
+  /** --setting-sources: read only these settings files (default: all three). */
+  sources?: SettingsScope[];
 }
 
 function envSettings(env: NodeJS.ProcessEnv): Settings {
@@ -272,9 +274,10 @@ export function loadSettings(opts: LoadOptions): LoadedSettings {
     return { scope, path: file, settings: how.filter ? pick(data as Settings, how.filter) : (data as Settings) };
   };
 
-  const user = read('user', settingsPath('user', opts.projectRoot));
-  const project = read('project', settingsPath('project', opts.projectRoot));
-  const local = read('local', settingsPath('local', opts.projectRoot));
+  const wanted = (scope: SettingsScope): boolean => !opts.sources || opts.sources.includes(scope);
+  const user = wanted('user') ? read('user', settingsPath('user', opts.projectRoot)) : undefined;
+  const project = wanted('project') ? read('project', settingsPath('project', opts.projectRoot)) : undefined;
+  const local = wanted('local') ? read('local', settingsPath('local', opts.projectRoot)) : undefined;
 
   const tail: Source[] = [];
   if (opts.extra) {
@@ -301,8 +304,8 @@ export function loadSettings(opts: LoadOptions): LoadedSettings {
   const compat = mergeSettings(...own.map((s) => s.settings)).claudeCompat ?? true;
   const claude = compat
     ? [
-        read('claude-project', path.join(opts.projectRoot, '.claude', 'settings.json'), { filter: CLAUDE_COMPAT_KEYS }),
-        read('claude-local', path.join(opts.projectRoot, '.claude', 'settings.local.json'), { filter: CLAUDE_COMPAT_KEYS }),
+        wanted('project') ? read('claude-project', path.join(opts.projectRoot, '.claude', 'settings.json'), { filter: CLAUDE_COMPAT_KEYS }) : undefined,
+        wanted('local') ? read('claude-local', path.join(opts.projectRoot, '.claude', 'settings.local.json'), { filter: CLAUDE_COMPAT_KEYS }) : undefined,
       ]
     : [];
 

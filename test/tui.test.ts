@@ -587,26 +587,26 @@ describe('interactive UI', { skip: available ? false : 'python3 with pyte is not
         { send: `${ESC}[200~${pasted}${ESC}[201~`, after: 0.3 },
         { snapshot: 'typed' },
         { send: '\x07' },
-        { wait: 'edit 1> ', timeout: 10 },
+        { wait: 'edit 1>', timeout: 10 },
         { snapshot: 'editing' },
         { send: 'fail\r' },
         { wait: 'exited with status 3', timeout: 10 },
         { snapshot: 'failed' },
         { send: '\x18\x05' },
-        { wait: 'edit 2> ', timeout: 10 },
+        { wait: 'edit 2>', timeout: 10 },
         { send: '\r' },
         // The footer is back once the editor has gone.
         { wait: '% context', timeout: 10 },
         { snapshot: 'unchanged' },
         { send: '\x07' },
-        { wait: 'edit 3> ', timeout: 10 },
+        { wait: 'edit 3>', timeout: 10 },
         { send: 'and a line added in the editor\r' },
         { wait: '% context', timeout: 10 },
         { snapshot: 'edited' },
         { send: '\x1f', after: 0.3 },
         { snapshot: 'undone' },
         { send: '\x07' },
-        { wait: 'edit 4> ', timeout: 10 },
+        { wait: 'edit 4>', timeout: 10 },
         { send: 'the line, again\r' },
         { wait: '% context', timeout: 10 },
         { send: '\r' },
@@ -1011,12 +1011,13 @@ describe('interactive UI', { skip: available ? false : 'python3 with pyte is not
     // The shared pty driver starts the program with nothing above it. Job control needs a shell,
     // so this one starts bash and types the command; it checks the raw output for what is expected.
     const driver = String.raw`
-import json, os, pty, select, sys, time
+import fcntl, json, os, pty, select, struct, sys, termios, time
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(spec["cwd"])
     os.execvpe("bash", ["bash", "--norc", "--noprofile", "-i"], {**os.environ, **spec["env"]})
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 out = b""
 mark = 0
 failed = None
@@ -1055,15 +1056,18 @@ print(json.dumps({"failed": failed, "output": out.decode("utf-8", "replace")}))
         steps: [
           { expect: 'READY$ ' },
           { send: `node ${launcher} --base-url ${server.url} --model mock-model\r` },
-          { expect: 'coco v' },
+          { expect: 'Ask coco to do something' },
           { send: 'hello' },
           { expect: 'hello' },
           { send: '\x1a' },
           // The shell reports the stopped job and prompts again: the terminal is its own.
           { expect: 'Stopped' },
           { expect: 'READY$ ' },
+          // Typed at the shell (echoed), run by the shell (printed), and the shell prompts again.
           { send: 'echo back-in-the-shell\r' },
-          { expect: 'back-in-the-shell\r\nREADY$ ' },
+          { expect: 'back-in-the-shell' },
+          { expect: 'back-in-the-shell' },
+          { expect: 'READY$ ' },
           { send: 'fg\r' },
           // Redrawn after the stop, with the text that was being typed.
           { expect: 'hello' },

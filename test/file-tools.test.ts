@@ -694,6 +694,15 @@ describe('staleness is judged by content, not by the clock', () => {
     assert.equal(checkFresh(ctx, file('m.txt')), null);
     touch('m.txt');
     assert.match(checkFresh(ctx, file('m.txt'))!, /changed on disk/);
+    // Without a hash, a different size under the same timestamp still shows.
+    const when = new Date('2024-05-06T07:08:09Z');
+    put('s.txt', 'abc');
+    fs.utimesSync(file('s.txt'), when, when);
+    ctx.session.readFiles.set(file('s.txt'), { mtimeMs: fs.statSync(file('s.txt')).mtimeMs, partial: false, size: 3 });
+    assert.equal(checkFresh(ctx, file('s.txt')), null);
+    fs.writeFileSync(file('s.txt'), 'abcd');
+    fs.utimesSync(file('s.txt'), when, when);
+    assert.match(checkFresh(ctx, file('s.txt'))!, /changed on disk/);
   });
 
   test('writing and editing leave the file recorded with its new content', async () => {
