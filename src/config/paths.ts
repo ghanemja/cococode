@@ -1,0 +1,98 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+/** Name of the per-project config directory and of the memory file. */
+export const PROJECT_DIR = '.coco';
+export const MEMORY_FILE = 'COCO.md';
+export const LOCAL_MEMORY_FILE = 'COCO.local.md';
+
+/** User-level config directory (~/.coco unless COCO_CONFIG_DIR is set). */
+export function configDir(): string {
+  return process.env.COCO_CONFIG_DIR || path.join(os.homedir(), PROJECT_DIR);
+}
+
+export function ensureDir(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Stable, filesystem-safe name for a working directory. */
+export function projectSlug(cwd: string): string {
+  return path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+/** Where transcripts for a given working directory live. */
+export function sessionsDir(cwd: string): string {
+  return path.join(configDir(), 'projects', projectSlug(cwd));
+}
+
+export function fileHistoryDir(sessionId: string): string {
+  return path.join(configDir(), 'file-history', sessionId);
+}
+
+/**
+ * Nearest ancestor that looks like a project root (has .git or .coco).
+ * Falls back to the directory itself.
+ */
+export function findProjectRoot(cwd: string): string {
+  let dir = path.resolve(cwd);
+  const home = os.homedir();
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    if (dir !== home && fs.existsSync(path.join(dir, PROJECT_DIR, 'settings.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(cwd);
+    dir = parent;
+  }
+}
+
+/**
+ * Project-level directories searched for commands, agents, skills and output
+ * styles. `.claude` is included so an existing Claude Code setup keeps working.
+ */
+export function projectConfigDirs(root: string, claudeCompat: boolean): string[] {
+  const dirs = [path.join(root, PROJECT_DIR)];
+  if (claudeCompat) dirs.push(path.join(root, '.claude'));
+  return dirs;
+}
+
+export function userConfigDirs(claudeCompat: boolean): string[] {
+  const dirs = [configDir()];
+  if (claudeCompat) dirs.push(path.join(os.homedir(), '.claude'));
+  return dirs;
+}
+
+/** Shorten a path for display: relative to cwd when inside it, ~ for home. */
+export function displayPath(p: string, cwd: string): string {
+  const abs = path.resolve(cwd, p);
+  const rel = path.relative(cwd, abs);
+  if (rel === '') return '.';
+  if (!rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+  const home = os.homedir();
+  if (abs === home) return '~';
+  if (abs.startsWith(home + path.sep)) return '~' + abs.slice(home.length);
+  return abs;
+}
+
+export function expandHome(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+export function readJsonFile<T>(file: string): T | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error(`Could not parse ${file}: ${(err as Error).message}`);
+  }
+}
+
+export function writeJsonFile(file: string, value: unknown): void {
+  ensureDir(path.dirname(file));
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n');
+  fs.renameSync(tmp, file);
+}

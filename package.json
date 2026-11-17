@@ -1,0 +1,28 @@
+{
+  "name": "cococode",
+  "version": "0.1.0",
+  "description": "A terminal coding agent for local models (Ollama, LM Studio, llama.cpp, vLLM, any OpenAI-compatible server).",
+  "type": "module",
+  "bin": {
+    "coco": "bin/coco.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-concurrency=4 \"test/**/*.test.ts\"",
+    "dev": "node src/cli.ts",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}
