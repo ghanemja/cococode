@@ -269,8 +269,8 @@ function lexSimple(command: string): Lexed {
 }
 
 const READ_ONLY = new Set([
-  'ls', 'pwd', 'cat', 'head', 'tail', 'wc', 'echo', 'printf', 'which', 'type', 'whoami', 'uname', 'stat',
-  'du', 'df', 'grep', 'egrep', 'fgrep', 'cut', 'tr', 'diff', 'cmp', 'basename', 'dirname',
+  'pwd', 'cat', 'head', 'tail', 'wc', 'echo', 'printf', 'which', 'type', 'whoami', 'uname', 'stat',
+  'df', 'cut', 'tr', 'diff', 'cmp', 'basename', 'dirname',
   'realpath', 'readlink', 'id', 'true', 'false', 'test', '[', 'cd', 'nl', 'column', 'jq', 'seq', 'tac', 'rev',
   'fold', 'comm', 'md5sum', 'sha1sum', 'sha256sum', 'shasum', 'cksum', 'arch', 'nproc', 'uptime', 'ps', 'printenv',
   'sleep', 'wait', 'command', 'hash', 'groups', 'locale', 'tty', 'pgrep', 'lsof', 'free',
@@ -283,7 +283,7 @@ const READ_ONLY = new Set([
 const PATH_FREE = new Set([
   'echo', 'printf', 'true', 'false', 'sleep', 'seq', 'which', 'type', 'hash', 'command', 'whoami', 'uname', 'id',
   'arch', 'nproc', 'uptime', 'free', 'groups', 'locale', 'tty', 'wait', 'printenv', 'pgrep', 'ps', 'hostname',
-  'basename', 'dirname', 'pwd', 'date',
+  'basename', 'dirname', 'pwd',
 ]);
 
 /** A short-option cluster containing the given letter, e.g. `-uo` for `o`. */
@@ -291,16 +291,27 @@ function shortFlag(letter: string): RegExp {
   return new RegExp(`^-[A-Za-z0-9]*${letter}`);
 }
 
-/** Commands that are read-only unless one of these arguments is present. */
+const FOLLOWS_LINKS = [shortFlag('L'), /^--(follow|dereference)/];
+
+/**
+ * Commands that are read-only unless one of these arguments is present:
+ * options that write a file, run a program, or follow symlinks out of the
+ * directories being searched.
+ */
 const GUARDED: Record<string, RegExp[]> = {
-  find: [/^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/],
+  find: [/^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls|L|H|follow)$/],
   sort: [shortFlag('o'), /^--output/, /^--compress-program/],
-  tree: [shortFlag('o'), /^--output/],
+  tree: [shortFlag('o'), /^--output/, shortFlag('l')],
   date: [shortFlag('s'), /^--set/],
   file: [shortFlag('C'), /^--compile/],
-  rg: [/^--pre/, /^--hostname-bin/],
-  fd: [shortFlag('x'), shortFlag('X'), /^--exec/],
-  ag: [/^--pager/],
+  rg: [/^--pre/, /^--hostname-bin/, ...FOLLOWS_LINKS],
+  fd: [shortFlag('x'), shortFlag('X'), /^--exec/, ...FOLLOWS_LINKS],
+  ag: [/^--pager/, shortFlag('f'), /^--follow/],
+  grep: [shortFlag('R'), /^--dereference-recursive/],
+  egrep: [shortFlag('R'), /^--dereference-recursive/],
+  fgrep: [shortFlag('R'), /^--dereference-recursive/],
+  du: FOLLOWS_LINKS,
+  ls: FOLLOWS_LINKS,
 };
 
 const HOSTNAME_FLAGS = /^(-f|-s|-i|-I|-d|-A|-y|--fqdn|--short|--ip-address|--all-ip-addresses|--domain|--long|--all-fqdns)$/;
@@ -450,6 +461,8 @@ function isOpaqueWord(word: string): boolean {
   if (/[$`]/.test(word)) return true;
   if (/\{[^{}]*(,|\.\.)[^{}]*\}/.test(word)) return true; // brace expansion
   if (word.startsWith('~') && word !== '~' && !word.startsWith('~/')) return true; // ~user, ~+, ~-
+  // A glob such as ".*" can match ".." in older shells.
+  if (word.split('/').some((part) => /^\.[*?[]/.test(part))) return true;
   return false;
 }
 

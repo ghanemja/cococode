@@ -376,7 +376,7 @@ export class PermissionManager {
         if (candidate === '/dev/null') continue;
         const abs = path.resolve(base, expandHome(candidate));
         if (!this.session.inWorkingDirs(abs)) return false;
-        if (writes && (this.isProtectedPath(abs) || this.isProtectedPath(realpathSafe(abs)))) return false;
+        if (writes && (this.isProtectedTarget(abs) || this.isProtectedTarget(realpathSafe(abs)))) return false;
       }
     }
     return true;
@@ -423,6 +423,16 @@ export class PermissionManager {
     if (path.dirname(absPath) === home && /^\.(bashrc|bash_profile|bash_login|bash_logout|zshrc|zprofile|zshenv|zlogin|profile|gitconfig|npmrc|inputrc)$/.test(base)) return true;
     if (isInside(absPath, path.join(home, '.ssh'))) return true;
     return false;
+  }
+
+  /**
+   * For commands that move or copy: besides protected files, the directories
+   * that hold them. Renaming some folder to ".coco" would otherwise install a
+   * settings file without ever writing to a protected path.
+   */
+  private isProtectedTarget(absPath: string): boolean {
+    const base = path.basename(absPath);
+    return this.isProtectedPath(absPath) || base === PROJECT_DIR || base === '.claude' || absPath === configDir();
   }
 
   private askOutcome(req: PermissionRequest, reason?: string, warning?: string): PermissionOutcome {

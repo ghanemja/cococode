@@ -335,14 +335,22 @@ describe('validateInput: nested schemas', () => {
     if (!res.ok) assert.match(res.error, /missing required parameter "questions\[0\]\.options"/);
   });
 
-  // askUserTool.execute() has code to accept options given as bare strings
-  // ("Models sometimes send options as bare strings"), but validation runs
-  // first and rejects them, so that code is unreachable. The fix belongs in
-  // src/tools/meta.ts (allow string | object for option items), which this
-  // test file does not own.
-  test('AskUserQuestion: options given as bare strings reach the tool', { skip: 'schema in src/tools/meta.ts rejects string options before execute() can normalise them' }, () => {
-    const res = validateInput(askUserTool.parameters, { questions: [{ question: 'Which DB?', options: ['Postgres', 'SQLite'] }] });
-    assert.equal(res.ok, true);
+  test('AskUserQuestion: near-miss shapes are repaired before validation', () => {
+    const strings = askUserTool.normalize!({ questions: [{ question: 'Which DB?', options: ['Postgres', 'SQLite'] }] });
+    assert.deepEqual(validateInput(askUserTool.parameters, strings), {
+      ok: true,
+      value: { questions: [{ question: 'Which DB?', options: [{ label: 'Postgres' }, { label: 'SQLite' }] }] },
+    });
+    // One question sent without the surrounding list.
+    const single = askUserTool.normalize!({ question: 'Proceed?', options: [{ label: 'Yes' }, 'No'] });
+    assert.deepEqual(validateInput(askUserTool.parameters, single), {
+      ok: true,
+      value: { questions: [{ question: 'Proceed?', options: [{ label: 'Yes' }, { label: 'No' }] }] },
+    });
+    // The schema shown to the model stays strict: without the repair, strings are rejected.
+    assert.equal(validateInput(askUserTool.parameters, { questions: [{ question: 'Which DB?', options: ['Postgres'] }] }).ok, false);
+    // Things it cannot repair pass through for validation to report.
+    assert.deepEqual(askUserTool.normalize!({ nothing: true }), { nothing: true });
   });
 
   test('a union type accepts any listed type', () => {

@@ -103,6 +103,11 @@ export interface Tool<I = any> {
   /** Model-facing description. Keep it short: local models have small context windows. */
   description: string;
   parameters: JsonSchema;
+  /**
+   * Repair argument shapes models commonly get wrong, before validation.
+   * The schema stays strict (it is what the model is shown); this accepts near misses.
+   */
+  normalize?(raw: Record<string, unknown>): Record<string, unknown>;
   /** Read-only calls are allowed in plan mode and may run concurrently. */
   isReadOnly(input: I): boolean;
   /** What needs approval, or null when the call never needs it. */

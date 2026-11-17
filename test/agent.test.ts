@@ -253,6 +253,32 @@ describe('agent loop: tool calls from weaker models', () => {
     assert.match(result.content, /file_path/);
   });
 
+  test('a tool can repair near-miss arguments before validation', async () => {
+    let asked: unknown;
+    const h = harness([{ calls: [{ name: 'AskUserQuestion', args: { questions: [{ question: 'Which DB?', options: ['Postgres', 'SQLite'] }] } }] }, { text: 'ok' }], {
+      runtime: {
+        askUser: async (questions) => {
+          asked = questions;
+          return { 'Which DB?': 'SQLite' };
+        },
+      },
+    });
+    await h.run('x');
+    assert.deepEqual(asked, [{ question: 'Which DB?', options: [{ label: 'Postgres' }, { label: 'SQLite' }] }]);
+    assert.match(h.toolResults()[0]!.content, /A: SQLite/);
+  });
+
+  test('shell output keeps multi-byte characters that straddle a read boundary', async () => {
+    const h = harness([{ calls: [{ name: 'Bash', args: { command: "yes '€' | head -n 60000 | tr -d '\\n'" } }] }, { text: 'ok' }], {
+      mode: 'bypassPermissions',
+      settings: { maxToolOutputChars: 200_000 },
+    });
+    await h.run('x');
+    const out = h.toolResults()[0]!.content;
+    assert.ok(out.length >= 60_000, `expected the full output, got ${out.length} characters`);
+    assert.ok(!out.includes(String.fromCodePoint(0xfffd)), 'no replacement characters');
+  });
+
   test('unparseable arguments are reported, not executed', async () => {
     const h = harness([{ calls: [{ name: 'Bash', args: {}, parseError: 'arguments were not valid JSON: {"command": "ls' }] }, { text: 'ok' }]);
     await h.run('x');

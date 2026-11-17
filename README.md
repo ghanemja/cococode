@@ -166,7 +166,7 @@ Type a request and press enter. While the model works you can keep typing; messa
 | `NotebookEdit` | Edit Jupyter notebook cells |
 | `Bash` | Run shell commands; working directory persists; background mode |
 | `BashOutput`, `KillShell` | Follow or stop background commands |
-| `Glob`, `Grep` | Find files and search contents (uses ripgrep when installed) |
+| `Glob`, `Grep` | Find files and search contents, respecting `.gitignore` (uses ripgrep when installed) |
 | `WebFetch`, `WebSearch` | Fetch a page as Markdown; search (DuckDuckGo, or your SearXNG) |
 | `TodoWrite` | Keep a task list for multi-step work |
 | `Agent` | Delegate a task to a subagent with its own context |
@@ -181,8 +181,9 @@ By default coco asks before it changes anything.
 
 - **Reads** inside the project are allowed. Outside it, coco asks.
 - **Edits** ask, showing the diff first.
-- **Shell commands** ask, except ones that only read (`ls`, `git status`, `grep` and similar, with no redirection or substitution).
+- **Shell commands** ask, except ones that only read (`ls`, `git status`, `grep` and similar) and stay inside the project. Anything coco cannot analyze in advance, such as command substitution or a variable in a path, asks.
 - **Web and MCP tools** ask the first time.
+- **Files that decide what runs on your machine** always ask, in every mode short of `bypassPermissions`: `.git/`, coco and Claude settings files, `.mcp.json`, shell startup files and `~/.ssh`. A general `Edit` rule does not cover them; a rule has to name the file.
 
 Each prompt offers "yes", "yes, and don't ask again" (which saves a rule), or "no" with room to say what to do instead.
 
@@ -208,7 +209,7 @@ Rules live in settings files and take the form `Tool` or `Tool(specifier)`:
 }
 ```
 
-Deny beats ask beats allow. Path rules follow gitignore conventions (`//abs`, `~/home`, `/from-project-root`, `relative`). A compound command such as `a && b` is allowed only if every part is. `Read` and `Edit` deny rules also block shell commands that name those paths, on a best-effort basis: they are a guard against accidents, not a sandbox.
+Deny beats ask beats allow. Path rules follow gitignore conventions (`//abs`, `~/home`, `/from-project-root`, `relative`). A compound command such as `a && b` is allowed only if every part is, and an ask or deny rule on any part applies to the whole line. `Edit` rules cover every tool that changes files and `Read` rules cover `Glob` and `Grep`; a bare `Write`, `NotebookEdit`, `Glob` or `Grep` rule means just that tool. `Read` and `Edit` deny rules also block shell commands that name those paths, on a best-effort basis: they are a guard against accidents, not a sandbox.
 
 ## Memory
 

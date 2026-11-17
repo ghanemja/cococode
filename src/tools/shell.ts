@@ -150,8 +150,10 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       return;
     }
 
-    const onChunk = (data: Buffer) => {
-      const text = data.toString('utf8');
+    // Decoding per stream (not per chunk) keeps a multi-byte character intact when it is split across reads.
+    proc.stdout?.setEncoding('utf8');
+    proc.stderr?.setEncoding('utf8');
+    const onChunk = (text: string) => {
       buffer.push(text);
       opts.onData?.(text);
     };
@@ -266,8 +268,10 @@ export class ShellManager {
       readOffset: 0,
       dropped: 0,
     };
-    const onChunk = (data: Buffer) => {
-      entry.output += data.toString('utf8');
+    proc.stdout?.setEncoding('utf8');
+    proc.stderr?.setEncoding('utf8');
+    const onChunk = (text: string) => {
+      entry.output += text;
       if (entry.output.length > MAX_BACKGROUND_BUFFER) {
         const cut = entry.output.length - MAX_BACKGROUND_BUFFER;
         entry.output = entry.output.slice(cut);

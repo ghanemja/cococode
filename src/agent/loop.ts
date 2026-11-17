@@ -465,7 +465,15 @@ export class Agent {
       if (call.parseError) {
         return { call, tool, input: undefined, error: `The arguments for ${tool.name} were not valid JSON (${call.parseError}). Call the tool again with a valid JSON object.` };
       }
-      const check = validateInput(tool.parameters, call.arguments);
+      let raw = call.arguments;
+      if (tool.normalize) {
+        try {
+          raw = tool.normalize(raw);
+        } catch {
+          raw = call.arguments; // validation will report what is wrong
+        }
+      }
+      const check = validateInput(tool.parameters, raw);
       if (!check.ok) return { call, tool, input: undefined, error: check.error };
       return { call, tool, input: check.value, error: undefined };
     });

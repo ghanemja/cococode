@@ -187,6 +187,9 @@ describe('isReadOnlyCommand: things that write or execute', () => {
     'rg --pre cat x', 'rg --pre=cat x', 'rg --hostname-bin=x y', 'fd -x rm', 'fd --exec rm', 'fd -X rm', 'fd --exec-batch rm', 'fd -tx x -x rm', 'ag --pager rm x',
     'uniq a out', 'uniq -c a out', 'tree -o x', 'tree -ao x', 'date -s x', 'date --set=x', 'date -us x', 'hostname foo', 'hostname -F f', 'hostname -b x',
     'file -C -m x', 'file --compile x',
+    // options that follow symlinks out of the tree being searched
+    'grep -R x .', 'grep -Rn x .', 'grep --dereference-recursive x .', 'find -L . -name x', 'find . -follow', 'rg -L x', 'rg --follow x', 'fd -L x', 'du -L',
+    'ls -LR', 'tree -l',
     'command rm x', 'command', 'command -p rm x', 'hash -p /x ls', 'type $(rm x)',
     // output redirection, even when glued to the command
     'cat x > y', 'ls>out', 'echo hi >> f', 'cat<x>y', 'ls 2>err', 'ls &>out', 'ls >|out', 'cat <> f',
@@ -286,7 +289,7 @@ describe('pathCandidates and pathArguments', () => {
   });
 
   test('arguments the shell would rewrite make the command opaque', () => {
-    for (const cmd of ['cat $HOME/.ssh/id_rsa', 'cat $X', 'cat "${X}"', 'cat ~root/.bashrc', 'cat ~+/x', 'cat {/etc/passwd,}', 'cat a{1..3}', 'cat `x`', 'cat < $F', 'grep x --file=$F', 'cd -', 'cd $OLDPWD']) {
+    for (const cmd of ['cat $HOME/.ssh/id_rsa', 'cat $X', 'cat "${X}"', 'cat ~root/.bashrc', 'cat ~+/x', 'cat {/etc/passwd,}', 'cat a{1..3}', 'cat `x`', 'cat < $F', 'grep x --file=$F', 'cd -', 'cd $OLDPWD', 'ls .*', 'cat src/.??*', 'cat .[a-z]*']) {
       assert.equal(pathCandidates(cmd).opaque, true, cmd);
     }
     for (const cmd of ['cat a', 'cat ~/x', 'cat ~', 'cat ./a/../b', 'cat a{b', 'cat {}', 'find . -name x', 'cd src']) {
@@ -295,7 +298,7 @@ describe('pathCandidates and pathArguments', () => {
   });
 
   test('commands that only print their arguments are path-free', () => {
-    for (const cmd of ['echo /etc/passwd', 'echo $HOME', 'printf "%s" ~root', 'which ls', 'basename /a/b', 'dirname /a/b', 'date -u', 'node --version', 'sleep 1']) {
+    for (const cmd of ['echo /etc/passwd', 'echo $HOME', 'printf "%s" ~root', 'which ls', 'basename /a/b', 'dirname /a/b', 'node --version', 'sleep 1']) {
       const found = pathCandidates(cmd);
       assert.equal(found.pathFree, true, cmd);
       assert.equal(found.opaque, false, cmd);
@@ -303,6 +306,8 @@ describe('pathCandidates and pathArguments', () => {
     }
     // ...but a file fed to them on stdin is still read.
     assert.deepEqual(pathCandidates('echo x < /etc/passwd').paths, ['/etc/passwd']);
+    // `date -f` reads dates from a file, so its arguments are checked like any other reader's.
+    assert.deepEqual(pathCandidates('date -f /etc/passwd').paths, ['/etc/passwd']);
     assert.equal(pathCandidates('cat f').pathFree, false);
   });
 

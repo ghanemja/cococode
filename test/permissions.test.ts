@@ -565,6 +565,10 @@ describe('PermissionManager: shell commands', () => {
       'wc -l /etc/passwd',
       'stat /etc/shadow',
       'file -f /etc/passwd',
+      'date -f /etc/passwd',
+      'ls .*',
+      'grep -R password .',
+      'find -L . -name id_rsa',
     ]) {
       assert.equal(f.bash(cmd), 'ask', cmd);
     }
@@ -654,6 +658,12 @@ describe('PermissionManager: shell commands', () => {
       'mkdir .git',
       'cp -t.git x',
       'cp --target-directory=.git/hooks x',
+      // ...and so would renaming a prepared directory into place
+      'mv prepared .coco',
+      'cp -r prepared .claude',
+      'mv prepared .coco/',
+      'mv .coco old && mv prepared .coco',
+      'mv src/.git2 src/.git',
     ]) {
       assert.equal(g.bash(cmd), 'ask', cmd);
     }

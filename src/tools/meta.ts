@@ -95,6 +95,18 @@ export const askUserTool: Tool<AskInput> = {
     },
     required: ['questions'],
   },
+  // Models often send options as bare strings, or one question without the list around it.
+  normalize(raw) {
+    const list = Array.isArray(raw.questions) ? raw.questions : raw.questions && typeof raw.questions === 'object' ? [raw.questions] : raw.question ? [raw] : undefined;
+    if (!list) return raw;
+    const questions = list.map((q: unknown) => {
+      if (!q || typeof q !== 'object' || Array.isArray(q)) return q;
+      const question = q as Record<string, unknown>;
+      if (!Array.isArray(question.options)) return question;
+      return { ...question, options: question.options.map((o: unknown) => (typeof o === 'string' || typeof o === 'number' ? { label: String(o) } : o)) };
+    });
+    return { ...raw, questions };
+  },
   isReadOnly: () => true,
   label: (input) => truncate(input.questions?.[0]?.question ?? '', 80),
   async execute(input, ctx): Promise<ToolResult> {
