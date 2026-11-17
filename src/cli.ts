@@ -593,6 +593,7 @@ export async function main(argv: string[]): Promise<number> {
 
   const { App } = await import('./ui/app.ts');
   const app = new App(ctl);
+  app.disableSlashCommands = Boolean(flags['disable-slash-commands']);
   let showHistory = resumed;
   if (resumeFlag === true && !resumed) {
     // `--resume` with no id: the picker opens once the UI is up.

@@ -55,10 +55,10 @@ const SHORTCUTS: [string, string][] = [
   ['ctrl+_', 'undo'],
   ['alt+d', 'delete the next word'],
   ['ctrl+t', 'show or hide the task list'],
+  ['ctrl+b', 'background a running command'],
   ['ctrl+o', 'verbose output'],
   ['alt+p', 'switch model'],
   ['alt+t', 'thinking on or off'],
-  ['ctrl+l', 'clear the screen'],
   ['ctrl+z', 'suspend'],
 ];
 
@@ -90,6 +90,8 @@ export class App implements CommandIO {
   /** ctrl+x, waiting for the ctrl+e that opens the editor. */
   private readonly chord = new ChordPrefix();
   private dialog: Dialog | null = null;
+  /** Send input starting with "/" to the model as written (--disable-slash-commands). */
+  disableSlashCommands = false;
   private completion: Completion | null = null;
   private completionDismissed = '';
   private files: string[] | null = null;
@@ -492,6 +494,13 @@ export class App implements CommandIO {
       void this.editPrompt();
       return;
     }
+    // ctrl+b moves a running shell command to the background. With nothing running it
+    // keeps its usual meaning (cursor left); ctrl+x ctrl+b always means the former.
+    if (key.ctrl && !key.meta && key.name === 'b' && (afterPrefix || this.ctl.session.shells.foregroundCount() > 0)) {
+      const moved = this.ctl.session.detachForeground();
+      this.setNotice(moved ? `Moved ${moved === 1 ? 'the running command' : `${moved} running commands`} to the background · /bashes lists them` : 'No command is running in the foreground', 2500);
+      return;
+    }
     if (this.helpOpen) {
       this.helpOpen = false;
       // The keys that mean "close this" only close it; any other key also does its usual job.
@@ -776,6 +785,10 @@ export class App implements CommandIO {
     }
     const previous = this.completion?.items[this.completion.index]?.value;
     let items: Completion['items'] = [];
+    if (token.kind === 'command' && this.disableSlashCommands) {
+      this.completion = null;
+      return;
+    }
     if (token.kind === 'command') {
       items = rankCommands(allCommands(this.ctl), token.query).map((cmd) => ({
         value: `/${cmd.name}`,
@@ -861,7 +874,7 @@ export class App implements CommandIO {
     await this.ready;
     if (this.exiting) return;
     if (this.running) {
-      if (text.startsWith('/')) {
+      if (text.startsWith('/') && !this.disableSlashCommands) {
         this.setNotice('Commands are unavailable while the model is working (esc to interrupt)', 2500);
         this.editor.set(text);
         return;
@@ -870,7 +883,7 @@ export class App implements CommandIO {
       this.draw();
       return;
     }
-    if (text.startsWith('/')) {
+    if (text.startsWith('/') && !this.disableSlashCommands) {
       await this.command(text);
       return;
     }

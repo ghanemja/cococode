@@ -220,6 +220,37 @@ describe('interactive UI', { skip: available ? false : 'python3 with pyte is not
     assert.match(toolMessage.content, /declined this action and said: keep the build dir/);
   });
 
+  test('ctrl+b moves a running command to the background and the turn carries on', async () => {
+    const res = await tui({
+      script: [{ toolCalls: [{ name: 'Bash', arguments: { command: 'echo started; sleep 20; echo finished' } }] }, { text: 'The command is still running in the background.' }],
+      args: ['--dangerously-skip-permissions'],
+      steps: [
+        { send: 'run the long command\r', after: 1.5 },
+        { send: '\x02', after: 0.3 },
+        { wait: 'still running in the background.', timeout: 15 },
+        { sleep: 0.3 },
+        { snapshot: 'moved' },
+        { send: '/bashes\r', after: 0.5 },
+        { snapshot: 'listed' },
+      ],
+    });
+    // The model was told where the command went, long before it would have finished.
+    const result = lastMessage(res.server.requests[1]!, 'tool').content;
+    assert.match(result, /started[\s\S]*The user moved this command to the background[\s\S]*bash_1/);
+    assert.doesNotMatch(result, /finished/);
+    assert.match(res.snapshots.listed!, /bash_1[\s\S]*sleep 20/);
+  });
+
+  test('--disable-slash-commands sends /text to the model as written', async () => {
+    const res = await tui({
+      script: [{ text: 'You typed a path.' }],
+      args: ['--disable-slash-commands'],
+      steps: [{ send: '/help me with /etc/hosts\r' }, { wait: 'You typed a path.', timeout: 15 }, { sleep: 0.2 }, { snapshot: 'end' }],
+    });
+    assert.equal(lastMessage(res.server.requests[0]!, 'user').content, '/help me with /etc/hosts');
+    assert.ok(!res.snapshots.end!.includes('Unknown command'));
+  });
+
   test('escape interrupts, and messages typed while busy are queued', async () => {
     const res = await tui({
       script: [{ text: 'Slow answer.', delayMs: 5000 }, { text: 'Second answer.', delayMs: 1500 }, { text: 'Answer to the queued one.' }],

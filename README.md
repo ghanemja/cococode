@@ -126,7 +126,17 @@ Type a request and press enter. While the model works you can keep typing; messa
 | shift+tab | Cycle permission mode: ask → accept edits → plan |
 | ctrl+o | Toggle verbose tool output |
 | ctrl+c | Clear input or interrupt; twice to exit |
-| up / down | Prompt history |
+| up / down | Prompt history. While the model works, up takes back the last queued message |
+| ctrl+r | Search prompt history |
+| ctrl+g, ctrl+x ctrl+e | Edit the prompt in `$VISUAL` / `$EDITOR` |
+| ctrl+b | Move a running shell command to the background |
+| ctrl+s | Stash the prompt; on an empty prompt, bring it back |
+| ctrl+t | Show or hide the task list |
+| ctrl+_ | Undo the last edit to the prompt |
+| ctrl+a/e/k/u/w/y, alt+b/f/d | Line editing as in a shell |
+| alt+p, alt+t | Switch model; turn thinking on or off |
+| ? | On an empty prompt: show the shortcuts |
+| ctrl+z | Suspend; `fg` resumes |
 | ctrl+l | Clear the screen |
 
 ### Slash commands
