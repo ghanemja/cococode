@@ -104,6 +104,8 @@ export interface Settings {
   fallbackModel?: string | string[];
   /** Run the main conversation as this agent (its prompt, tools and model). */
   agent?: string;
+  /** When a reply announces a next step but calls no tool, tell the model once to go on (default true). */
+  nudgeAnnouncedActions?: boolean;
 
   /** Context window in tokens. Detected from the server when unset. */
   contextWindow?: number;

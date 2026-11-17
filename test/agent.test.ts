@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, test } from 'node:test';
 import type { AgentEvent, PermissionAnswer, PermissionPrompt } from '../src/agent/loop.ts';
-import { Agent } from '../src/agent/loop.ts';
+import { Agent, announcesAction } from '../src/agent/loop.ts';
 import { CLEARED_RESULT, fitTranscript, microcompact, recentTail } from '../src/agent/compact.ts';
 import { TokenCalibrator, estimateTokens, messagesTokens } from '../src/agent/tokens.ts';
 import { buildSystemPrompt } from '../src/agent/systemPrompt.ts';
@@ -1063,5 +1063,50 @@ describe('system prompt', () => {
     assert.ok(prompt.startsWith('You are a pirate.'));
     assert.ok(!prompt.includes('You are coco'));
     assert.match(prompt, /Working directory/);
+  });
+});
+
+describe('agent loop: a reply that announces a step without taking it', () => {
+  test('the model is told once that nothing happened, and can then act', async () => {
+    const h = harness([{ text: 'I found the problem. Let me read a.txt to confirm.' }, { calls: [{ name: 'Read', args: { file_path: 'a.txt' } }] }, { text: 'Confirmed: three lines.' }]);
+    const events = await h.run('check a.txt');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.toolResults().length, 1);
+    assert.equal(h.agent.lastAssistantText(), 'Confirmed: three lines.');
+    const note = h.provider.requests[1]!.messages.at(-1) as UserMessage;
+    assert.equal(note.isMeta, true);
+    assert.match(String(note.content), /contained no tool call, so nothing happened/);
+    assert.ok(events.some((e) => e.type === 'notice' && /without doing it/.test(e.text)));
+  });
+
+  test('it happens once per turn: a second announcement ends the turn as written', async () => {
+    const h = harness([{ text: 'Let me check the tests.' }, { text: "I'll run the tests now." }, { text: 'never requested' }]);
+    const events = await h.run('go');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.provider.requests.length, 2);
+    assert.equal(h.agent.lastAssistantText(), "I'll run the tests now.");
+  });
+
+  test('answers, questions and offers are left alone', async () => {
+    for (const text of ['Done. The tests pass.', 'Let me know if you want anything else.', "I'll create the file once you confirm the name.", 'Should I go ahead and run the migration?']) {
+      const h = harness([{ text }, { text: 'never requested' }]);
+      await h.run('go');
+      assert.equal(h.provider.requests.length, 1, text);
+    }
+  });
+
+  test('announcesAction reads only the closing sentence', () => {
+    for (const text of ['Let me read the file.', "I've updated the parser. Now I'll run the tests to verify.", "I'll start by exploring the repository structure:", '**Next, I will update the README.**', "The bug is in auth.ts.\n\nLet's fix it."]) {
+      assert.equal(announcesAction(text), true, text);
+    }
+    for (const text of ['', "I'll be happy to help with that!", 'Let me explain how this works. The loop runs until the queue is empty.', 'Here is the plan:\n1. Read the config\n2. Update the parser', 'I fixed the bug. Would you like me to run the tests?']) {
+      assert.equal(announcesAction(text), false, text);
+    }
+  });
+
+  test('the setting turns it off', async () => {
+    const h = harness([{ text: 'Let me read the file.' }, { text: 'never requested' }], { settings: { nudgeAnnouncedActions: false } });
+    await h.run('go');
+    assert.equal(h.provider.requests.length, 1);
   });
 });

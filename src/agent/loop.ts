@@ -177,6 +177,38 @@ const CUT_OFF_NOTE =
   'Your reply was cut off at the output limit. Continue exactly where it stopped, without repeating anything. If you were about to call a tool, call it now.';
 const DROPPED_NOTE =
   'The connection dropped while you were replying, so your last message is incomplete. Continue exactly where it stopped, without repeating what you already wrote. If you were about to call a tool, call it now.';
+const ANNOUNCED_NOTE =
+  'Your last message says what you are about to do, but it contained no tool call, so nothing happened. If there is more to do, call the tool now. If the task is finished, or you need something from the user, say so plainly instead.';
+
+const ACTION_VERBS =
+  'read|check|look|open|search|find|run|execute|create|write|edit|update|modify|change|fix|add|remove|delete|implement|start|begin|examine|inspect|explore|review|verify|test|list|view|see|try|install|build|make|apply|call|use|grep|fetch|analy[sz]e|investigate|proceed|continue|take|go|do|get|gather|scan|locate|refactor|rename|move|replace|rewrite|debug|compile|commit|set up|dig';
+const ANNOUNCES = new RegExp(
+  `^(?:(?:ok(?:ay)?|alright|great|good|perfect|sure|now|next|first|then|so|finally|after that)[,.!]?\\s+)*` +
+    `(?:let me|let's|let us|i'll|i will|i am going to|i'm going to|i need to|i should|i'm now going to|now i'll|now i will|going to|time to)\\s+` +
+    `(?:(?:now|first|also|then|just|quickly|go ahead and|start by|begin by|try to|need to)\\s+)*(?:${ACTION_VERBS})\\b`,
+  'i',
+);
+/** Signs that the model is waiting for the user rather than about to act. */
+const WAITS_FOR_USER = /\?|\b(?:let me know|if you|once you|when you|after you|would you like|do you want|should i|shall i|please (?:confirm|provide|tell|let|share|specify)|your (?:confirmation|approval|input|permission|go-ahead))\b/i;
+
+/**
+ * Does a reply without tool calls end by announcing an action ("Let me read
+ * the file.")? Small local models do this often: they describe the next step
+ * and stop, and the turn ends with nothing done. Only the closing sentence
+ * counts, and anything that reads as waiting for the user does not.
+ */
+export function announcesAction(text: string): boolean {
+  const lines = text.trim().split('\n').map((l) => l.trim()).filter(Boolean);
+  const last = lines[lines.length - 1];
+  if (!last || last.length > 300) return false;
+  // The closing sentence of the last line, without list markers or emphasis.
+  const plain = last.replace(/^(?:[-*>#]+|\d+[.)])\s*/, '').replace(/[*_`]/g, '');
+  const sentences = plain.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const closing = sentences[sentences.length - 1] ?? plain;
+  if (WAITS_FOR_USER.test(plain)) return false;
+  return ANNOUNCES.test(closing);
+}
+
 /** How many times a reply cut off at the output limit is continued automatically. */
 const MAX_CONTINUATIONS = 2;
 /** How many times in a row a reply cut off by a dropped connection is continued. */
@@ -282,6 +314,7 @@ export class Agent {
     let turns = 0;
     let lengthRetried = false;
     let emptyRetried = false;
+    let announcedNudged = false;
     let overflowRetried = false;
     let stopHookBlocks = 0;
     let maxTokens: number | undefined;
@@ -515,6 +548,15 @@ export class Agent {
             continue;
           }
           yield { type: 'notice', level: 'warn', text: 'The reply was cut off at the output token limit again. Say "continue" to carry on, or raise maxOutputTokens.' };
+        }
+
+        // A reply that ends by announcing a step, with no tool call, would end the turn with
+        // nothing done. Point it out once; a second time the reply stands.
+        if (stopReason !== 'length' && !announcedNudged && tools.length > 0 && deps.settings.nudgeAnnouncedActions !== false && announcesAction(text)) {
+          announcedNudged = true;
+          this.push({ role: 'user', isMeta: true, content: ANNOUNCED_NOTE });
+          yield { type: 'notice', level: 'info', text: 'The model said what it would do next without doing it; asking it to go on.' };
+          continue;
         }
 
         const hookEvent = deps.depth > 0 ? 'SubagentStop' : 'Stop';

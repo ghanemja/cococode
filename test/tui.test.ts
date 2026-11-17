@@ -98,7 +98,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /** Process id and state of the UI started for this mock server ("T..." when stopped). */
 function uiProcess(server: MockServer): { pid: number; state: string } | undefined {
-  const rows = execFileSync('ps', ['-eo', 'pid=,stat=,args='], { encoding: 'utf8' }).split('\n');
+  const rows = execFileSync('ps', ['-A', '-ww', '-o', 'pid=,stat=,args='], { encoding: 'utf8' }).split('\n');
   const row = rows.find((r) => r.includes('coco.js') && r.includes(`--base-url ${server.url} `));
   const m = row ? /^\s*(\d+)\s+(\S+)/.exec(row) : null;
   return m ? { pid: Number(m[1]), state: m[2]! } : undefined;
@@ -921,8 +921,37 @@ describe('interactive UI', { skip: available ? false : 'python3 with pyte is not
     assert.match(res.snapshots.help!, /> Ask coco to do something/);
     const panel = belowPrompt(res.snapshots.help!);
     assert.match(panel[0]!, /^ {2}!\s+run a shell command$/);
-    assert.equal(panel[panel.length - 1], '  … /help has the rest');
+    // One column, cut where the terminal ends, with a count of what did not fit.
+    assert.equal(rows.length, 14);
+    assert.match(panel[panel.length - 1]!, /^ {2}… \+\d+ more$/);
+    assert.equal(panel.length - 1 + Number(/\d+/.exec(panel[panel.length - 1]!)![0]), 20);
     assert.equal(promptText(res.snapshots.typed!), 'x');
+  });
+
+  test('a pinned task list longer than the space for it shows where the work is', async () => {
+    const todos = Array.from({ length: 14 }, (_, i) => ({
+      content: `Step ${i + 1} of a plan with a description long enough to need cutting off`,
+      status: i < 5 ? 'completed' : i === 5 ? 'in_progress' : 'pending',
+      activeForm: `Doing step ${i + 1}`,
+    }));
+    const res = await tui({
+      script: [{ toolCalls: [{ name: 'TodoWrite', arguments: { todos } }] }, { text: 'Planned.' }],
+      cols: 50,
+      rows: 13,
+      steps: [{ send: 'plan it\r' }, { wait: '● Planned.', timeout: 15 }, { sleep: 0.3 }, { send: '\x14', after: 0.3 }, { snapshot: 'pinned' }],
+    });
+    const screen = res.snapshots.pinned!;
+    for (const row of screen.split('\n')) assert.ok(row.length < 50, `row too wide: ${JSON.stringify(row)}`);
+    // The prompt stays on screen, and the list starts at the last finished task rather than the first.
+    assert.match(screen, /> Ask coco to do something/);
+    const list = belowPrompt(screen).slice(1);
+    assert.equal(list[0], '  Tasks · 5 of 14 done · ctrl+t to hide');
+    assert.match(list[1]!, /^ {2}☑ Step 5 of a plan with a description long/);
+    assert.equal(list[2], '  ◼ Doing step 6');
+    assert.match(list[3]!, /^ {2}☐ Step 7 of a plan .*…$/);
+    // Hidden tasks are on both sides of what is shown, so they are only counted.
+    assert.match(list[list.length - 1]!, /^ {2}… \d+ more not shown$/);
+    assert.equal(list.length - 2 + Number(/\d+/.exec(list[list.length - 1]!)![0]), 14);
   });
 
   test('up takes the last queued message back into the prompt', async () => {
@@ -1021,15 +1050,17 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 out = b""
 mark = 0
 failed = None
+alive = True
 def pump(seconds):
-    global out
+    global out, alive
     end = time.time() + seconds
-    while time.time() < end:
+    while alive and time.time() < end:
         if select.select([fd], [], [], 0.05)[0]:
             try:
                 data = os.read(fd, 65536)
             except OSError:
-                return
+                data = b""
+            alive = len(data) > 0
             out += data
 for step in spec["steps"]:
     if "send" in step:
@@ -1038,7 +1069,7 @@ for step in spec["steps"]:
         continue
     want = step["expect"].encode()
     deadline = time.time() + 20
-    while want not in out[mark:] and time.time() < deadline:
+    while alive and want not in out[mark:] and time.time() < deadline:
         pump(0.1)
     at = out.find(want, mark)
     if at < 0:

@@ -1291,10 +1291,12 @@ export class App implements CommandIO {
       lines.push(truncate(line.trimEnd(), width));
     }
     if (lines.length <= maxRows) return lines;
-    return maxRows > 0 ? [...lines.slice(0, maxRows - 1), c.dim(truncate('  … /help has the rest', width))] : [];
+    if (maxRows <= 0) return [];
+    const shown = lines.slice(0, maxRows - 1);
+    return [...shown, c.dim(truncate(`  … +${items.length - shown.length * columns} more`, width))];
   }
 
-  /** The task list under the prompt (ctrl+t), in at most `maxRows` rows. */
+  /** The task list under the prompt (ctrl+t): a heading and at most ten rows, fewer when `maxRows` is short. */
   private pinnedTasks(width: number, maxRows: number): string[] {
     if (maxRows <= 0) return [];
     const todos = this.ctl.session.todos;
@@ -1302,10 +1304,14 @@ export class App implements CommandIO {
     const done = todos.filter((t) => t.status === 'completed').length;
     const lines = [c.dim(truncate(`  Tasks · ${done} of ${todos.length} done · ctrl+t to hide`, width))];
     const rows = renderTodos(todos, width, '  ');
-    const room = maxRows - 1;
-    if (rows.length <= room) lines.push(...rows);
-    else if (room > 0) lines.push(...rows.slice(0, room - 1), c.dim(truncate(`  … +${rows.length - room + 1} more`, width)));
-    return lines;
+    const room = Math.min(maxRows - 1, 10);
+    if (rows.length <= room) return [...lines, ...rows];
+    if (room <= 0) return lines;
+    // Not all of it fits: show the part where the work is, from the last task done onwards.
+    const firstOpen = todos.findIndex((t) => t.status !== 'completed');
+    const start = Math.max(0, Math.min(firstOpen - 1, rows.length - (room - 1)));
+    const shown = rows.slice(start, start + room - 1);
+    return [...lines, ...shown, c.dim(truncate(`  … ${rows.length - shown.length} more not shown`, width))];
   }
 
   /** Build and show the live region. */
