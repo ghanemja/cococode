@@ -253,10 +253,23 @@ describe('NotebookEdit: file handling', () => {
     assert.equal(fs.readFileSync(file, 'utf8'), text);
   });
 
+  it('refuses to rewrite a notebook that is not UTF-8', async () => {
+    const { ctx, file } = setup();
+    fs.writeFileSync(file, Buffer.concat([Buffer.from('{"cells": [], "note": "caf'), Buffer.from([0xe9]), Buffer.from('"}')]));
+    recordRead(ctx, file);
+    const before = fs.readFileSync(file);
+    const r = await edit(ctx, { cell_id: '0', new_source: 'x' });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /the file is not valid UTF-8/);
+    assert.deepEqual(fs.readFileSync(file), before);
+  });
+
   it('refuses to edit a notebook that changed on disk since it was read', async () => {
     const { ctx, file } = setup();
+    // Staleness is judged by content: a touched but identical file is still fresh.
     const future = new Date(Date.now() + 60_000);
     fs.utimesSync(file, future, future);
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\n$/, '\n\n'));
     const r = await edit(ctx, { cell_id: '0', new_source: 'x' });
     assert.equal(r.isError, true);
     assert.match(r.content, /changed on disk/);

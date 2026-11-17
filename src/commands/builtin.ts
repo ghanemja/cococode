@@ -180,7 +180,8 @@ export async function doctorReport(ctl: Controller): Promise<string[]> {
   for (const e of ctl.loaded.errors) out.push(`  ${bad} Settings: ${e}`);
   for (const e of ctl.mcpErrors) out.push(`  ${warn} MCP config: ${e}`);
   for (const s of ctl.mcp?.status() ?? []) {
-    out.push(s.status === 'connected' ? `  ${ok} MCP ${s.name}: ${plural(s.toolCount, 'tool')}` : `  ${bad} MCP ${s.name}: ${s.error ?? s.status}`);
+    if (s.status === 'disabled') out.push(`  ${c.dim('○')} MCP ${s.name}: disabled`);
+    else out.push(s.status === 'connected' ? `  ${ok} MCP ${s.name}: ${plural(s.toolCount, 'tool')}` : `  ${bad} MCP ${s.name}: ${s.error ?? s.status}`);
   }
   out.push(ctl.memory.length ? `  ${ok} Memory: ${ctl.memory.map((m) => displayPath(m.path, ctl.session.cwd)).join(', ')}` : `  ${c.dim('·')} No ${MEMORY_FILE} yet. Run /init to create one.`);
   const hooks = ctl.hooks.list();
@@ -879,10 +880,30 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   },
   {
     name: 'mcp',
-    description: 'Show MCP servers and their tools',
-    argumentHint: '[reconnect <name>]',
+    description: 'Show MCP servers and their tools; reconnect, enable or disable one',
+    argumentHint: '[reconnect|enable|disable <name|all>]',
     async run(args, ctl, io) {
       const [verb, name] = args.trim().split(/\s+/);
+      if ((verb === 'enable' || verb === 'disable') && name) {
+        if (!ctl.mcp) {
+          io.print(c.red('No MCP servers are configured.'));
+          return;
+        }
+        const known = ctl.mcp.status().map((s) => s.name);
+        const targets = name === 'all' ? known : known.filter((n) => n === name);
+        if (targets.length === 0) {
+          io.print(c.red(`No MCP server named "${name}". Configured: ${known.join(', ') || 'none'}.`));
+          return;
+        }
+        for (const target of targets) await ctl.mcp.setEnabled(target, verb === 'enable');
+        // Remembered for this project, so the choice holds in the next session.
+        updateSettingsFile('local', ctl.session.projectRoot, (s) => {
+          const off = new Set(s.disabledMcpServers ?? []);
+          for (const target of targets) verb === 'enable' ? off.delete(target) : off.add(target);
+          if (off.size) s.disabledMcpServers = [...off].sort();
+          else delete s.disabledMcpServers;
+        });
+      }
       if (verb === 'reconnect' && name) {
         if (!ctl.mcp) {
           io.print(c.red('No MCP servers are configured.'));
@@ -903,8 +924,9 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
       const tools = ctl.mcp!.tools();
       const lines = [heading('MCP servers')];
       for (const s of statuses) {
-        const mark = s.status === 'connected' ? c.green('✓') : s.status === 'failed' ? c.red('✗') : c.yellow('…');
-        lines.push(`  ${mark} ${c.bold(s.name)} ${c.dim(`(${s.scope})`)} ${s.status === 'connected' ? plural(s.toolCount, 'tool') : (s.error ?? s.status)}`);
+        const mark = s.status === 'connected' ? c.green('✓') : s.status === 'failed' ? c.red('✗') : s.status === 'disabled' ? c.dim('○') : c.yellow('…');
+        const detail = s.status === 'connected' ? plural(s.toolCount, 'tool') : s.status === 'disabled' ? c.dim(`disabled · /mcp enable ${s.name}`) : (s.error ?? s.status);
+        lines.push(`  ${mark} ${c.bold(s.name)} ${c.dim(`(${s.scope})`)} ${detail}`);
         const prefix = `mcp__${s.name.replace(/[^A-Za-z0-9_-]/g, '_')}__`;
         for (const t of tools.filter((tool) => tool.name.startsWith(prefix)).slice(0, 30)) {
           lines.push(`      ${c.cyan(t.name.slice(prefix.length))} ${c.dim(t.description.split('\n')[0]!.slice(0, 70))}`);

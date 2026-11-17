@@ -25,10 +25,12 @@ import { ModelClient, ProviderError, createProvider, detectServers, profileModel
 import { SessionState } from '../session/state.ts';
 import type { SessionSummary } from '../session/store.ts';
 import { Transcript, cleanupOldSessions, loadSession } from '../session/store.ts';
-import { looksBinary } from '../tools/fsutil.ts';
+import { looksBinary, makeReadRecord } from '../tools/fsutil.ts';
 import { walkFiles } from '../tools/search.ts';
 import { inlineBashRunner } from '../commands/inline.ts';
 import { renderSkill } from '../tools/meta.ts';
+import { mcpResourceTools } from '../tools/mcpResources.ts';
+import { deferredListing, planDeferral, toolSearchThreshold, toolSearchTool, type DeferralState } from '../tools/toolSearch.ts';
 import { builtinTools, filterTools, withoutTools } from '../tools/registry.ts';
 import type { AskQuestion, RuntimeHandle, SkillInvocation, SubagentRequest, SubagentResult, Tool, ToolContext } from '../tools/types.ts';
 import type { ContentPart, ImagePart, Message, PermissionMode, UserMessage } from '../types.ts';
@@ -403,17 +405,17 @@ export class Controller implements RuntimeHandle {
   }
 
   async connectMcp(): Promise<void> {
+    // Servers switched off in settings are still loaded, so /mcp enable can bring them back.
     const { servers, errors } = loadMcpServers(this.session.projectRoot, {
       extraFiles: this.opts.mcpConfigFiles,
       inline: this.settings.mcpServers,
-      disabled: this.settings.disabledMcpServers,
     });
     this.mcpErrors = errors;
     if (this.opts.bare && !this.opts.mcpConfigFiles?.length) return;
     const explicitOnly = this.opts.strictMcp || this.opts.bare;
     const usable = explicitOnly ? servers.filter((s) => s.scope === 'flag') : this.untrusted ? servers.filter((s) => s.scope === 'user' || s.scope === 'flag') : servers;
     if (usable.length === 0) return;
-    this.mcp = new McpManager(usable, { clientVersion: VERSION, cwd: this.session.projectRoot });
+    this.mcp = new McpManager(usable, { clientVersion: VERSION, cwd: this.session.projectRoot, disabled: this.settings.disabledMcpServers });
     await this.mcp.connectAll();
   }
 
@@ -432,8 +434,42 @@ export class Controller implements RuntimeHandle {
     if (this.permissions.mode === 'bypassPermissions' || this.permissions.mode === 'dontAsk') hidden.add('EnterPlanMode');
     if (modelVisibleSkills(this.skillDefs).length === 0) hidden.add('Skill');
     if (!this.projectHasNotebooks()) hidden.add('NotebookEdit');
-    const all = [...this.builtin.filter((t) => !hidden.has(t.name)), ...(this.mcp?.tools() ?? [])];
-    return filterTools(all, this.opts.toolFilter);
+    const all = [...this.builtin.filter((t) => !hidden.has(t.name)), ...mcpResourceTools(this.mcp), ...(this.mcp?.tools() ?? [])];
+    const { active, deferred } = this.planTools(filterTools(all, this.opts.toolFilter));
+    // The search tool goes in after --tools is applied: it is how the deferred tools are reached.
+    return deferred.length ? [...active, this.toolSearch] : active;
+  }
+
+  /** Tools the model has asked for with ToolSearch; they stay loaded for the session. */
+  private readonly deferral: DeferralState = { loaded: new Set() };
+  private deferredNow: Tool[] = [];
+  private readonly toolSearch = toolSearchTool(() => this.deferredNow, this.deferral);
+
+  /**
+   * Split the tools into those sent with every request and those only named
+   * in the system prompt until the model loads them. MCP servers can bring
+   * dozens of definitions, and a local context window cannot spare the room.
+   */
+  private planTools(usable: Tool[]): { active: Tool[]; deferred: Tool[] } {
+    const setting = this.settings.toolSearch;
+    const threshold = toolSearchThreshold(typeof setting === 'boolean' ? String(setting) : (setting ?? process.env.COCO_TOOL_SEARCH ?? process.env.ENABLE_TOOL_SEARCH));
+    if (threshold === null) {
+      this.deferredNow = [];
+      return { active: usable, deferred: [] };
+    }
+    const contextWindow = this.client?.profile.contextWindow ?? this.settings.contextWindow ?? DEFAULTS.contextWindow;
+    const plan = planDeferral(usable, { contextWindow, thresholdPercent: threshold, state: this.deferral });
+    this.deferredNow = plan.deferred;
+    return plan;
+  }
+
+  /** A call to a tool that is deferred loads it, and the model is asked to call again with the definition in front of it. */
+  private explainUnknownTool(name: string): string | undefined {
+    this.sessionTools();
+    const tool = this.deferredNow.find((t) => t.name.toLowerCase() === name.toLowerCase());
+    if (!tool) return undefined;
+    this.deferral.loaded.add(tool.name);
+    return `The tool ${tool.name} was not loaded yet, so its parameters were not known. It is loaded now: call it again, following its definition.`;
   }
 
   /** What the main conversation is offered: the session's tools, narrowed when it runs as an agent. */
@@ -472,9 +508,16 @@ export class Controller implements RuntimeHandle {
       skills: this.skills(),
       agents: this.tools().some((t) => t.name === 'Agent') ? this.agentTypes() : [],
       mcpInstructions: (this.mcp?.status() ?? []).filter((s) => s.instructions).map((s) => ({ server: s.name, text: s.instructions! })),
+      deferredTools: this.deferredToolListing(),
       override: this.opts.systemPrompt ?? this.mainAgent()?.prompt,
       append: this.opts.appendSystemPrompt,
     });
+  }
+
+  private deferredToolListing(): string | undefined {
+    const offered = this.tools();
+    if (!offered.includes(this.toolSearch)) return undefined;
+    return deferredListing(this.deferredNow);
   }
 
   private makeAgent(): Agent {
@@ -492,6 +535,7 @@ export class Controller implements RuntimeHandle {
       transcript: this.transcript,
       maxTurns: this.opts.maxTurns,
       drainQueued: () => this.queued.splice(0),
+      unknownTool: (name) => this.explainUnknownTool(name),
       fallback: (index) => this.fallbackClient(index),
       carryOver: () => ({
         skills: [...this.invokedSkills].map(([name, content]) => ({ name, content })),
@@ -627,7 +671,7 @@ export class Controller implements RuntimeHandle {
       }
       const content = buf.toString('utf8');
       const clipped = content.length > maxChars;
-      this.session.readFiles.set(abs, { mtimeMs: stat.mtimeMs, partial: clipped });
+      this.session.readFiles.set(abs, makeReadRecord(abs, clipped, buf));
       attached.push(`<file path="${shown}">\n${clipped ? `${content.slice(0, maxChars)}\n… [truncated: ${content.length - maxChars} more characters; use Read for the rest]` : content}\n</file>`);
     }
 
@@ -683,6 +727,7 @@ export class Controller implements RuntimeHandle {
     this.transcript = this.makeTranscript();
     this.hooks = this.makeHooks();
     this.queued = [];
+    this.deferral.loaded.clear();
     this.invokedSkills.clear();
     this.approvedPlan = undefined;
     const totals = this.agent.totals;

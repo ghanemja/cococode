@@ -94,6 +94,8 @@ export interface PromptParts {
   skills?: { name: string; description: string }[];
   agents?: { name: string; description: string }[];
   mcpInstructions?: { server: string; text: string }[];
+  /** Names of tools that exist but are not loaded, with how to load them. */
+  deferredTools?: string;
   /** Replaces the built-in prompt (--system-prompt). */
   override?: string;
   /** Appended after everything else (--append-system-prompt). */
@@ -118,6 +120,7 @@ export function buildSystemPrompt(parts: PromptParts): string {
   for (const mcp of parts.mcpInstructions ?? []) {
     if (mcp.text.trim()) sections.push(`# Instructions from MCP server "${mcp.server}"\n${mcp.text.trim().slice(0, 2000)}`);
   }
+  if (parts.deferredTools?.trim()) sections.push(parts.deferredTools.trim());
   sections.push(renderEnv(parts.env));
   if (parts.memory?.trim()) sections.push(parts.memory.trim());
   if (parts.append?.trim()) sections.push(parts.append.trim());

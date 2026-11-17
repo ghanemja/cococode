@@ -87,6 +87,8 @@ export interface AgentDeps {
   onCompacted?: () => void;
   /** Extra text for the model after a successful tool call (instructions that apply to the file just touched). */
   afterTool?: (toolName: string, input: Record<string, unknown>) => string | undefined;
+  /** A chance to explain a call to a tool that is not on offer (for instance one that is not loaded yet). */
+  unknownTool?: (name: string) => string | undefined;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -645,7 +647,10 @@ export class Agent {
     // Validate up front so we know which calls may share a batch.
     const prepared = calls.map((call) => {
       const tool = this.resolveTool(call.name, tools);
-      if (!tool) return { call, tool: undefined, input: undefined, error: `Unknown tool "${call.name}". Available tools: ${tools.map((t) => t.name).join(', ')}.` };
+      if (!tool) {
+        const hint = this.deps.unknownTool?.(call.name);
+        return { call, tool: undefined, input: undefined, error: hint ?? `Unknown tool "${call.name}". Available tools: ${tools.map((t) => t.name).join(', ')}.` };
+      }
       if (call.parseError === TRUNCATED_ARGS) {
         return {
           call,
@@ -851,7 +856,7 @@ export class Agent {
     }
     const max = deps.settings.maxToolOutputChars ?? DEFAULTS.maxToolOutputChars;
     // Anything still too large for the context is saved in full and shown trimmed.
-    if (result.content.length > max * 1.2) result = { ...result, content: spillOutput(session.id, call.id, result.content, max) };
+    if (result.content.length > max * 1.2) result = { ...result, content: spillOutput(session.id, call.id, result.content, max, { failed: Boolean(result.isError) }) };
 
     debug('tools', `result ${tool.name}${result.isError ? ' (error)' : ''} ${Date.now() - executionStarted}ms`, result.content, 2000);
     if (!result.isError && deps.afterTool) {

@@ -7,7 +7,7 @@ import { displayPath } from './config/paths.ts';
 import type { Settings, SettingsScope } from './config/settings.ts';
 import { getByPath, loadSettings, parseSettingValue, setByPath, settingsPath, updateSettingsFile } from './config/settings.ts';
 import type { McpScope, McpServerConfig } from './mcp/config.ts';
-import { addMcpServer, loadMcpServers, mcpConfigPath, removeMcpServer } from './mcp/config.ts';
+import { addMcpServer, addMcpServerJson, loadMcpServers, mcpConfigPath, removeMcpServer } from './mcp/config.ts';
 import { NO_SERVER_HELP, ProviderError, detectServers, rankModels } from './providers/index.ts';
 import { findSession, listSessions } from './session/store.ts';
 import { enableDebug } from './util/debug.ts';
@@ -78,7 +78,7 @@ Commands:
   ${APP_NAME} doctor [--probe]          Check the setup; --probe also tests the model with live tool calls
   ${APP_NAME} sessions                  List saved conversations for this directory
   ${APP_NAME} config [get|set|list]     Read or change settings
-  ${APP_NAME} mcp [add|list|get|remove] Manage MCP servers
+  ${APP_NAME} mcp [add|add-json|list|get|remove]   Manage MCP servers
 
 Environment:
   COCO_MODEL, COCO_PROVIDER, COCO_BASE_URL, COCO_API_KEY, COCO_CONTEXT_WINDOW,
@@ -348,6 +348,14 @@ async function cmdMcp(args: ParsedArgs): Promise<number> {
     process.stdout.write(`Added MCP server "${name}" (${scope}) to ${file}\n`);
     return 0;
   }
+  if (verb === 'add-json') {
+    if (!name || !rest[0]) fail(`Usage: ${APP_NAME} mcp add-json <name> '<json>' [--scope user|project|local]`);
+    const scope = parseScope(str(args.flags, 'scope'), 'local') as McpScope;
+    const added = addMcpServerJson(scope, cwd, name!, rest.join(' '));
+    if (added.error) fail(added.error);
+    process.stdout.write(`Added MCP server "${name}" (${scope}) to ${added.file}\n`);
+    return 0;
+  }
   if (verb === 'remove' || verb === 'rm') {
     if (!name) fail(`Usage: ${APP_NAME} mcp remove <name> [--scope user|project|local]`);
     const scope = str(args.flags, 'scope') ? (parseScope(str(args.flags, 'scope'), 'local') as McpScope) : undefined;
@@ -356,7 +364,8 @@ async function cmdMcp(args: ParsedArgs): Promise<number> {
     return removed ? 0 : 1;
   }
   const { merged } = loadSettings({ projectRoot: cwd });
-  const { servers, errors } = loadMcpServers(cwd, { inline: merged.mcpServers, disabled: merged.disabledMcpServers });
+  const { servers, errors } = loadMcpServers(cwd, { inline: merged.mcpServers });
+  const off = new Set(merged.disabledMcpServers ?? []);
   for (const e of errors) process.stderr.write(`${c.yellow(e)}\n`);
   if (verb === 'get') {
     const server = servers.find((s) => s.name === name);
@@ -371,7 +380,7 @@ async function cmdMcp(args: ParsedArgs): Promise<number> {
   }
   for (const s of servers) {
     const target = 'url' in s.config ? `${s.config.type} ${s.config.url}` : `${s.config.command} ${(s.config.args ?? []).join(' ')}`;
-    process.stdout.write(`${padEnd(s.name, 20)} ${c.dim(padEnd(s.scope, 9))} ${target}\n`);
+    process.stdout.write(`${padEnd(s.name, 20)} ${c.dim(padEnd(s.scope, 9))} ${target}${off.has(s.name) ? c.dim('  (disabled)') : ''}\n`);
   }
   return 0;
 }

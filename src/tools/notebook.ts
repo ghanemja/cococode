@@ -2,7 +2,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { stripAnsi } from '../ui/ansi.ts';
 import { htmlToMarkdown } from '../util/html.ts';
-import { checkFresh, detectEol, editPermission, resolvePath, shortPath, writeFileTracked } from './fsutil.ts';
+import { checkFresh, detectEol, editPermission, encodingProblem, resolvePath, shortPath, writeFileTracked } from './fsutil.ts';
 import { errorResult, type PermissionRequest, type Tool, type ToolContext, type ToolResult } from './types.ts';
 
 export interface NotebookEditInput {
@@ -212,7 +212,11 @@ export const notebookEditTool: Tool<NotebookEditInput> = {
     let original: string;
     let nb: Notebook;
     try {
-      original = fs.readFileSync(abs, 'utf8');
+      const bytes = fs.readFileSync(abs);
+      // Rewriting a file that is not UTF-8 would corrupt it.
+      const problem = encodingProblem(bytes);
+      if (problem) return errorResult(`Could not edit ${name}: the file ${problem}.`);
+      original = bytes.toString('utf8');
       nb = parseNotebook(original);
     } catch (err) {
       return errorResult(`Could not edit ${name}: ${(err as Error).message}`);

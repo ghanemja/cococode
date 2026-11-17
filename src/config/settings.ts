@@ -104,6 +104,12 @@ export interface Settings {
   fallbackModel?: string | string[];
   /** Run the main conversation as this agent (its prompt, tools and model). */
   agent?: string;
+  /**
+   * Keep MCP tool definitions out of the prompt until the model asks for them:
+   * "auto" (when they would take over 10% of the context window), "auto:N" for
+   * another percentage, true (always) or false (never).
+   */
+  toolSearch?: string | boolean;
   /** When a reply announces a next step but calls no tool, tell the model once to go on (default true). */
   nudgeAnnouncedActions?: boolean;
 

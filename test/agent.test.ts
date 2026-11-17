@@ -745,8 +745,8 @@ describe('agent loop: hooks', () => {
 
   test('PostToolUse runs after success and PostToolUseFailure after failure, each with the call id', async () => {
     const dir = tempProject();
-    const log = path.join(dir, 'events.jsonl');
-    const record = `cat >> ${log}; echo >> ${log}`;
+    // One file per event: the two calls run in parallel, and appends to a shared file can interleave.
+    const record = `cat > ${dir}/event-$$.json`;
     const h = harness([{ calls: [{ name: 'Read', args: { file_path: 'a.txt' } }, { name: 'Read', args: { file_path: 'missing.txt' } }] }, { text: 'ok' }], {
       hooks: {
         PostToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: record }] }],
@@ -754,7 +754,10 @@ describe('agent loop: hooks', () => {
       },
     });
     await h.run('x');
-    const seen = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const seen = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith('event-'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')) as Record<string, unknown>);
     const success = seen.find((e) => e.hook_event_name === 'PostToolUse')!;
     const failure = seen.find((e) => e.hook_event_name === 'PostToolUseFailure')!;
     assert.equal(seen.length, 2);

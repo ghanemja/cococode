@@ -614,3 +614,92 @@ describe('doctor --probe: a live check of the model', () => {
     assert.match(res.stdout, /Model check[\s\S]*did not call a tool when told to \(it replied: "I would call the tool if I could\."\)/);
   });
 });
+
+describe('MCP: tool search, resources and switching servers on and off', () => {
+  const FIXTURE = path.join(import.meta.dirname, 'fixtures', 'mock-mcp-server.mjs');
+  const mcpConfig = JSON.stringify({ mcpServers: { mock: { command: 'node', args: [FIXTURE] } } });
+  const offered = (req: { body: Record<string, any> }): string[] => ((req.body.tools as { function: { name: string } }[] | undefined) ?? []).map((t) => t.function.name);
+
+  test('deferred tools are named in the prompt, loaded by ToolSearch and then callable', async () => {
+    const { ctl, server } = await setup(
+      [
+        { toolCalls: [{ name: 'ToolSearch', arguments: { query: 'select:mcp__mock__echo' } }] },
+        { toolCalls: [{ name: 'mcp__mock__echo', arguments: { text: 'hello' } }] },
+        { text: 'done' },
+      ],
+      { mcpConfigFiles: [mcpConfig], allowedTools: ['mcp__mock'], overrides: { toolSearch: true } },
+    );
+    await ctl.connectMcp();
+    await collect(ctl.submit('say hello through the mock server'));
+    const first = offered(server.requests[0]!);
+    assert.ok(first.includes('ToolSearch') && first.includes('ListMcpResources') && first.includes('ReadMcpResource'), first.join(','));
+    assert.ok(!first.some((n) => n.startsWith('mcp__mock__')));
+    assert.match(String(server.requests[0]!.body.messages[0].content), /# More tools[\s\S]*echo[\s\S]*call ToolSearch/);
+    // Once loaded, the tool's definition is sent and stays loaded.
+    assert.ok(offered(server.requests[1]!).includes('mcp__mock__echo'));
+    assert.ok(!offered(server.requests[1]!).includes('mcp__mock__add'));
+    assert.match(lastMessage(server.requests[2]!, 'tool').content, /hello/);
+  });
+
+  test('calling a deferred tool directly loads it and asks for the call again', async () => {
+    const { ctl, server } = await setup([{ toolCalls: [{ name: 'mcp__mock__add', arguments: { x: 1 } }] }, { text: 'ok' }], {
+      mcpConfigFiles: [mcpConfig],
+      overrides: { toolSearch: true },
+    });
+    await ctl.connectMcp();
+    await collect(ctl.submit('add'));
+    assert.match(lastMessage(server.requests[1]!, 'tool').content, /mcp__mock__add was not loaded yet[\s\S]*call it again/);
+    assert.ok(offered(server.requests[1]!).includes('mcp__mock__add'));
+  });
+
+  test('with tool search off every MCP tool is sent, and a few tools are never deferred', async () => {
+    const off = await setup([{ text: 'ok' }], { mcpConfigFiles: [mcpConfig], overrides: { toolSearch: false } });
+    await off.ctl.connectMcp();
+    await collect(off.ctl.submit('hi'));
+    const names = offered(off.server.requests[0]!);
+    assert.ok(names.includes('mcp__mock__echo') && !names.includes('ToolSearch'));
+    // The default defers only when the definitions would take a real share of the window.
+    const roomy = await setup([{ text: 'ok' }], { mcpConfigFiles: [mcpConfig], overrides: { contextWindow: 200_000 } });
+    await roomy.ctl.connectMcp();
+    await collect(roomy.ctl.submit('hi'));
+    assert.ok(offered(roomy.server.requests[0]!).includes('mcp__mock__echo'));
+  });
+
+  test('/mcp disable and enable switch a server and remember the choice', async () => {
+    const { ctl, dir } = await setup([], { mcpConfigFiles: [mcpConfig], overrides: { toolSearch: false } });
+    await ctl.connectMcp();
+    const has = () => ctl.tools().some((t) => t.name === 'mcp__mock__echo');
+    assert.equal(has(), true);
+    const io = fakeIO();
+    await runSlash('/mcp disable mock', ctl, io);
+    assert.equal(has(), false);
+    assert.match(io.out.join('\n'), /mock[\s\S]*disabled · \/mcp enable mock/);
+    const local = path.join(dir, '.coco', 'settings.local.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(local, 'utf8')).disabledMcpServers, ['mock']);
+    await runSlash('/mcp enable all', ctl, io);
+    assert.equal(has(), true);
+    assert.equal(JSON.parse(fs.readFileSync(local, 'utf8')).disabledMcpServers, undefined);
+    await runSlash('/mcp disable nope', ctl, io);
+    assert.match(io.out.join('\n'), /No MCP server named "nope"\. Configured: mock\./);
+  });
+
+  test('a server disabled in settings starts switched off and can be enabled', async () => {
+    const { ctl } = await setup([], { mcpConfigFiles: [mcpConfig], overrides: { toolSearch: false, disabledMcpServers: ['mock'] } });
+    await ctl.connectMcp();
+    assert.deepEqual(ctl.mcp!.status().map((s) => [s.name, s.status]), [['mock', 'disabled']]);
+    await runSlash('/mcp enable mock', ctl, fakeIO());
+    assert.equal(ctl.mcp!.status()[0]!.status, 'connected');
+  });
+
+  test('coco mcp add-json writes a server definition', () => {
+    const dir = tempProject();
+    const env = { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'), NO_COLOR: '1' };
+    const cli = path.join(import.meta.dirname, '..', 'bin', 'coco.js');
+    const out = execFileSync('node', [cli, 'mcp', 'add-json', 'docs', '{"type":"http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer ${DOCS_TOKEN}"}}', '--scope', 'project'], { cwd: dir, env, encoding: 'utf8' });
+    assert.match(out, /Added MCP server "docs" \(project\)/);
+    // The variable reference is kept, not expanded into the file.
+    assert.match(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'), /\$\{DOCS_TOKEN\}/);
+    assert.match(execFileSync('node', [cli, 'mcp', 'list'], { cwd: dir, env, encoding: 'utf8' }), /docs\s+project\s+http https:\/\/example\.com\/mcp/);
+    assert.throws(() => execFileSync('node', [cli, 'mcp', 'add-json', 'bad', '{nope'], { cwd: dir, env, encoding: 'utf8', stdio: 'pipe' }));
+  });
+});
