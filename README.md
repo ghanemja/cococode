@@ -354,7 +354,7 @@ coco config set permissions.defaultMode acceptEdits --scope project
 | `claudeCompat` | `true` | Read `.claude/` and `CLAUDE.md` |
 | `bell` | `false` | Ring when a turn ends or approval is needed |
 
-Environment: `COCO_MODEL`, `COCO_PROVIDER`, `COCO_BASE_URL`, `COCO_API_KEY`, `COCO_CONTEXT_WINDOW`, `COCO_CONFIG_DIR`, `OLLAMA_HOST`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. To use the web tools behind a proxy, set `NODE_USE_ENV_PROXY=1`.
+Environment: `COCO_MODEL`, `COCO_PROVIDER`, `COCO_BASE_URL`, `COCO_API_KEY`, `COCO_CONTEXT_WINDOW`, `COCO_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`, `OLLAMA_HOST`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. To use the web tools behind a proxy, set `NODE_USE_ENV_PROXY=1`.
 
 ## Built for local models
 

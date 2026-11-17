@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -12,14 +13,26 @@ export function configDir(): string {
   return process.env.COCO_CONFIG_DIR || path.join(os.homedir(), PROJECT_DIR);
 }
 
+/** Claude Code's user directory, read for compatibility (~/.claude unless CLAUDE_CONFIG_DIR is set). */
+export function claudeDir(): string {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+}
+
 export function ensureDir(dir: string): string {
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-/** Stable, filesystem-safe name for a working directory. */
+/**
+ * Stable, filesystem-safe name for a working directory. The readable part
+ * alone is ambiguous ("/a/b-c" and "/a/b/c" flatten to the same text), so a
+ * short hash of the path keeps two projects from sharing their sessions.
+ */
 export function projectSlug(cwd: string): string {
-  return path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-');
+  const abs = path.resolve(cwd);
+  const readable = abs.replace(/[^a-zA-Z0-9]/g, '-').slice(-150);
+  const hash = crypto.createHash('sha1').update(abs).digest('hex').slice(0, 8);
+  return `${readable}-${hash}`;
 }
 
 /** Where transcripts for a given working directory live. */
@@ -59,7 +72,7 @@ export function projectConfigDirs(root: string, claudeCompat: boolean): string[]
 
 export function userConfigDirs(claudeCompat: boolean): string[] {
   const dirs = [configDir()];
-  if (claudeCompat) dirs.push(path.join(os.homedir(), '.claude'));
+  if (claudeCompat) dirs.push(claudeDir());
   return dirs;
 }
 

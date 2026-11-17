@@ -472,8 +472,26 @@ describe('Edit', () => {
     assert.equal(res.isError, true);
     assert.match(res.content, /matches 2 places in a\.py \(ignoring indentation\)/);
     assert.equal(get('a.py'), original);
-    // With replace_all the caller has said every place is meant.
-    assert.equal((await edit('a.py', 'if a:\ngo()', 'if a:\nstop()', true)).isError, undefined);
+    // With replace_all the caller has said every place is meant; each keeps its own indentation.
+    const all = await edit('a.py', 'if a:\ngo()', 'if a:\nstop()', true);
+    assert.equal(all.isError, undefined);
+    assert.equal(all.summary, 'Replaced 2 occurrences (matched ignoring indentation)');
+    assert.equal(get('a.py'), 'if a:\n    stop()\nelse:\n    pass\nif a:\n\tstop()\n');
+  });
+
+  test('a whitespace-tolerant match that would need guessed indentation is refused', async () => {
+    const original = 'def f():\n    if a:\n        go()\n';
+    seen('a.py', original);
+    const res = await edit('a.py', 'if a:\ngo()', 'if a:\ngo()\nlog()');
+    assert.equal(res.isError, true);
+    assert.match(res.content, /old_string was not found/);
+    assert.equal(get('a.py'), original);
+  });
+
+  test('a whitespace-tolerant deletion removes the lines instead of leaving a blank one', async () => {
+    seen('a.txt', 'keep\n    remove me   \nkeep too\n');
+    assert.equal((await edit('a.txt', 'remove me\n', '')).isError, undefined);
+    assert.equal(get('a.txt'), 'keep\nkeep too\n');
   });
 
   test('an exact match is preferred over a looser one elsewhere', async () => {
@@ -579,7 +597,8 @@ describe('fuzzyFind', () => {
     assert.equal(found!.actual, '  alpha  \n    beta');
     assert.equal(found!.how, 'ignoring indentation');
     assert.equal(found!.count, 1);
-    assert.equal(found!.replacement, '  ALPHA\n  BETA');
+    assert.equal(found!.replacement, '  ALPHA\n    BETA');
+    assert.deepEqual(found!.regions.map((r) => [r.startLine, r.lineCount]), [[0, 2]]);
     assert.equal(fuzzyFind('x\n  go()\ny\n\tgo()\n', 'go()', 'no()')!.count, 2);
   });
 
@@ -597,7 +616,33 @@ describe('fuzzyFind', () => {
 
   test('relative indentation inside the replacement is preserved', () => {
     const found = fuzzyFind('\t\tif (x) {\n\t\t\ty();\n\t\t}\n', 'if (x) {\n  y();\n}', 'if (x) {\n  y();\n  z();\n}');
-    assert.equal(found!.replacement, '\t\tif (x) {\n\t\t  y();\n\t\t  z();\n\t\t}');
+    assert.equal(found!.replacement, '\t\tif (x) {\n\t\t\ty();\n\t\t\tz();\n\t\t}');
+  });
+
+  test('new, deeper lines are indented in the file\'s own style', () => {
+    // Tabs in the file, four spaces from the model.
+    const tabs = fuzzyFind('func f() {\n\tx := 1\n}\n', 'func f() {\n    x := 1\n}', 'func f() {\n    if ok {\n        x := 1\n    }\n}');
+    assert.equal(tabs!.replacement, 'func f() {\n\tif ok {\n\t\tx := 1\n\t}\n}');
+    // Spaces in the file, tabs from the model.
+    const spaces = fuzzyFind('def f():\n    return 1\n', 'def f():\n\treturn 1', 'def f():\n\tif x:\n\t\treturn 1');
+    assert.equal(spaces!.replacement, 'def f():\n    if x:\n        return 1');
+    // A dedent below every level seen in old_string.
+    const dedent = fuzzyFind('class A:\n        x = 1\n', '    x = 1', '    x = 2\ny = 3');
+    assert.equal(dedent!.replacement, '        x = 2\n    y = 3');
+  });
+
+  test('refuses to guess when old_string flattened the indentation and the replacement changes shape', () => {
+    const content = 'if a:\n    go()\n';
+    // Same shape: each line keeps the indentation of the line it replaces.
+    assert.equal(fuzzyFind(content, 'if a:\ngo()', 'if b:\nstop()')!.replacement, 'if b:\n    stop()');
+    // An added line could belong at either level.
+    assert.equal(fuzzyFind(content, 'if a:\ngo()', 'if a:\ngo()\nmore()'), null);
+  });
+
+  test('an empty replacement removes the matched lines', () => {
+    const found = fuzzyFind('a\n  b  \nc\n', 'b', '');
+    assert.equal(found!.replacement, '');
+    assert.equal(found!.actual, '  b  ');
   });
 });
 

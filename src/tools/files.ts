@@ -244,17 +244,28 @@ const onlySpaces = (s: string) => s !== '' && /^ +$/.test(s);
  * Work out how the model's indentation maps onto the file's from the lines
  * that matched, then apply the same mapping to the replacement text. Returns
  * null when the mapping is contradictory (the same indentation in old_string
- * stands for different indentation in the file): then there is no telling how
- * the new lines should be indented, and guessing would corrupt the code.
+ * stands for different indentation in the file) and the replacement adds or
+ * removes lines: then there is no telling how the new lines should be
+ * indented, and guessing would corrupt the code.
  */
 function reindent(oldLines: string[], fileLines: string[], replacement: string[]): string[] | null {
   const map = new Map<string, string>();
+  let contradictory = false;
   for (let j = 0; j < oldLines.length; j++) {
     if (oldLines[j]!.trim() === '') continue;
     const from = leadingWhitespace(oldLines[j]!);
     const to = leadingWhitespace(fileLines[j]!);
-    if (map.has(from) && map.get(from) !== to) return null;
+    if (map.has(from) && map.get(from) !== to) contradictory = true;
     map.set(from, to);
+  }
+  if (contradictory) {
+    // Still safe when the replacement has the same shape as old_string: each new
+    // line then simply keeps the indentation of the file line it replaces.
+    const sameShape =
+      replacement.length === oldLines.length &&
+      replacement.every((line, j) => (line.trim() === '') === (oldLines[j]!.trim() === '') && leadingWhitespace(line) === leadingWhitespace(oldLines[j]!));
+    if (!sameShape) return null;
+    return replacement.map((line, j) => (line.trim() === '' ? line : leadingWhitespace(fileLines[j]!) + line.trimStart()));
   }
   if ([...map].every(([from, to]) => from === to)) return replacement;
 

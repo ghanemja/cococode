@@ -48,6 +48,7 @@ async function tui(s: Scenario): Promise<TuiResult & { dir: string; server: Mock
     cwd: dir,
     env: {
       COCO_CONFIG_DIR: path.join(dir, '.coco-home'),
+      CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'),
       OLLAMA_HOST: s.ollama ? server.root.replace('http://', '') : '127.0.0.1:1',
       EDITOR: 'true',
       ...(s.env ?? {}),

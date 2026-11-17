@@ -34,7 +34,7 @@ interface RunResult {
 
 function coco(dir: string, args: string[], opts: { env?: Record<string, string>; stdin?: string } = {}): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), NO_COLOR: '1', ...opts.env };
+    const env: NodeJS.ProcessEnv = { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'), NO_COLOR: '1', ...opts.env };
     // The developer's own setup must not leak into the tests.
     for (const key of ['COCO_MODEL', 'COCO_PROVIDER', 'COCO_BASE_URL', 'COCO_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_KEY']) if (!(key in (opts.env ?? {}))) delete env[key];
     if (!opts.env?.OLLAMA_HOST) env.OLLAMA_HOST = '127.0.0.1:1'; // nothing listens here
@@ -382,6 +382,10 @@ describe('sessions and configuration from the command line', () => {
     const all = JSON.parse((await coco(dir, ['config'])).stdout.split('\n\n')[0]!);
     assert.equal(all.permissions.defaultMode, 'acceptEdits');
     assert.equal((await coco(dir, ['config', 'get', 'nothing.here'])).code, 1);
+    const bad = await coco(dir, ['config', 'set', '__proto__.polluted', '1']);
+    assert.equal(bad.code, 1);
+    assert.match(bad.stderr, /^Could not set __proto__\.polluted/);
+    assert.ok(!bad.stderr.includes('    at '), 'no stack trace for a user error');
   });
 
   test('settings files drive a run: model, permissions and env', async () => {

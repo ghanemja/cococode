@@ -335,6 +335,24 @@ describe('listSessions / findSession', () => {
     );
   });
 
+  test('directories whose names flatten alike do not share sessions', () => {
+    const dashed = path.join(root, 'my-app');
+    const nested = path.join(root, 'my', 'app');
+    fs.mkdirSync(dashed);
+    fs.mkdirSync(nested, { recursive: true });
+    new Transcript(dashed, 'in-dashed', '1.0.0').message(user('dashed work'));
+    new Transcript(nested, 'in-nested', '1.0.0').message(user('nested work'));
+    assert.deepEqual(
+      listSessions(dashed).map((s) => s.id),
+      ['in-dashed'],
+    );
+    assert.deepEqual(
+      listSessions(nested).map((s) => s.id),
+      ['in-nested'],
+    );
+    assert.equal(findSession(nested, 'in-dashed'), undefined);
+  });
+
   test('sessions are kept apart per working directory', () => {
     const other = path.join(root, 'other-project');
     fs.mkdirSync(other);

@@ -564,7 +564,8 @@ export class App implements CommandIO {
     const text = this.editor.value().trim();
     if (!text) return;
     this.editor.addHistory(this.editor.text.trim());
-    this.appendHistory(this.editor.text.trim());
+    // On disk the paste itself is stored: a placeholder would mean nothing in a later session.
+    this.appendHistory(text);
     this.editor.clear();
     this.completion = null;
     this.completionDismissed = '';

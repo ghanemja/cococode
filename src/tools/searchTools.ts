@@ -108,16 +108,22 @@ export const grepTool: Tool<GrepInput> = {
       mode,
       caseInsensitive,
       context,
-      multiline: Boolean(input.multiline),
+      // A pattern that mentions a newline can only match across lines, so allow it to.
+      multiline: Boolean(input.multiline) || /\\n|\n/.test(input.pattern),
+      dotAll: Boolean(input.multiline),
       signal: ctx.signal,
     });
     if (res.error) return errorResult(res.error);
     if (res.lines.length === 0) return { content: 'No matches found.', summary: 'No matches' };
 
-    const shown = res.lines.slice(0, limit);
+    // Show paths the way the other tools accept them: relative to the working directory.
+    const rel = path.relative(ctx.cwd, res.base);
+    const prefix = rel === '' ? '' : rel.startsWith('..') || path.isAbsolute(rel) ? `${res.base}/` : `${rel.split(path.sep).join('/')}/`;
+    const all = prefix ? res.lines.map((l) => (l === '--' ? l : prefix + l)) : res.lines;
+    const shown = all.slice(0, limit);
     let content = shown.join('\n');
-    if (res.lines.length > limit) {
-      content += `\n\n[${res.lines.length - limit} more lines not shown. Narrow the pattern or raise head_limit.]`;
+    if (all.length > limit) {
+      content += `\n\n[${all.length - limit} more lines not shown. Narrow the pattern or raise head_limit.]`;
     }
     content = clampOutput(content, ctx.settings.maxToolOutputChars ?? DEFAULTS.maxToolOutputChars);
     const summary =

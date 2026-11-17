@@ -97,13 +97,15 @@ export class SelectDialog<T> implements Dialog {
     if (key.name === 'return') {
       if (!current) return false;
       if (this.spec.multi) {
-        const values = this.spec.options.filter((_, i) => this.checked.has(i)).map((o) => o.value);
-        if (current.option.input && this.inputText.trim()) {
-          return this.finish({ value: current.option.value, values, text: this.inputText.trim() });
-        }
-        if (values.length === 0) this.checked.add(current.original);
-        const picked = this.spec.options.filter((_, i) => this.checked.has(i)).map((o) => o.value);
-        return this.finish({ value: picked[0]!, values: picked });
+        const values = this.spec.options.filter((o, i) => this.checked.has(i) && !o.input).map((o) => o.value);
+        // Typed text counts wherever the highlight is; it would otherwise be silently lost.
+        const text = this.inputText.trim();
+        const inputOption = this.spec.options.find((o) => o.input);
+        if (text && inputOption) return this.finish({ value: inputOption.value, values, text });
+        if (values.length > 0) return this.finish({ value: values[0]!, values });
+        // Nothing checked: enter picks the highlighted option, but an empty text entry is not an answer.
+        if (current.option.input) return false;
+        return this.finish({ value: current.option.value, values: [current.option.value] });
       }
       return this.finish({ value: current.option.value, values: [current.option.value], text: typing ? this.inputText.trim() : undefined });
     }

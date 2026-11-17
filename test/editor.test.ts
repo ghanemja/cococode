@@ -43,10 +43,11 @@ describe('inserting and deleting', () => {
     ed.cursor = 5;
     ed.insert(',');
     assert.equal(ed.text, 'hello, world');
-    ed.cursor = ed.text.length;
+    // value() rather than .text: the assertions above have narrowed the property's type.
+    ed.cursor = ed.value().length;
     ed.insert('!');
-    assert.equal(ed.text, 'hello, world!');
-    assert.equal(ed.cursor, ed.text.length);
+    assert.equal(ed.value(), 'hello, world!');
+    assert.equal(ed.cursor, ed.value().length);
   });
 
   test('inserted text is normalised: CRLF to LF, tabs to spaces', () => {
@@ -130,7 +131,7 @@ describe('inserting and deleting', () => {
     let seed = 12345;
     const next = (n: number) => {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      return seed % n;
+      return (seed >>> 8) % n; // the low bits of this generator cycle quickly
     };
     const ed = editor();
     for (let step = 0; step < 600; step++) {

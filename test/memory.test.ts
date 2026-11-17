@@ -17,6 +17,7 @@ beforeEach(() => {
   home = path.join(root, 'home');
   fs.mkdirSync(home);
   process.env.HOME = home;
+  process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
 });
 
 afterEach(() => {

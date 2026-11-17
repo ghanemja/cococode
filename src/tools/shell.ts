@@ -11,6 +11,8 @@ export interface RunOptions {
   onData?: (chunk: string) => void;
   /** Maximum characters of output kept. The middle is dropped when exceeded. */
   maxOutput?: number;
+  /** How long to wait after SIGTERM before SIGKILL. */
+  killGraceMs?: number;
 }
 
 export interface RunResult {
@@ -51,9 +53,14 @@ export function commandEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   };
 }
 
-/** Kill a process and everything it started. */
-export function killTree(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
-  if (proc.pid === undefined || proc.exitCode !== null) return;
+/**
+ * Kill a process and everything it started. With `evenIfExited`, the process
+ * group is signalled although its leader is gone, to reach children that
+ * outlived the shell.
+ */
+export function killTree(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM', evenIfExited = false): void {
+  if (proc.pid === undefined) return;
+  if (!evenIfExited && (proc.exitCode !== null || proc.signalCode !== null)) return;
   try {
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(proc.pid), '/t', '/f'], { stdio: 'ignore' });
@@ -151,10 +158,11 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     proc.stdout?.on('data', onChunk);
     proc.stderr?.on('data', onChunk);
 
-    let killTimer: NodeJS.Timeout | undefined;
+    let exitTimer: NodeJS.Timeout | undefined;
     const terminate = () => {
       killTree(proc, 'SIGTERM');
-      killTimer = setTimeout(() => killTree(proc, 'SIGKILL'), 2000);
+      // Not cancelled when the shell exits: a child that ignores SIGTERM must still go.
+      const killTimer = setTimeout(() => killTree(proc, 'SIGKILL', true), opts.killGraceMs ?? 2000);
       killTimer.unref();
     };
 
@@ -176,8 +184,11 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
+      if (exitTimer) clearTimeout(exitTimer);
       opts.signal?.removeEventListener('abort', onAbort);
+      // Stop listening to pipes a background child may still hold open.
+      proc.stdout?.destroy();
+      proc.stderr?.destroy();
       let cwd: string | undefined;
       if (cwdFile) {
         try {
@@ -196,6 +207,11 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       finish(127);
     });
     proc.on('close', (code) => finish(code));
+    // `close` waits for every holder of the output pipes. A command that leaves
+    // something running (`server &`) would otherwise hang until the timeout.
+    proc.on('exit', (code) => {
+      exitTimer = setTimeout(() => finish(code), 250);
+    });
   });
 }
 
@@ -227,6 +243,8 @@ const MAX_BACKGROUND_BUFFER = 1_000_000;
 export class ShellManager {
   private shells = new Map<string, ShellEntry>();
   private counter = 0;
+  /** How long a killed shell gets to exit before its process group is SIGKILLed. */
+  killGraceMs = 2000;
 
   start(command: string, cwd: string, env?: Record<string, string>): BackgroundShell {
     const { shell, args } = shellPath();
@@ -307,7 +325,7 @@ export class ShellManager {
     if (entry.status === 'running') {
       entry.status = 'killed';
       killTree(entry.proc, 'SIGTERM');
-      const t = setTimeout(() => killTree(entry.proc, 'SIGKILL'), 2000);
+      const t = setTimeout(() => killTree(entry.proc, 'SIGKILL', true), this.killGraceMs);
       t.unref();
     }
     return true;

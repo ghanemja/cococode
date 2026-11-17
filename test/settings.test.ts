@@ -3,18 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, test } from 'node:test';
-import {
-  configDir,
-  displayPath,
-  expandHome,
-  findProjectRoot,
-  projectConfigDirs,
-  projectSlug,
-  readJsonFile,
-  sessionsDir,
-  userConfigDirs,
-  writeJsonFile,
-} from '../src/config/paths.ts';
+import { claudeDir, configDir, displayPath, expandHome, findProjectRoot, projectConfigDirs, projectSlug, readJsonFile, sessionsDir, userConfigDirs, writeJsonFile } from '../src/config/paths.ts';
 import type { Settings } from '../src/config/settings.ts';
 import {
   getByPath,
@@ -479,12 +468,27 @@ describe('parseSettingValue', () => {
 });
 
 describe('paths', () => {
-  test('projectSlug is stable and filesystem-safe', () => {
-    assert.equal(projectSlug('/home/me/my project/v1.2'), '-home-me-my-project-v1-2');
+  test('projectSlug is stable, readable and filesystem-safe', () => {
+    assert.match(projectSlug('/home/me/my project/v1.2'), /^-home-me-my-project-v1-2-[0-9a-f]{8}$/);
+    assert.equal(projectSlug('/home/me/app'), projectSlug('/home/me/app'));
     assert.equal(projectSlug('/a/b/'), projectSlug('/a/b'));
     assert.equal(projectSlug('/a/b/../b'), projectSlug('/a/b'));
     assert.match(projectSlug(path.join(os.tmpdir(), 'x y', 'z')), /^[A-Za-z0-9-]+$/);
     assert.notEqual(projectSlug('/a/b'), projectSlug('/a/c'));
+  });
+
+  test('paths that flatten to the same text still get different slugs', () => {
+    assert.notEqual(projectSlug('/work/my-app'), projectSlug('/work/my/app'));
+    assert.notEqual(projectSlug('/work/a b'), projectSlug('/work/a.b'));
+    assert.notEqual(projectSlug('/work/App'), projectSlug('/work/app'));
+  });
+
+  test('a very deep path still gives a usable directory name', () => {
+    const deep = `/${Array.from({ length: 60 }, (_, i) => `directory-${i}`).join('/')}`;
+    const slug = projectSlug(deep);
+    assert.ok(slug.length <= 160, String(slug.length));
+    assert.ok(slug.includes('directory-59'));
+    assert.notEqual(slug, projectSlug(`${deep}x`));
   });
 
   test('sessionsDir lives under the config directory', () => {
@@ -561,7 +565,18 @@ describe('paths', () => {
     assert.deepEqual(projectConfigDirs(root, true), [path.join(root, '.coco'), path.join(root, '.claude')]);
     assert.deepEqual(projectConfigDirs(root, false), [path.join(root, '.coco')]);
     assert.deepEqual(userConfigDirs(false), [configDir()]);
-    assert.deepEqual(userConfigDirs(true), [configDir(), path.join(os.homedir(), '.claude')]);
+    assert.deepEqual(userConfigDirs(true), [configDir(), claudeDir()]);
+    // Like ~/.coco, the Claude directory can be relocated; it defaults to ~/.claude.
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      process.env.CLAUDE_CONFIG_DIR = path.join(root, 'elsewhere');
+      assert.equal(claudeDir(), path.join(root, 'elsewhere'));
+      delete process.env.CLAUDE_CONFIG_DIR;
+      assert.equal(claudeDir(), path.join(os.homedir(), '.claude'));
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+    }
   });
 
   test('writeJsonFile creates directories, replaces atomically and leaves no temp file', () => {

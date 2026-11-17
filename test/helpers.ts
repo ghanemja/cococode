@@ -8,10 +8,11 @@ import { setColorEnabled } from '../src/ui/ansi.ts';
 
 setColorEnabled(false);
 
-/** A fresh temp directory, with COCO_CONFIG_DIR pointed inside it so tests never touch ~/.coco. */
+/** A fresh temp directory, with the user config directories pointed inside it so tests never touch ~/.coco or ~/.claude. */
 export function tempProject(prefix = 'coco-test-'): string {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   process.env.COCO_CONFIG_DIR = path.join(dir, '.coco-home');
+  process.env.CLAUDE_CONFIG_DIR = path.join(dir, '.claude-home');
   return dir;
 }
 

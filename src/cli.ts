@@ -254,14 +254,24 @@ function cmdConfig(args: ParsedArgs): number {
     if (!key || rest.length === 0) fail(`Usage: ${APP_NAME} config set <key> <value> [--scope user|project|local]`);
     const scope = parseScope(str(args.flags, 'scope'), 'user');
     const value = parseSettingValue(rest.join(' '));
-    const file = updateSettingsFile(scope, cwd, (s) => setByPath(s as Record<string, unknown>, key!, value));
+    let file: string;
+    try {
+      file = updateSettingsFile(scope, cwd, (s) => setByPath(s as Record<string, unknown>, key!, value));
+    } catch (err) {
+      return fail(`Could not set ${key}: ${(err as Error).message}`);
+    }
     process.stdout.write(`Set ${key} = ${JSON.stringify(value)} in ${file}\n`);
     return 0;
   }
   if (verb === 'unset') {
     if (!key) fail(`Usage: ${APP_NAME} config unset <key> [--scope user|project|local]`);
     const scope = parseScope(str(args.flags, 'scope'), 'user');
-    const file = updateSettingsFile(scope, cwd, (s) => setByPath(s as Record<string, unknown>, key!, undefined));
+    let file: string;
+    try {
+      file = updateSettingsFile(scope, cwd, (s) => setByPath(s as Record<string, unknown>, key!, undefined));
+    } catch (err) {
+      return fail(`Could not unset ${key}: ${(err as Error).message}`);
+    }
     process.stdout.write(`Removed ${key} from ${file}\n`);
     return 0;
   }

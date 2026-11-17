@@ -145,8 +145,7 @@ describe('tool set', () => {
   const names = (server: MockServer, i = 0) => (server.requests[i]!.body.tools as { function: { name: string } }[]).map((t) => t.function.name);
 
   test('tools that cannot apply are not sent, saving context', async () => {
-    // Compat off so skills in the developer's own ~/.claude do not count as installed here.
-    const { ctl, server } = await setup([{ text: 'a' }, { text: 'b' }], { overrides: { claudeCompat: false } });
+    const { ctl, server } = await setup([{ text: 'a' }, { text: 'b' }]);
     await collect(ctl.submit('hi'));
     assert.ok(!names(server).includes('ExitPlanMode'));
     assert.ok(!names(server).includes('Skill'));

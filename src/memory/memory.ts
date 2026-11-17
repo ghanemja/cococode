@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { LOCAL_MEMORY_FILE, MEMORY_FILE, PROJECT_DIR, configDir, expandHome, findProjectRoot } from '../config/paths.ts';
+import { claudeDir, configDir, expandHome, findProjectRoot, LOCAL_MEMORY_FILE, MEMORY_FILE, PROJECT_DIR } from '../config/paths.ts';
 
 export type MemoryScope = 'user' | 'project' | 'local';
 
@@ -96,7 +96,7 @@ export function loadMemory(cwd: string, claudeCompat = true): MemoryFile[] {
   };
 
   add(path.join(configDir(), MEMORY_FILE), 'user', 0);
-  if (claudeCompat) add(path.join(os.homedir(), '.claude', 'CLAUDE.md'), 'user', 0);
+  if (claudeCompat) add(path.join(claudeDir(), 'CLAUDE.md'), 'user', 0);
 
   const root = findProjectRoot(cwd);
   const dirs: string[] = [];

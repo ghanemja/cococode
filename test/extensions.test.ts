@@ -283,6 +283,7 @@ describe('extension loading', () => {
     // ~/.claude is read when compat is on; point it somewhere empty.
     process.env.HOME = path.join(root, 'home');
     fs.mkdirSync(process.env.HOME, { recursive: true });
+    process.env.CLAUDE_CONFIG_DIR = path.join(process.env.HOME, '.claude');
   });
 
   afterEach(() => {

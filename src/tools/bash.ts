@@ -77,11 +77,11 @@ export const bashTool: Tool<BashInput> = {
       notes.push(`Command timed out after ${formatDuration(timeoutMs)} and was killed. For long-running processes use run_in_background.`);
     } else if (res.exitCode !== 0) notes.push(`Exit code ${res.exitCode}`);
 
+    const lineCount = output ? output.split('\n').length : 0;
     if (!output && notes.length === 0) output = '(no output)';
     const content = [output, ...notes].filter(Boolean).join('\n');
     const failed = res.interrupted || res.timedOut || res.exitCode !== 0;
     const elapsed = Date.now() - started;
-    const lineCount = output ? output.split('\n').length : 0;
     let summary: string;
     if (res.interrupted) summary = 'Interrupted';
     else if (res.timedOut) summary = `Timed out after ${formatDuration(timeoutMs)}`;
