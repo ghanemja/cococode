@@ -13,7 +13,7 @@ export type Step =
   | { wait: string; timeout?: number }
   | { send: string; after?: number }
   | { sleep: number }
-  | { snapshot: string }
+  | { snapshot: string; full?: boolean }
   | { resize: [number, number] };
 
 export interface TuiSpec {

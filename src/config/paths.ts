@@ -68,7 +68,8 @@ export function displayPath(p: string, cwd: string): string {
   const abs = path.resolve(cwd, p);
   const rel = path.relative(cwd, abs);
   if (rel === '') return '.';
-  if (!rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+  const outside = rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+  if (!outside) return rel;
   const home = os.homedir();
   if (abs === home) return '~';
   if (abs.startsWith(home + path.sep)) return '~' + abs.slice(home.length);
@@ -82,10 +83,18 @@ export function expandHome(p: string): string {
 }
 
 export function readJsonFile<T>(file: string): T | undefined {
+  let text: string;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
+    text = fs.readFileSync(file, 'utf8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error(`Could not read ${file}: ${(err as Error).message}`);
+  }
+  // An empty file (freshly created, or truncated) holds no settings; it is not an error.
+  if (text.trim() === '') return undefined;
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
     throw new Error(`Could not parse ${file}: ${(err as Error).message}`);
   }
 }
@@ -93,6 +102,11 @@ export function readJsonFile<T>(file: string): T | undefined {
 export function writeJsonFile(file: string, value: unknown): void {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n');
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n');
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
 }

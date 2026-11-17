@@ -157,6 +157,7 @@ export class Agent {
   private permissionLock: Promise<void> = Promise.resolve();
   private lastFingerprint = '';
   private repeatCount = 0;
+  private warnedTooSmall = false;
 
   constructor(deps: AgentDeps) {
     this.deps = deps;
@@ -251,10 +252,25 @@ export class Agent {
       turns++;
 
       if ((deps.settings.autoCompact ?? true) && this.contextTokens() > this.compactLimit()) {
-        yield* this.compact(signal, { auto: true });
-        if (signal.aborted) {
-          yield { type: 'done', reason: 'aborted' };
-          return;
+        // Summarising only helps when the conversation is what fills the window. If the
+        // system prompt and tool definitions alone are too big, compacting every turn
+        // would burn a model call each time and free nothing.
+        const conversation = this.calibrator.apply(messagesTokens(this.messages));
+        if (conversation > deps.client.profile.contextWindow * 0.15) {
+          yield* this.compact(signal, { auto: true });
+          if (signal.aborted) {
+            yield { type: 'done', reason: 'aborted' };
+            return;
+          }
+        } else if (!this.warnedTooSmall) {
+          this.warnedTooSmall = true;
+          yield {
+            type: 'notice',
+            level: 'warn',
+            text:
+              `The context window (${deps.client.profile.contextWindow} tokens) is nearly filled by the system prompt and tool definitions alone. ` +
+              'Use a larger context (--context, or reload the model with more), limit tools with --tools, or shorten your memory files.',
+          };
         }
       }
 

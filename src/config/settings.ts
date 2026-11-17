@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PermissionMode } from '../types.ts';
 import { PROJECT_DIR, configDir, readJsonFile, writeJsonFile } from './paths.ts';
@@ -134,16 +135,23 @@ function uniq<T>(items: T[]): T[] {
   return [...new Set(items)];
 }
 
+/** Deep copy of JSON-like data, so the merged result never aliases a source. */
+function clone<T>(value: T): T {
+  return typeof value === 'object' && value !== null ? structuredClone(value) : value;
+}
+
 /**
  * Merge settings so that later sources win for scalars, while permission
- * rule lists and hook lists accumulate across sources.
+ * rule lists and hook lists accumulate across sources. The result shares no
+ * objects with its inputs, so changing it cannot alter a source.
  */
 export function mergeSettings(...sources: (Settings | undefined)[]): Settings {
   const out: Record<string, unknown> = {};
   for (const src of sources) {
     if (!src) continue;
-    for (const [key, value] of Object.entries(src)) {
-      if (value === undefined) continue;
+    for (const [key, raw] of Object.entries(src)) {
+      if (raw === undefined) continue;
+      const value: unknown = clone(raw);
       const prev = out[key];
       if (key === 'permissions' && isPlainObject(value)) {
         const a = (prev ?? {}) as PermissionSettings;
@@ -214,59 +222,74 @@ function pick(settings: Settings, keys: (keyof Settings)[]): Settings {
 }
 
 export function loadSettings(opts: LoadOptions): LoadedSettings {
-  const sources: LoadedSettings['sources'] = [];
+  type Source = LoadedSettings['sources'][number];
   const errors: string[] = [];
 
-  const read = (scope: string, file: string, filter?: (keyof Settings)[]) => {
+  const read = (scope: string, file: string, how: { filter?: (keyof Settings)[]; required?: boolean } = {}): Source | undefined => {
+    let data: unknown;
     try {
-      const data = readJsonFile<Settings>(file);
-      if (data && isPlainObject(data)) {
-        sources.push({ scope, path: file, settings: filter ? pick(data, filter) : data });
-      }
+      data = readJsonFile<unknown>(file);
     } catch (err) {
       errors.push((err as Error).message);
-    }
-  };
-
-  read('user', settingsPath('user', opts.projectRoot));
-
-  // Compat files are read first so that .coco settings win on conflicts.
-  const userSettings = sources[0]?.settings;
-  const projectProbe = (() => {
-    try {
-      return readJsonFile<Settings>(settingsPath('project', opts.projectRoot));
-    } catch {
       return undefined;
     }
-  })();
-  const compat = projectProbe?.claudeCompat ?? userSettings?.claudeCompat ?? true;
-  if (compat) {
-    read('claude-project', path.join(opts.projectRoot, '.claude', 'settings.json'), CLAUDE_COMPAT_KEYS);
-    read('claude-local', path.join(opts.projectRoot, '.claude', 'settings.local.json'), CLAUDE_COMPAT_KEYS);
-  }
-  read('project', settingsPath('project', opts.projectRoot));
-  read('local', settingsPath('local', opts.projectRoot));
+    if (data === undefined) {
+      if (how.required) errors.push(`Settings file not found: ${file}`);
+      return undefined;
+    }
+    if (!isPlainObject(data)) {
+      errors.push(`${file} must contain a JSON object.`);
+      return undefined;
+    }
+    return { scope, path: file, settings: how.filter ? pick(data as Settings, how.filter) : (data as Settings) };
+  };
 
+  const user = read('user', settingsPath('user', opts.projectRoot));
+  const project = read('project', settingsPath('project', opts.projectRoot));
+  const local = read('local', settingsPath('local', opts.projectRoot));
+
+  const tail: Source[] = [];
   if (opts.extra) {
     const trimmed = opts.extra.trim();
     if (trimmed.startsWith('{')) {
       try {
-        sources.push({ scope: 'flag', settings: JSON.parse(trimmed) as Settings });
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (isPlainObject(parsed)) tail.push({ scope: 'flag', settings: parsed as Settings });
+        else errors.push('--settings must be a JSON object.');
       } catch (err) {
         errors.push(`--settings is not valid JSON: ${(err as Error).message}`);
       }
     } else {
-      read('flag', path.resolve(trimmed));
+      const flag = read('flag', path.resolve(trimmed), { required: true });
+      if (flag) tail.push(flag);
     }
   }
-
   const env = envSettings(process.env);
-  if (Object.keys(env).length) sources.push({ scope: 'env', settings: env });
-  if (opts.overrides && Object.keys(opts.overrides).length) {
-    sources.push({ scope: 'cli', settings: opts.overrides });
-  }
+  if (Object.keys(env).length) tail.push({ scope: 'env', settings: env });
+  if (opts.overrides && Object.keys(opts.overrides).length) tail.push({ scope: 'cli', settings: opts.overrides });
 
+  // Whether to honour .claude files is itself a setting, decided by coco's own sources.
+  const own = [user, project, local, ...tail].filter((s): s is Source => s !== undefined);
+  const compat = mergeSettings(...own.map((s) => s.settings)).claudeCompat ?? true;
+  const claude = compat
+    ? [
+        read('claude-project', path.join(opts.projectRoot, '.claude', 'settings.json'), { filter: CLAUDE_COMPAT_KEYS }),
+        read('claude-local', path.join(opts.projectRoot, '.claude', 'settings.local.json'), { filter: CLAUDE_COMPAT_KEYS }),
+      ]
+    : [];
+
+  // Compat files sit just above user settings so that .coco settings win on conflicts.
+  const sources = [user, ...claude, project, local, ...tail].filter((s): s is Source => s !== undefined);
   return { merged: mergeSettings(...sources.map((s) => s.settings)), sources, errors };
+}
+
+/** Keep a copy of a settings file we cannot parse before writing over it. */
+function preserveInvalid(file: string): void {
+  try {
+    fs.copyFileSync(file, `${file}.invalid`);
+  } catch {
+    // nothing to preserve
+  }
 }
 
 /** Read-modify-write a single settings file. */
@@ -278,22 +301,29 @@ export function updateSettingsFile(
   const file = settingsPath(scope, projectRoot);
   let current: Settings = {};
   try {
-    current = readJsonFile<Settings>(file) ?? {};
+    const data = readJsonFile<unknown>(file);
+    if (isPlainObject(data)) current = data as Settings;
+    else if (data !== undefined) preserveInvalid(file);
   } catch {
-    current = {};
+    // The file is not valid JSON. It contributes nothing while it is broken,
+    // but the user's text is kept next to it rather than silently replaced.
+    preserveInvalid(file);
   }
   mutate(current);
   writeJsonFile(file, current);
   return file;
 }
 
+const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
 /** Set a dotted key ("permissions.defaultMode") on a settings object. */
 export function setByPath(target: Record<string, unknown>, dotted: string, value: unknown): void {
   const parts = dotted.split('.');
+  if (parts.some((p) => p === '' || UNSAFE_KEYS.has(p))) throw new Error(`Invalid settings key: ${dotted}`);
   let node = target;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i]!;
-    if (!isPlainObject(node[key])) node[key] = {};
+    if (!Object.hasOwn(node, key) || !isPlainObject(node[key])) node[key] = {};
     node = node[key] as Record<string, unknown>;
   }
   const last = parts[parts.length - 1]!;
@@ -304,7 +334,8 @@ export function setByPath(target: Record<string, unknown>, dotted: string, value
 export function getByPath(source: unknown, dotted: string): unknown {
   let node: unknown = source;
   for (const part of dotted.split('.')) {
-    if (!isPlainObject(node)) return undefined;
+    // Own properties only: "toString" is not a setting.
+    if (!isPlainObject(node) || !Object.hasOwn(node, part)) return undefined;
     node = node[part];
   }
   return node;

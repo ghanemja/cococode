@@ -29,6 +29,8 @@ export interface ModelInfo {
   loadedContextLength?: number;
   /** Known capability names: "tools", "vision", "thinking". Undefined when the server does not say. */
   capabilities?: string[];
+  /** Image input, when the server reports it separately from `capabilities`. */
+  vision?: boolean;
   sizeBytes?: number;
   parameterSize?: string;
   quantization?: string;
@@ -80,16 +82,20 @@ export function classifyError(status: number, message: string): ProviderErrorKin
   ) {
     return 'context_overflow';
   }
-  if (status === 404 || /model .*not found|no such model|model not loaded|try pulling it first/.test(m)) {
+  if (/model .*not found|no such model|no models? loaded|model not loaded|try pulling it first|model .*does not exist|unknown model/.test(m)) {
     return 'model_not_found';
   }
+  // A bare 404 is more often a wrong base URL than a missing model.
+  if (status === 404 && /model/.test(m)) return 'model_not_found';
   return 'http';
 }
 
 export function connectionError(baseUrl: string, err: unknown): ProviderError {
   const e = err as Error & { cause?: { code?: string; message?: string } };
-  if (e?.name === 'AbortError' || e?.name === 'TimeoutError') {
-    return new ProviderError('aborted', 'Request aborted');
+  if (err instanceof ProviderError) return err;
+  if (e?.name === 'AbortError') return new ProviderError('aborted', 'Request aborted');
+  if (e?.name === 'TimeoutError') {
+    return new ProviderError('connection', `Timed out waiting for ${baseUrl}. Is the model server running and responsive?`);
   }
   const code = e?.cause?.code ?? '';
   const detail = code || e?.cause?.message || e?.message || String(err);
@@ -114,7 +120,11 @@ export async function readErrorBody(res: Response): Promise<string> {
   return text.trim().slice(0, 500) || `HTTP ${res.status}`;
 }
 
-/** Yield complete lines from a streaming response body. */
+/**
+ * Yield complete lines from a streaming response body. A read that fails is
+ * reported as an abort when the caller cancelled, and otherwise as a dropped
+ * connection, so callers never see a raw fetch error.
+ */
 export async function* readLines(res: Response, signal?: AbortSignal): AsyncGenerator<string> {
   if (!res.body) return;
   const reader = res.body.getReader();
@@ -123,7 +133,16 @@ export async function* readLines(res: Response, signal?: AbortSignal): AsyncGene
   try {
     for (;;) {
       if (signal?.aborted) throw new ProviderError('aborted', 'Request aborted');
-      const { done, value } = await reader.read();
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        if (signal?.aborted || (err as Error)?.name === 'AbortError') throw new ProviderError('aborted', 'Request aborted');
+        const e = err as Error & { cause?: { code?: string; message?: string } };
+        const detail = e?.cause?.code || e?.cause?.message || e?.message || String(err);
+        throw new ProviderError('connection', `The connection to the model server was lost mid-response (${detail}).`);
+      }
+      const { done, value } = chunk;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let nl: number;

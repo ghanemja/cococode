@@ -40,7 +40,8 @@ export function findImports(text: string): string[] {
     const withoutCode = line.replace(/`[^`]*`/g, '');
     const re = /(?:^|[\s(])@((?:~\/|\.{1,2}\/|\/)?[\w.-]+(?:\/[\w.-]+)*)/g;
     for (let m = re.exec(withoutCode); m; m = re.exec(withoutCode)) {
-      const ref = m[1]!;
+      // A full stop after the path ends the sentence; it is not part of the name.
+      const ref = m[1]!.replace(/\.+$/, '');
       // Require something path-like so "@username" in prose is not an import.
       if (ref.includes('/') || /\.[a-zA-Z0-9]+$/.test(ref)) out.push(ref);
     }

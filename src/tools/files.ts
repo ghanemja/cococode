@@ -339,8 +339,8 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
   const raw = fs.readFileSync(abs, 'utf8');
   const eol = detectEol(raw);
   const content = raw.replace(/\r\n/g, '\n');
-  let oldString = stripLineNumbers(inputOld.replace(/\r\n/g, '\n'));
-  let newString = stripLineNumbers(inputNew.replace(/\r\n/g, '\n'));
+  let oldString = inputOld.replace(/\r\n/g, '\n');
+  let newString = inputNew.replace(/\r\n/g, '\n');
 
   if (oldString === newString) return { error: 'old_string and new_string are identical; nothing to change.' };
   if (oldString === '') {
@@ -352,6 +352,17 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
 
   let note = '';
   let count = countOccurrences(content, oldString);
+  if (count === 0) {
+    // The text may have been pasted from Read output, line-number prefixes and all. Only
+    // assume so when it does not match as written: a TSV row really can start "12<tab>".
+    const bare = stripLineNumbers(oldString);
+    if (bare !== oldString && (countOccurrences(content, bare) > 0 || fuzzyFind(content, bare, '') !== null)) {
+      oldString = bare;
+      newString = stripLineNumbers(newString);
+      if (oldString === newString) return { error: 'old_string and new_string are identical; nothing to change.' };
+      count = countOccurrences(content, oldString);
+    }
+  }
   if (count === 0) {
     const fuzzy = fuzzyFind(content, oldString, newString);
     if (!fuzzy) {

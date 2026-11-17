@@ -25,6 +25,8 @@ interface RawResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Killed because the turn was interrupted; not a hook failure. */
+  aborted: boolean;
 }
 
 export interface HookBase {
@@ -37,10 +39,15 @@ export interface HookBase {
 
 function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRoot: string, signal?: AbortSignal): Promise<RawResult> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
+      return;
+    }
     const { shell, args } = shellPath();
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let aborted = false;
     let done = false;
     const proc = spawn(shell, args(hook.command), {
       cwd,
@@ -53,16 +60,23 @@ function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRo
       done = true;
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
-      resolve({ code, stdout, stderr, timedOut });
+      resolve({ code, stdout, stderr, timedOut, aborted });
     };
+    const seconds = typeof hook.timeout === 'number' && hook.timeout > 0 ? hook.timeout : 60;
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(proc, 'SIGKILL');
-    }, (hook.timeout ?? 60) * 1000);
-    const onAbort = () => killTree(proc, 'SIGKILL');
+    }, seconds * 1000);
+    const onAbort = () => {
+      aborted = true;
+      killTree(proc, 'SIGKILL');
+    };
     signal?.addEventListener('abort', onAbort, { once: true });
-    proc.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')));
-    proc.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')));
+    // Decode as streams so a multi-byte character split across chunks survives.
+    proc.stdout.setEncoding('utf8');
+    proc.stderr.setEncoding('utf8');
+    proc.stdout.on('data', (d: string) => (stdout += d));
+    proc.stderr.on('data', (d: string) => (stderr += d));
     proc.on('error', (err) => {
       stderr += err.message;
       finish(1);
@@ -95,16 +109,31 @@ export class HookRunner {
     this.base = base;
   }
 
+  /** Matchers for an event, tolerating hand-written settings of the wrong shape. */
+  private matchers(event: HookEvent): { matcher?: string; commands: HookCommand[] }[] {
+    const raw: unknown = this.getConfig()?.[event];
+    if (!Array.isArray(raw)) return [];
+    const out: { matcher?: string; commands: HookCommand[] }[] = [];
+    for (const entry of raw as unknown[]) {
+      if (!isRecord(entry) || !Array.isArray(entry.hooks)) continue;
+      const commands = (entry.hooks as unknown[]).filter(
+        (h): h is HookCommand => isRecord(h) && h.type === 'command' && typeof h.command === 'string' && h.command.trim() !== '',
+      );
+      if (commands.length) out.push({ matcher: typeof entry.matcher === 'string' ? entry.matcher : undefined, commands });
+    }
+    return out;
+  }
+
   has(event: HookEvent): boolean {
-    return (this.getConfig()?.[event]?.length ?? 0) > 0;
+    return this.matchers(event).length > 0;
   }
 
   /** All configured hooks, for display. */
   list(): { event: HookEvent; matcher: string; command: string }[] {
     const out: { event: HookEvent; matcher: string; command: string }[] = [];
-    for (const [event, matchers] of Object.entries(this.getConfig() ?? {})) {
-      for (const m of matchers ?? []) {
-        for (const h of m.hooks ?? []) out.push({ event: event as HookEvent, matcher: m.matcher || '*', command: h.command });
+    for (const event of Object.keys(this.getConfig() ?? {}) as HookEvent[]) {
+      for (const m of this.matchers(event)) {
+        for (const h of m.commands) out.push({ event, matcher: m.matcher || '*', command: h.command });
       }
     }
     return out;
@@ -116,15 +145,12 @@ export class HookRunner {
    */
   async run(event: HookEvent, payload: Record<string, unknown>, subject?: string, signal?: AbortSignal): Promise<HookOutcome> {
     const outcome: HookOutcome = { blocked: false, messages: [] };
-    const matchers = this.getConfig()?.[event];
-    if (!matchers?.length) return outcome;
-
     const commands: HookCommand[] = [];
     const seen = new Set<string>();
-    for (const m of matchers) {
+    for (const m of this.matchers(event)) {
       if (!matcherApplies(m.matcher, subject)) continue;
-      for (const h of m.hooks ?? []) {
-        if (h?.type !== 'command' || !h.command || seen.has(h.command)) continue;
+      for (const h of m.commands) {
+        if (seen.has(h.command)) continue;
         seen.add(h.command);
         commands.push(h);
       }
@@ -147,6 +173,7 @@ export class HookRunner {
 
     results.forEach((res, i) => {
       const command = commands[i]!.command;
+      if (res.aborted) return; // the user interrupted; nothing to report
       if (res.timedOut) {
         outcome.messages.push(`${event} hook timed out: ${command}`);
         return;

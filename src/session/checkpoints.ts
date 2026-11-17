@@ -8,6 +8,8 @@ interface Snapshot {
   path: string;
   /** Backup file holding the previous content, or null if the file did not exist. */
   backup: string | null;
+  /** Permission bits of the original file, so an executable stays executable. */
+  mode?: number;
 }
 
 /**
@@ -27,7 +29,10 @@ export class Checkpoints {
     this.dir = dir;
     this.indexFile = path.join(dir, 'index.json');
     try {
-      this.snapshots = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as Snapshot[];
+      const parsed = JSON.parse(fs.readFileSync(this.indexFile, 'utf8')) as unknown;
+      this.snapshots = Array.isArray(parsed)
+        ? (parsed as Snapshot[]).filter((s) => s && typeof s.path === 'string' && typeof s.turn === 'number' && (s.backup === null || typeof s.backup === 'string'))
+        : [];
     } catch {
       this.snapshots = [];
     }
@@ -37,16 +42,27 @@ export class Checkpoints {
   track(absPath: string, turn: number): void {
     if (this.snapshots.some((s) => s.turn === turn && s.path === absPath)) return;
     let backup: string | null = null;
+    let mode: number | undefined;
+    let data: Buffer | undefined;
     try {
-      const data = fs.readFileSync(absPath);
-      fs.mkdirSync(this.dir, { recursive: true });
-      const hash = crypto.createHash('sha1').update(absPath).digest('hex').slice(0, 16);
-      backup = path.join(this.dir, `${hash}@${turn}`);
-      fs.writeFileSync(backup, data);
+      data = fs.readFileSync(absPath);
+      mode = fs.statSync(absPath).mode & 0o7777;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return; // unreadable: nothing to restore to
     }
-    this.snapshots.push({ turn, path: absPath, backup });
+    if (data !== undefined) {
+      try {
+        fs.mkdirSync(this.dir, { recursive: true });
+        const hash = crypto.createHash('sha1').update(absPath).digest('hex').slice(0, 16);
+        backup = path.join(this.dir, `${hash}@${turn}`);
+        fs.writeFileSync(backup, data);
+      } catch {
+        return; // could not save a copy, so there is nothing to rewind to
+      }
+    }
+    const snapshot: Snapshot = { turn, path: absPath, backup };
+    if (mode !== undefined) snapshot.mode = mode;
+    this.snapshots.push(snapshot);
     this.persist();
   }
 
@@ -74,15 +90,23 @@ export class Checkpoints {
         } else {
           fs.mkdirSync(path.dirname(snap.path), { recursive: true });
           fs.copyFileSync(snap.backup, snap.path);
+          if (snap.mode !== undefined && process.platform !== 'win32') fs.chmodSync(snap.path, snap.mode);
         }
         restored.push(snap.path);
       } catch {
         failed.push(snap.path);
       }
     }
-    this.snapshots = this.snapshots.filter((s) => s.turn < turn);
+    // Keep the snapshots of files that could not be restored, so a retry is possible.
+    const stuck = new Set(failed);
+    this.snapshots = this.snapshots.filter((s) => s.turn < turn || stuck.has(s.path));
     this.persist();
     return { restored, failed };
+  }
+
+  /** Highest turn with a snapshot, or 0. A resumed session must number new turns above this. */
+  lastTurn(): number {
+    return this.snapshots.reduce((max, s) => Math.max(max, s.turn), 0);
   }
 
   private persist(): void {

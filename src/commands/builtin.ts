@@ -56,7 +56,7 @@ export interface SlashCommand {
 }
 
 const heading = (s: string) => c.bold(s);
-const kv = (k: string, v: string) => `  ${c.dim(padEnd(k, 16))}${v}`;
+const kv = (k: string, v: string) => `  ${c.dim(padEnd(k, 18))}${v}`;
 
 const INIT_PROMPT = `Analyze this codebase and create a ${MEMORY_FILE} file in the project root. It is loaded into your context at the start of every session, so it should hold what a new contributor needs and cannot quickly work out alone:
 

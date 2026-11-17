@@ -13,7 +13,8 @@ The script is a JSON object:
       {"wait": "text to wait for", "timeout": 10},
       {"send": "hello\\r"},
       {"sleep": 0.3},
-      {"snapshot": "label"}
+      {"snapshot": "label"},
+      {"snapshot": "label", "full": true}
     ]
   }
 
@@ -40,7 +41,8 @@ def main() -> int:
         spec = json.load(fh)
     cols = spec.get("cols", 100)
     rows = spec.get("rows", 30)
-    screen = pyte.Screen(cols, rows)
+    # HistoryScreen keeps what scrolled off the top, so tests can check the scrollback too.
+    screen = pyte.HistoryScreen(cols, rows, history=5000, ratio=0.001)
     stream = pyte.ByteStream(screen)
 
     pid, fd = pty.fork()
@@ -76,6 +78,12 @@ def main() -> int:
     def text() -> str:
         return "\n".join(line.rstrip() for line in screen.display)
 
+    def scrollback() -> str:
+        rows_above = []
+        for line in screen.history.top:
+            rows_above.append("".join(line[x].data for x in range(cols)).rstrip())
+        return "\n".join(rows_above + [text()])
+
     status = 0
     alive = True
     for step in spec["steps"]:
@@ -109,7 +117,8 @@ def main() -> int:
         elif "snapshot" in step:
             pump(0.1)
             print(f"<<<SNAPSHOT {step['snapshot']} cursor={screen.cursor.y},{screen.cursor.x}>>>")
-            print(text())
+            # "full" includes everything that has scrolled off the top of the screen.
+            print(scrollback() if step.get("full") else text())
             print("<<<END>>>")
 
     try:

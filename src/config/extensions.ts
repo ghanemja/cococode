@@ -102,6 +102,11 @@ export function splitArgs(args: string): string[] {
 /**
  * Expand a command body: `$ARGUMENTS`, `$1`..`$9`, and `` !`cmd` `` which is
  * replaced by the command's output when `runBash` permits it.
+ *
+ * Only inline commands written in the command file run. Arguments are
+ * substituted into them (so `` !`git log $1` `` works), but text that merely
+ * arrives through an argument is never executed, and placeholders inside an
+ * argument are left as typed.
  */
 export async function expandCommand(
   command: Pick<CustomCommand, 'body'>,
@@ -109,25 +114,34 @@ export async function expandCommand(
   runBash?: (cmd: string) => Promise<string | null>,
 ): Promise<string> {
   const positional = splitArgs(args);
-  let text = command.body;
-  const usesArgs = /\$ARGUMENTS|\$[1-9]/.test(text);
-  text = text.replace(/\$ARGUMENTS/g, args.trim());
-  text = text.replace(/\$([1-9])/g, (_, n: string) => positional[Number(n) - 1] ?? '');
-  if (!usesArgs && args.trim()) text = `${text.trimEnd()}\n\nARGUMENTS: ${args.trim()}`;
+  const trimmedArgs = args.trim();
+  const body = command.body;
+  const usesArgs = /\$ARGUMENTS|\$[1-9]/.test(body);
+  const substitute = (text: string) =>
+    text.replace(/\$ARGUMENTS|\$([1-9])/g, (_match, n: string | undefined) => (n === undefined ? trimmedArgs : (positional[Number(n) - 1] ?? '')));
 
+  // Split the template into literal text and inline commands before any
+  // argument is substituted, so arguments cannot introduce new commands.
   const inline = /!`([^`\n]+)`/g;
-  const matches = [...text.matchAll(inline)];
-  if (matches.length) {
-    const outputs = await Promise.all(
-      matches.map(async (m) => {
-        if (!runBash) return `[command not run: ${m[1]}]`;
-        const out = await runBash(m[1]!);
-        return out === null ? `[command not permitted: ${m[1]}]` : out.trim();
-      }),
-    );
-    let i = 0;
-    text = text.replace(inline, () => outputs[i++] ?? '');
+  const pieces: { text: string; command: boolean }[] = [];
+  let last = 0;
+  for (let m = inline.exec(body); m; m = inline.exec(body)) {
+    pieces.push({ text: body.slice(last, m.index), command: false }, { text: m[1]!, command: true });
+    last = m.index + m[0].length;
   }
+  pieces.push({ text: body.slice(last), command: false });
+
+  const rendered = await Promise.all(
+    pieces.map(async (piece) => {
+      const text = substitute(piece.text);
+      if (!piece.command) return text;
+      if (!runBash) return `[command not run: ${text}]`;
+      const out = await runBash(text);
+      return out === null ? `[command not permitted: ${text}]` : out.trim();
+    }),
+  );
+  let text = rendered.join('');
+  if (!usesArgs && trimmedArgs) text = `${text.trimEnd()}\n\nARGUMENTS: ${trimmedArgs}`;
   return text.trim();
 }
 

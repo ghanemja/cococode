@@ -1,6 +1,6 @@
 import type { ProviderConfig, Settings } from '../config/settings.ts';
 import { DEFAULTS } from '../config/settings.ts';
-import type { StopReason } from '../types.ts';
+import type { ToolCall } from '../types.ts';
 import { OllamaProvider, normalizeOllamaHost } from './ollama.ts';
 import { OpenAIProvider } from './openai.ts';
 import { TextStreamParser, toTextProtocol } from './textTools.ts';
@@ -26,7 +26,8 @@ export const PRESETS: Record<string, ProviderConfig> = {
 const PROBE_ORDER = ['ollama', 'lmstudio', 'llamacpp', 'vllm', 'jan', 'koboldcpp', 'tabby'];
 
 export function providerConfigs(settings: Settings): Record<string, ProviderConfig> {
-  const configs: Record<string, ProviderConfig> = { ...PRESETS, ...(settings.providers ?? {}) };
+  // Null prototype: a provider called "constructor" or "toString" must not resolve to an inherited member.
+  const configs: Record<string, ProviderConfig> = Object.assign(Object.create(null) as Record<string, ProviderConfig>, PRESETS, settings.providers ?? {});
   const ollamaHost = process.env.OLLAMA_HOST;
   if (ollamaHost && !settings.providers?.ollama) {
     try {
@@ -106,35 +107,29 @@ export const NO_SERVER_HELP = [
   '  coco --base-url http://host:port/v1 --model <name>',
 ].join('\n');
 
+function buildProvider(name: string, base: ProviderConfig, settings: Settings): Provider {
+  const config: ProviderConfig = {
+    ...base,
+    baseUrl: settings.baseUrl ?? base.baseUrl,
+    apiKey: settings.apiKey ?? base.apiKey ?? (name === 'openai' ? process.env.OPENAI_API_KEY : undefined),
+  };
+  return createProvider(name, config);
+}
+
 /**
  * Decide which server to talk to. An explicit provider or base URL wins;
  * otherwise the first running local server is used.
  */
 export async function resolveProvider(settings: Settings): Promise<ResolvedProvider> {
   const configs = providerConfigs(settings);
-  let model = settings.model;
-  let providerName = settings.provider;
+  const model = settings.model;
 
-  // "provider/model" shorthand, only when the prefix names a known provider.
-  if (model && !providerName) {
-    const slash = model.indexOf('/');
-    if (slash > 0 && configs[model.slice(0, slash)]) {
-      providerName = model.slice(0, slash);
-      model = model.slice(slash + 1);
-    }
-  }
-
-  if (providerName) {
-    const base = configs[providerName];
+  if (settings.provider) {
+    const base = configs[settings.provider];
     if (!base) {
-      throw new ProviderError('other', `Unknown provider "${providerName}". Known providers: ${Object.keys(configs).join(', ')}.`);
+      throw new ProviderError('other', `Unknown provider "${settings.provider}". Known providers: ${Object.keys(configs).join(', ')}.`);
     }
-    const config: ProviderConfig = {
-      ...base,
-      baseUrl: settings.baseUrl ?? base.baseUrl,
-      apiKey: settings.apiKey ?? base.apiKey ?? (providerName === 'openai' ? process.env.OPENAI_API_KEY : undefined),
-    };
-    return { provider: createProvider(providerName, config), model };
+    return { provider: buildProvider(settings.provider, base, settings), model };
   }
 
   if (settings.baseUrl) {
@@ -149,10 +144,25 @@ export async function resolveProvider(settings: Settings): Promise<ResolvedProvi
     return { provider: createProvider(isOllama ? 'ollama' : 'custom', config), model };
   }
 
-  const detected = await detectServers(settings);
+  // "provider/model" shorthand, only when the prefix names a known provider.
+  const slash = model ? model.indexOf('/') : -1;
+  const prefix = model && slash > 0 ? model.slice(0, slash) : undefined;
+  const shorthand = prefix !== undefined && configs[prefix] ? { name: prefix, model: model!.slice(slash + 1) } : undefined;
+
+  let detected: DetectedServer[] | undefined;
+  if (shorthand) {
+    // Model ids can themselves begin with a provider's name ("openai/gpt-oss-20b"
+    // on LM Studio). A running server that lists the full id takes precedence.
+    detected = await detectServers(settings);
+    const local = detected.find((d) => d.models.some((m) => m.id === model));
+    if (local) return { provider: createProvider(local.name, local.config), model, detected };
+    return { provider: buildProvider(shorthand.name, configs[shorthand.name]!, settings), model: shorthand.model };
+  }
+
+  detected = await detectServers(settings);
   if (detected.length === 0) throw new ProviderError('connection', NO_SERVER_HELP);
   // Prefer a server that actually has the requested model.
-  const withModel = model ? detected.find((d) => d.models.some((m) => m.id === model)) : undefined;
+  const withModel = model ? detected.find((d) => d.models.some((m) => m.id === model || m.id === `${model}:latest`)) : undefined;
   const chosen = withModel ?? detected.find((d) => d.models.length > 0) ?? detected[0]!;
   return { provider: createProvider(chosen.name, chosen.config), model, detected };
 }
@@ -215,7 +225,7 @@ export async function profileModel(provider: Provider, model: string, settings: 
     contextWindow,
     maxOutputTokens,
     toolMode,
-    vision: Boolean(info?.capabilities?.includes('vision')),
+    vision: Boolean(info?.vision ?? info?.capabilities?.includes('vision')),
     notes,
   };
 }
@@ -253,24 +263,52 @@ export class ModelClient {
       const wire = this.profile.toolMode === 'prompt' ? toTextProtocol(base) : base;
       const parser = new TextStreamParser(base.tools.map((t) => t.name));
       let emitted = false;
-      let nativeCalls = 0;
+      let calls = 0;
+      let finished = false;
+      // Some servers put a call in the structured field and also leave its
+      // text in the content. The same call from both sources is one call.
+      const seen = new Map<string, 'native' | 'text'>();
+      const isRepeat = (call: ToolCall, source: 'native' | 'text'): boolean => {
+        const key = `${call.name}\n${JSON.stringify(call.arguments)}`;
+        const earlier = seen.get(key);
+        if (earlier !== undefined && earlier !== source) return true;
+        seen.set(key, source);
+        return false;
+      };
+      const fromParser = function* (events: StreamEvent[]): Generator<StreamEvent> {
+        for (const parsed of events) {
+          if (parsed.type === 'tool_call') {
+            if (isRepeat(parsed.call, 'text')) continue;
+            calls++;
+          }
+          yield parsed;
+        }
+      };
       try {
         for await (const event of this.provider.chat(wire)) {
           if (event.type === 'text') {
-            for (const parsed of parser.push(event.text)) {
+            for (const parsed of fromParser(parser.push(event.text))) {
               emitted = true;
               yield parsed;
             }
           } else if (event.type === 'done') {
-            for (const parsed of parser.flush()) yield parsed;
-            let stopReason: StopReason = event.stopReason;
-            if (parser.callCount + nativeCalls > 0) stopReason = 'tool_calls';
-            yield { type: 'done', stopReason };
+            yield* fromParser(parser.flush());
+            finished = true;
+            yield { type: 'done', stopReason: calls > 0 ? 'tool_calls' : event.stopReason };
+          } else if (event.type === 'tool_call') {
+            if (isRepeat(event.call, 'native')) continue;
+            calls++;
+            emitted = true;
+            yield event;
           } else {
-            if (event.type === 'tool_call') nativeCalls++;
             if (event.type !== 'usage') emitted = true;
             yield event;
           }
+        }
+        if (!finished) {
+          // A stream that ends without saying so still has text held in the parser.
+          yield* fromParser(parser.flush());
+          yield { type: 'done', stopReason: calls > 0 ? 'tool_calls' : 'stop' };
         }
         return;
       } catch (err) {

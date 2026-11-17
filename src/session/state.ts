@@ -75,14 +75,28 @@ export function isInside(child: string, parent: string): boolean {
   return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
 }
 
-/** Resolve symlinks for the longest existing prefix of a path. */
-export function realpathSafe(p: string): string {
+/**
+ * Resolve symlinks for the longest existing prefix of a path. A dangling
+ * symlink is followed by hand: writing through it creates its target, so the
+ * target is where the path really leads.
+ */
+export function realpathSafe(p: string, hops = 0): string {
   let current = path.resolve(p);
   const tail: string[] = [];
   for (;;) {
     try {
       return path.join(fs.realpathSync(current), ...tail);
     } catch {
+      let link: string | undefined;
+      try {
+        if (fs.lstatSync(current).isSymbolicLink()) link = fs.readlinkSync(current);
+      } catch {
+        link = undefined;
+      }
+      if (link !== undefined && hops < 40) {
+        const target = path.resolve(realpathSafe(path.dirname(current), hops + 1), link);
+        return path.join(realpathSafe(target, hops + 1), ...tail);
+      }
       const parent = path.dirname(current);
       if (parent === current) return path.resolve(p);
       tail.unshift(path.basename(current));

@@ -6,6 +6,7 @@
  */
 import type { Message, StopReason, ToolCall } from '../types.ts';
 import { isRecord, parseJsonLoose } from '../util/json.ts';
+import { TRUNCATED_ARGS } from './textTools.ts';
 import type { ChatRequest, ModelInfo, Provider, StreamEvent } from './types.ts';
 import {
   ProviderError,
@@ -59,13 +60,19 @@ export function toOllamaMessages(system: string, messages: Message[]): OllamaMes
   return out;
 }
 
-/** Normalise OLLAMA_HOST-style values ("0.0.0.0:11434", "localhost") to a URL. */
+/**
+ * Normalise OLLAMA_HOST-style values to a base URL, the way Ollama itself
+ * reads them: a bare host gets http and port 11434, while an explicit scheme
+ * keeps that scheme's default port. "0.0.0.0" (a listen address) becomes
+ * loopback, and a trailing /v1 is dropped because this is the native API.
+ */
 export function normalizeOllamaHost(host: string): string {
   let h = host.trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//.test(h)) h = `http://${h}`;
+  const hasScheme = /^https?:\/\//i.test(h);
+  if (!hasScheme) h = `http://${h.startsWith(':') ? `127.0.0.1${h}` : h || '127.0.0.1'}`;
   const url = new URL(h);
   if (url.hostname === '0.0.0.0' || url.hostname === '[::]') url.hostname = '127.0.0.1';
-  if (!url.port && url.protocol === 'http:' && !/^https?:\/\/[^/]+:\d+/.test(h)) url.port = '11434';
+  if (!hasScheme && !url.port) url.port = '11434';
   return url.toString().replace(/\/+$/, '').replace(/\/v1$/, '');
 }
 
@@ -167,8 +174,12 @@ export class OllamaProvider implements Provider {
             if (isRecord(fn.arguments)) call.arguments = fn.arguments;
             else if (typeof fn.arguments === 'string' && fn.arguments.trim()) {
               const parsed = parseJsonLoose(fn.arguments);
-              if (parsed.ok && isRecord(parsed.value)) call.arguments = parsed.value;
-              else call.parseError = `arguments were not valid JSON: ${fn.arguments.slice(0, 200)}`;
+              if (parsed.ok && isRecord(parsed.value)) {
+                call.arguments = parsed.value;
+                if (parsed.truncated) call.parseError = TRUNCATED_ARGS;
+              } else {
+                call.parseError = `arguments were not valid JSON: ${fn.arguments.slice(0, 200)}`;
+              }
             }
             sawCalls = true;
             yield { type: 'tool_call', call };

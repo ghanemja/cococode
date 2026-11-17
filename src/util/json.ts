@@ -87,6 +87,8 @@ function closeOpenStructures(text: string): string {
   if (escaped) out = out.slice(0, -1);
   if (inString) out += '"';
   out = out.replace(/[,:]\s*$/, (m) => (m.trim() === ':' ? ': null' : ''));
+  // Cut in the middle of a key: `{"a":1,"b` has a string where a pair is needed.
+  if (stack[stack.length - 1] === '}' && /[{,]\s*"(?:[^"\\]|\\.)*"\s*$/.test(out)) out += ': null';
   while (stack.length) out += stack.pop();
   return out;
 }
@@ -122,7 +124,63 @@ export interface LooseParse {
   value?: unknown;
   /** True when the text had to be repaired before it parsed. */
   repaired?: boolean;
+  /**
+   * True when the text ended mid-value and was closed artificially. The value
+   * is then incomplete (a string may be cut short), so callers that act on it,
+   * such as tool calls, should treat it as an error rather than run with it.
+   */
+  truncated?: boolean;
   error?: string;
+}
+
+/** The first JSON-looking value in `text`: prose before and after it is dropped. */
+function extractValue(text: string): string {
+  const start = text.search(/[{[]/);
+  if (start < 0) return text;
+  const end = findBalancedEnd(text, start);
+  return end > start ? text.slice(start, end + 1) : text.slice(start);
+}
+
+/**
+ * Python dict syntax: single-quoted strings and True/False/None. Only applied
+ * when the text has no double quotes at all, so the conversion is unambiguous.
+ */
+function fromPythonLiteral(text: string): string {
+  if (text.includes('"') || !text.includes("'")) return text;
+  let out = '';
+  let inString = false;
+  let word = '';
+  const flushWord = () => {
+    if (word === 'True') out += 'true';
+    else if (word === 'False') out += 'false';
+    else if (word === 'None') out += 'null';
+    else out += word;
+    word = '';
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (ch === '\\' && text[i + 1] === "'") {
+        out += "'";
+        i++;
+      } else if (ch === "'") {
+        inString = false;
+        out += '"';
+      } else out += ch;
+      continue;
+    }
+    if (/[A-Za-z]/.test(ch)) {
+      word += ch;
+      continue;
+    }
+    flushWord();
+    if (ch === "'") {
+      inString = true;
+      out += '"';
+    } else out += ch;
+  }
+  flushWord();
+  return out;
 }
 
 export function parseJsonLoose(input: string): LooseParse {
@@ -131,23 +189,24 @@ export function parseJsonLoose(input: string): LooseParse {
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch (first) {
-    const attempts: ((s: string) => string)[] = [
-      escapeControlCharsInStrings,
-      (s) => removeTrailingCommas(escapeControlCharsInStrings(s)),
-      (s) => {
-        // Leading or trailing prose around a single JSON value.
-        const start = s.search(/[{[]/);
-        if (start < 0) return s;
-        const end = findBalancedEnd(s, start);
-        return end > start ? s.slice(start, end + 1) : s.slice(start);
-      },
-      (s) => closeOpenStructures(removeTrailingCommas(escapeControlCharsInStrings(s))),
+    const escaped = escapeControlCharsInStrings(text);
+    const cleaned = removeTrailingCommas(escaped);
+    // Each repair is tried in turn, cheapest and least invasive first.
+    const repairs: { make: () => string; truncated?: boolean }[] = [
+      { make: () => escaped },
+      { make: () => cleaned },
+      { make: () => extractValue(cleaned) },
+      { make: () => removeTrailingCommas(escapeControlCharsInStrings(fromPythonLiteral(extractValue(text)))) },
+      { make: () => closeOpenStructures(extractValue(cleaned)), truncated: true },
     ];
-    let candidate = text;
-    for (const fix of attempts) {
-      candidate = fix(candidate);
+    let previous = text;
+    for (const repair of repairs) {
+      const candidate = repair.make();
+      if (candidate === previous) continue;
+      previous = candidate;
       try {
-        return { ok: true, value: JSON.parse(candidate), repaired: true };
+        const value = JSON.parse(candidate) as unknown;
+        return repair.truncated ? { ok: true, value, repaired: true, truncated: true } : { ok: true, value, repaired: true };
       } catch {
         // try the next repair
       }

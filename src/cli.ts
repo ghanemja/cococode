@@ -35,6 +35,7 @@ Options:
       --permission-mode <mode>     ${PERMISSION_MODES.join(', ')}
       --dangerously-skip-permissions   Never ask for approval (use only in a sandbox)
       --allowedTools <rules...>    Rules to allow, e.g. "Bash(npm test:*)" Edit
+                                   (list flags take every following word: put the prompt first, or after --)
       --disallowedTools <rules...> Rules to deny, e.g. "Bash(rm:*)" WebFetch
       --tools <names...>           Limit the tools available to the model
       --add-dir <dirs...>          Extra directories the agent may work in
@@ -43,6 +44,7 @@ Options:
       --append-system-prompt <text>    Add to the system prompt
       --output-format <fmt>        With -p: text (default), json or stream-json
       --max-turns <n>              With -p: stop after n model turns
+      --image <files...>           With -p: attach images (vision models only)
       --mcp-config <files...>      Extra MCP server definitions (JSON files or strings)
       --settings <file|json>       Extra settings to load
       --no-session-persistence     Do not save a transcript
@@ -74,7 +76,7 @@ const VALUE_FLAGS = new Set([
   'system-prompt', 'system-prompt-file', 'append-system-prompt', 'output-format', 'max-turns', 'settings',
   'scope', 'transport', 'input-format',
 ]);
-const LIST_FLAGS = new Set(['allowedTools', 'allowed-tools', 'disallowedTools', 'disallowed-tools', 'tools', 'add-dir', 'mcp-config', 'env', 'header']);
+const LIST_FLAGS = new Set(['allowedTools', 'allowed-tools', 'disallowedTools', 'disallowed-tools', 'tools', 'add-dir', 'mcp-config', 'env', 'header', 'image']);
 const OPTIONAL_VALUE_FLAGS = new Set(['resume']);
 const SHORT: Record<string, string> = { p: 'print', c: 'continue', r: 'resume', m: 'model', v: 'version', h: 'help', s: 'scope', e: 'env', t: 'transport', H: 'header' };
 
@@ -102,9 +104,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     if (LIST_FLAGS.has(name)) {
       const values: string[] = inline !== undefined ? [inline] : [];
-      while (inline === undefined && i + 1 < argv.length && !argv[i + 1]!.startsWith('-')) values.push(argv[++i]!);
+      // Path lists stop at the first argument that is not a path, so a prompt after them is not swallowed.
+      const wantsPath = name === 'add-dir' || name === 'image';
+      while (inline === undefined && i + 1 < argv.length && !argv[i + 1]!.startsWith('-')) {
+        if (wantsPath && values.length > 0 && !fs.existsSync(argv[i + 1]!)) break;
+        values.push(argv[++i]!);
+      }
       // "a,b c" and separate arguments are both accepted.
-      const split = name === 'env' || name === 'header' || name === 'mcp-config' ? values : values.flatMap(splitRules);
+      const split = name === 'env' || name === 'header' || name === 'mcp-config' || name === 'image' || name === 'add-dir' ? values : values.flatMap(splitRules);
       flags[name] = [...((flags[name] as string[] | undefined) ?? []), ...split];
     } else if (VALUE_FLAGS.has(name)) {
       const value = inline ?? argv[++i];
@@ -112,7 +119,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       flags[name] = value;
     } else if (OPTIONAL_VALUE_FLAGS.has(name)) {
       if (inline !== undefined) flags[name] = inline;
-      else if (i + 1 < argv.length && !argv[i + 1]!.startsWith('-') && /^[0-9a-f-]{4,}$/i.test(argv[i + 1]!)) flags[name] = argv[++i]!;
+      // Only something shaped like a session id is taken as one; anything else is the prompt.
+      else if (i + 1 < argv.length && /^[0-9a-f]{8}(-[0-9a-f-]*)?$/i.test(argv[i + 1]!)) flags[name] = argv[++i]!;
       else flags[name] = true;
     } else {
       flags[name] = inline ?? true;

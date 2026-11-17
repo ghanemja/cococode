@@ -88,24 +88,36 @@ export function loadSession(file: string): LoadedSession {
 }
 
 /**
- * Make a loaded history valid for a model again: every tool call needs a
- * result, which a crash or kill mid-turn can leave missing.
+ * Make a loaded history valid for a model again. Every tool call needs
+ * exactly one result directly after it; a crash or kill mid-turn can leave
+ * some missing, and a damaged line can leave a result with no call.
  */
 export function repairMessages(messages: Message[]): Message[] {
   const out: Message[] = [];
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
+    // A result whose call is gone answers nothing; servers reject it.
+    if (msg.role === 'tool') continue;
     out.push(msg);
     if (msg.role !== 'assistant' || !msg.toolCalls?.length) continue;
-    const answered = new Set<string>();
+
+    // Outstanding results per call id (ids are normally unique, but count to be safe).
+    const pending = new Map<string, number>();
+    for (const call of msg.toolCalls) pending.set(call.id, (pending.get(call.id) ?? 0) + 1);
     let j = i + 1;
     while (j < messages.length && messages[j]!.role === 'tool') {
-      answered.add((messages[j] as Extract<Message, { role: 'tool' }>).toolCallId);
-      out.push(messages[j]!);
+      const result = messages[j] as Extract<Message, { role: 'tool' }>;
+      const left = pending.get(result.toolCallId) ?? 0;
+      if (left > 0) {
+        pending.set(result.toolCallId, left - 1);
+        out.push(result);
+      }
       j++;
     }
     for (const call of msg.toolCalls) {
-      if (!answered.has(call.id)) {
+      const left = pending.get(call.id) ?? 0;
+      if (left > 0) {
+        pending.set(call.id, left - 1);
         out.push({ role: 'tool', toolCallId: call.id, name: call.name, content: 'No result: the session ended before this tool finished.', isError: true });
       }
     }
@@ -128,7 +140,9 @@ function summarizeFile(file: string): SessionSummary | undefined {
     const loaded = loadSession(file);
     const prompts = loaded.messages.filter((m) => m.role === 'user' && !m.isMeta);
     if (prompts.length === 0) return undefined;
-    const first = messageText((prompts[0] as Extract<Message, { role: 'user' }>).content);
+    // Prefer what the user typed over what a slash command or attachment expanded it to.
+    const firstMessage = prompts[0] as Extract<Message, { role: 'user' }>;
+    const first = firstMessage.display ?? messageText(firstMessage.content);
     return {
       id: loaded.id,
       path: file,

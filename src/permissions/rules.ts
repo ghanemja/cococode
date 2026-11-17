@@ -23,6 +23,9 @@ const FAMILY: Record<string, string> = {
   Task: 'Agent',
 };
 
+/** Real tools that belong to a family but are not its head. A bare rule naming one means just that tool. */
+const MEMBER_TOOLS = new Set(['Write', 'NotebookEdit', 'Glob', 'Grep']);
+
 export function family(tool: string): string {
   return FAMILY[tool] ?? tool;
 }
@@ -104,29 +107,41 @@ export function matchBashSpec(spec: string, command: string): boolean {
 }
 
 /**
- * Path specs follow gitignore conventions:
+ * Turn a path spec into an absolute glob. Specs follow gitignore conventions:
  *   //abs/path   absolute
  *   ~/path       home directory
  *   /path        relative to the project root
  *   path, ./path relative to the current directory
- * A spec naming a directory also covers everything beneath it.
+ *   *.env        (a bare glob) at any depth below the current directory
  */
-export function matchPathSpec(spec: string, absPath: string, ctx: MatchContext): boolean {
+export function resolvePathSpec(spec: string, ctx: MatchContext): string {
   let pattern: string;
   if (spec.startsWith('//')) pattern = spec.slice(1);
   else if (spec === '~' || spec.startsWith('~/')) pattern = path.join(os.homedir(), spec.slice(1));
   else if (spec.startsWith('/')) pattern = path.join(ctx.projectRoot, spec);
   else if (spec.startsWith('./')) pattern = path.join(ctx.cwd, spec.slice(2));
-  else if (spec.includes('/') || /[*?[{]/.test(spec) === false) pattern = path.join(ctx.cwd, spec);
-  else pattern = path.join(ctx.cwd, '**', spec); // bare glob like *.env matches at any depth
+  else if (spec.includes('/') || !/[*?[{]/.test(spec)) pattern = path.join(ctx.cwd, spec);
+  else pattern = path.join(ctx.cwd, '**', spec);
+  return pattern.split(path.sep).join('/').replace(/\/+$/, '') || '/';
+}
 
-  const normalized = pattern.split(path.sep).join('/').replace(/\/+$/, '');
-  const target = absPath.split(path.sep).join('/');
-  if (globToRegExp(normalized).test(target)) return true;
-  if (globToRegExp(`${normalized}/**`).test(target)) return true;
+/** Does an absolute glob (from `resolvePathSpec`) cover `absPath`? A directory covers its contents. */
+export function matchAbsoluteGlob(pattern: string, absPath: string): boolean {
+  // Normalise so that "src/../secret" cannot pass as something under src/.
+  const target = path.resolve(absPath).split(path.sep).join('/');
+  if (globToRegExp(pattern).test(target)) return true;
+  if (globToRegExp(`${pattern}/**`).test(target)) return true;
+  // "dir/**" also covers the directory itself (a search rooted there).
+  if (pattern.endsWith('/**') && globToRegExp(pattern.slice(0, -3)).test(target)) return true;
+  return false;
+}
+
+/** See `resolvePathSpec` for the forms a spec can take. */
+export function matchPathSpec(spec: string, absPath: string, ctx: MatchContext): boolean {
+  if (matchAbsoluteGlob(resolvePathSpec(spec, ctx), absPath)) return true;
   // A bare filename such as ".env" also matches at any depth below cwd.
-  if (!spec.includes('/') && !/[*?[{]/.test(spec)) {
-    return globToRegExp(path.join(ctx.cwd, '**', spec).split(path.sep).join('/')).test(target);
+  if (!spec.includes('/') && !/[*?[{]/.test(spec) && spec !== '~') {
+    return matchAbsoluteGlob(path.join(ctx.cwd, '**', spec).split(path.sep).join('/'), absPath);
   }
   return false;
 }
@@ -155,7 +170,10 @@ export function ruleMatches(rule: Rule, actualTool: string, req: PermissionReque
   }
 
   if (rule.spec === undefined) {
-    return rule.tool === actualTool || ruleFamily === reqFamily || rule.tool === '*';
+    if (rule.tool === actualTool || rule.tool === '*') return true;
+    // "Edit" and "Read" speak for their whole family; "Write" or "Grep" name one tool.
+    if (MEMBER_TOOLS.has(rule.tool)) return false;
+    return ruleFamily === reqFamily || ruleFamily === family(actualTool);
   }
   if (!req || ruleFamily !== reqFamily || req.target === undefined) return false;
 

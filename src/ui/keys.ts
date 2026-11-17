@@ -16,6 +16,8 @@ export interface Key {
 
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
+/** Longest escape sequence we wait for before giving up on it. */
+const MAX_SEQUENCE = 64;
 
 const CSI_FINAL: Record<string, string> = {
   A: 'up',
@@ -46,9 +48,17 @@ function key(name: string, mods: Partial<Key> = {}): Key {
   return { name, ctrl: false, meta: false, shift: false, ...mods };
 }
 
-function modifiers(code: number): Pick<Key, 'ctrl' | 'meta' | 'shift'> {
-  const bits = Math.max(0, code - 1);
+/** Decode a modifier parameter ("5", or kitty's "5:1"); 1 means none. */
+function modifiers(param: string | undefined): Pick<Key, 'ctrl' | 'meta' | 'shift'> {
+  const code = Number.parseInt(param ?? '1', 10);
+  const bits = Number.isFinite(code) ? Math.max(0, code - 1) : 0;
   return { shift: (bits & 1) !== 0, meta: (bits & 2) !== 0, ctrl: (bits & 4) !== 0 };
+}
+
+/** Name of the key that produces a C0 control code together with ctrl. */
+function controlName(code: number): string {
+  // ctrl+a..z are 1..26; 28..31 are ctrl+\ ] ^ _
+  return String.fromCharCode(code <= 26 ? code + 96 : code + 64);
 }
 
 function fromCodepoint(cp: number, mods: Pick<Key, 'ctrl' | 'meta' | 'shift'>): Key {
@@ -127,7 +137,7 @@ export class KeyParser {
         else if (ch === '\t') keys.push(key('tab'));
         else if (code === 127 || code === 8) keys.push(key('backspace'));
         else if (code === 0) keys.push(key('space', { ctrl: true }));
-        else keys.push(key(String.fromCharCode(code + 96), { ctrl: true }));
+        else keys.push(key(controlName(code), { ctrl: true }));
         continue;
       }
 
@@ -150,32 +160,41 @@ export class KeyParser {
     const next = buf[1]!;
 
     if (next === '[') {
-      // CSI: parameters, then a final byte in @-~
+      // CSI: parameter bytes (0-9 : ; < = > ?), intermediate bytes (space to /), then a final byte (@ to ~).
       let i = 2;
-      while (i < buf.length && /[0-9;:<=>?]/.test(buf[i]!)) i++;
-      if (i >= buf.length) return PASTE_START.startsWith(buf) || buf.length < 12 ? 0 : 1;
-      const final = buf[i]!;
-      const params = buf.slice(2, i).split(';');
+      while (i < buf.length && buf.charCodeAt(i) >= 0x30 && buf.charCodeAt(i) <= 0x3f) i++;
+      const paramEnd = i;
+      while (i < buf.length && buf.charCodeAt(i) >= 0x20 && buf.charCodeAt(i) <= 0x2f) i++;
+      // Incomplete: wait for the rest, unless it is absurdly long (then drop it).
+      if (i >= buf.length) return buf.length > MAX_SEQUENCE ? buf.length : 0;
+      const finalCode = buf.charCodeAt(i);
+      // Not a valid sequence: drop what was scanned and reparse from the odd byte.
+      if (finalCode < 0x40 || finalCode > 0x7e) return i;
       const consumed = i + 1;
+      // Sequences with intermediate bytes are terminal reports, never keys.
+      if (i > paramEnd) return consumed;
+      const final = buf[i]!;
+      const params = buf.slice(2, paramEnd).split(';');
       if (final === '~') {
         // modifyOtherKeys: CSI 27 ; mod ; code ~
         if (params[0] === '27' && params.length >= 3) {
-          keys.push(fromCodepoint(Number(params[2]), modifiers(Number(params[1]))));
+          const cp = Number.parseInt(params[2]!, 10);
+          if (Number.isFinite(cp) && cp > 0) keys.push(fromCodepoint(cp, modifiers(params[1])));
           return consumed;
         }
         const name = TILDE_CODES[params[0]!];
-        if (name) keys.push(key(name, modifiers(Number(params[1] ?? 1))));
+        if (name) keys.push(key(name, modifiers(params[1])));
         return consumed;
       }
       if (final === 'u') {
         // kitty: CSI code ; mod u
-        const cp = Number(params[0]!.split(':')[0]);
-        if (Number.isFinite(cp) && cp > 0) keys.push(fromCodepoint(cp, modifiers(Number((params[1] ?? '1').split(':')[0]))));
+        const cp = Number.parseInt(params[0]!, 10);
+        if (Number.isFinite(cp) && cp > 0) keys.push(fromCodepoint(cp, modifiers(params[1])));
         return consumed;
       }
       const name = CSI_FINAL[final];
       if (name) {
-        const mods = modifiers(Number(params[1] ?? 1));
+        const mods = modifiers(params[1]);
         if (final === 'Z') mods.shift = true;
         keys.push(key(name, mods));
       }
@@ -198,8 +217,10 @@ export class KeyParser {
     // Alt + key
     const code = next.charCodeAt(0);
     if (next === '\r') keys.push(key('return', { meta: true }));
+    else if (next === '\t') keys.push(key('tab', { meta: true }));
     else if (code === 127 || code === 8) keys.push(key('backspace', { meta: true }));
-    else if (code < 32) keys.push(key(String.fromCharCode(code + 96), { ctrl: true, meta: true }));
+    else if (code === 0) keys.push(key('space', { ctrl: true, meta: true }));
+    else if (code < 32) keys.push(key(controlName(code), { ctrl: true, meta: true }));
     else {
       const cp = buf.codePointAt(1)!;
       const text = String.fromCodePoint(cp);

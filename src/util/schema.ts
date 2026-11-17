@@ -76,15 +76,18 @@ function coerceObject(input: Record<string, unknown>, schema: JsonSchema, path: 
   const out: Record<string, unknown> = {};
   const prefix = path ? `${path}.` : '';
   for (const [key, raw] of Object.entries(input)) {
-    const propSchema = props[key];
+    if (key === '__proto__') continue; // assigning it would replace the result's prototype
+    // hasOwn: "constructor" and "toString" exist on every object but are not schema properties.
+    const propSchema = Object.hasOwn(props, key) ? props[key] : undefined;
     if (!propSchema) {
       // Unknown keys are dropped rather than rejected; models add stray fields.
       if (schema.additionalProperties === true || isRecord(schema.additionalProperties)) out[key] = raw;
       continue;
     }
+    // null means "not provided": dropped when optional, reported as missing when required.
+    if (raw === null || raw === undefined) continue;
     const required = schema.required?.includes(key) ?? false;
-    // null or empty string for an optional value means "not provided".
-    if (!required && (raw === null || raw === undefined || (raw === '' && !allowedTypes(propSchema).includes('string')))) continue;
+    if (!required && raw === '' && !allowedTypes(propSchema).includes('string')) continue;
     out[key] = coerce(raw, propSchema, `${prefix}${key}`, errors);
   }
   for (const key of schema.required ?? []) {

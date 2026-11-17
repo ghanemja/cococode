@@ -25,6 +25,7 @@ import { SessionState } from '../session/state.ts';
 import type { SessionSummary } from '../session/store.ts';
 import { Transcript, cleanupOldSessions, loadSession } from '../session/store.ts';
 import { looksBinary } from '../tools/fsutil.ts';
+import { walkFiles } from '../tools/search.ts';
 import { builtinTools, filterTools } from '../tools/registry.ts';
 import type { AskQuestion, RuntimeHandle, SkillInfo, SubagentRequest, SubagentResult, Tool, ToolContext } from '../tools/types.ts';
 import type { ContentPart, ImagePart, Message, PermissionMode, UserMessage } from '../types.ts';
@@ -232,7 +233,14 @@ export class Controller implements RuntimeHandle {
     await this.useModel(this.provider, model);
     this.env = gatherEnv(this.session.cwd, this.session.projectRoot, this.session.additionalDirs, model);
     this.agent = this.makeAgent();
+    // A session resumed before the model was connected (--continue, --resume).
+    if (this.resumedMessages) {
+      this.agent.load(this.resumedMessages);
+      this.resumedMessages = undefined;
+    }
   }
+
+  private resumedMessages: Message[] | undefined;
 
   private async useModel(provider: Provider, model: string): Promise<void> {
     const profile = await profileModel(provider, model, this.settings);
@@ -292,9 +300,38 @@ export class Controller implements RuntimeHandle {
 
   // ---------------------------------------------------------------------- agent
 
+  /**
+   * Tools offered to the model right now. Every definition costs context on
+   * each request, so tools that cannot be useful in the current state are left
+   * out: plan approval outside plan mode, skills when none are installed,
+   * notebook editing in a project without notebooks.
+   */
   tools(): Tool[] {
-    const all = [...this.builtin, ...(this.mcp?.tools() ?? [])];
+    const hidden = new Set<string>();
+    if (this.permissions.mode !== 'plan') hidden.add('ExitPlanMode');
+    if (this.skillDefs.length === 0) hidden.add('Skill');
+    if (!this.projectHasNotebooks()) hidden.add('NotebookEdit');
+    const all = [...this.builtin.filter((t) => !hidden.has(t.name)), ...(this.mcp?.tools() ?? [])];
     return filterTools(all, this.opts.toolFilter);
+  }
+
+  private hasNotebooks: boolean | undefined;
+
+  private projectHasNotebooks(): boolean {
+    // Once the model has read a notebook the tool is needed, wherever the file lives.
+    if (!this.hasNotebooks) {
+      for (const file of this.session.readFiles.keys()) {
+        if (file.endsWith('.ipynb')) return (this.hasNotebooks = true);
+      }
+    }
+    if (this.hasNotebooks === undefined) {
+      try {
+        this.hasNotebooks = walkFiles(this.session.projectRoot, { limit: 20_000 }).some((f) => f.endsWith('.ipynb'));
+      } catch {
+        this.hasNotebooks = false;
+      }
+    }
+    return this.hasNotebooks;
   }
 
   systemPrompt(): string {
@@ -520,6 +557,8 @@ export class Controller implements RuntimeHandle {
       this.agent = this.makeAgent();
       this.agent.load(loaded.messages);
       if (totals) this.agent.totals = totals;
+    } else {
+      this.resumedMessages = loaded.messages;
     }
     return loaded.messages;
   }

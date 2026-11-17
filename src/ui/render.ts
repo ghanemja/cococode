@@ -4,7 +4,7 @@ import type { ToolResult } from '../tools/types.ts';
 import type { Message } from '../types.ts';
 import { messageText } from '../types.ts';
 import { diffLines, diffStats, renderDiff } from '../util/diff.ts';
-import { c, expandTabs, formatCount, plural, truncate, wrapText } from './ansi.ts';
+import { c, expandTabs, formatContext, formatCount, plural, truncate, wrapText } from './ansi.ts';
 import { renderMarkdown } from './markdown.ts';
 
 export const BULLET = '●';
@@ -13,7 +13,7 @@ const BRANCH = '└';
 export function renderUserPrompt(text: string, width: number): string[] {
   const body = text.split('\n<attached-files>')[0]!.trimEnd();
   const lines = wrapText(body, width, { indent: '> ', hangingIndent: '  ' });
-  return ['', ...lines.map((l) => c.dim(l))];
+  return lines.map((l) => c.dim(l));
 }
 
 export function renderTodos(todos: TodoItem[], width: number, indent = '  '): string[] {
@@ -126,5 +126,5 @@ export function contextBar(used: number, window: number, width = 30): string {
   const ratio = Math.min(1, used / Math.max(1, window));
   const filled = Math.round(ratio * width);
   const color = ratio > 0.85 ? c.red : ratio > 0.65 ? c.yellow : c.green;
-  return `${color('█'.repeat(filled))}${c.dim('░'.repeat(width - filled))} ${formatCount(used)} / ${formatCount(window)} (${Math.round(ratio * 100)}%)`;
+  return `${color('█'.repeat(filled))}${c.dim('░'.repeat(width - filled))} ${formatCount(used)} / ${formatContext(window)} (${Math.round(ratio * 100)}%)`;
 }

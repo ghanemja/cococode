@@ -192,6 +192,14 @@ export class App implements CommandIO {
     process.stdout.on('resize', () => this.draw());
     process.on('SIGTERM', () => void this.quit(143));
     process.on('SIGHUP', () => void this.quit(129));
+    // A stray error must not leave the terminal in raw mode with a dead UI.
+    const report = (err: unknown) => {
+      if (this.exiting) return;
+      this.print(c.red(`Internal error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`));
+      this.draw();
+    };
+    process.on('uncaughtException', report);
+    process.on('unhandledRejection', report);
 
     this.ctl.attachUi({
       requestPermission: (p) => this.askPermission(p),
@@ -232,6 +240,13 @@ export class App implements CommandIO {
 
     this.setNotice('Connecting to the model server…', 0);
     await ctl.connect((models) => this.pickModel(models));
+    if (this.modelWasPicked) {
+      try {
+        ctl.saveModelChoice();
+      } catch {
+        // a read-only config directory just means being asked again next time
+      }
+    }
     this.setNotice('');
     ctl.attachUi(ctl.ui);
     ctl.startupMaintenance();
@@ -266,31 +281,25 @@ export class App implements CommandIO {
         hint: [m.parameterSize, m.quantization, m.sizeBytes ? formatBytes(m.sizeBytes) : '', m.loaded ? 'loaded' : ''].filter(Boolean).join(' · '),
       })),
     });
-    if (picked) {
-      // Remember it so the question is asked once.
-      queueMicrotask(() => {
-        try {
-          this.ctl.saveModelChoice();
-        } catch {
-          // read-only config directory
-        }
-      });
-    }
+    // Saved once the connection is up, so the question is asked only once.
+    if (picked) this.modelWasPicked = true;
     return picked;
   }
 
   private banner(): void {
     const ctl = this.ctl;
     const p = ctl.client.profile;
+    const width = this.screen.width;
+    const dim = (text: string) => wrapText(text, width, { indent: '  ' }).map((l) => c.dim(l));
     const lines = [
       '',
       `${c.cyan('✻')} ${c.bold(APP_NAME)} ${c.dim(`v${VERSION}`)}`,
-      c.dim(`  ${ctl.client.model} · ${ctl.provider.name} · ${formatContext(p.contextWindow)} context${p.toolMode === 'prompt' ? ' · text tool protocol' : ''}`),
-      c.dim(`  ${ctl.session.cwd}`),
-      c.dim('  /help for commands · @ to attach files · shift+tab to change mode'),
+      ...dim(`${ctl.client.model} · ${ctl.provider.name} · ${formatContext(p.contextWindow)} context${p.toolMode === 'prompt' ? ' · text tool protocol' : ''}`),
+      ...dim(ctl.session.cwd),
+      ...dim('/help for commands · @ to attach files · shift+tab to change mode'),
     ];
-    for (const note of p.notes) lines.push(...wrapText(`! ${note}`, this.screen.width, { indent: '  ', hangingIndent: '    ' }).map((l) => c.yellow(l)));
-    if (ctl.memory.length === 0) lines.push(c.dim('  Tip: run /init to create a COCO.md with instructions for this project.'));
+    for (const note of p.notes) lines.push(...wrapText(`! ${note}`, width, { indent: '  ', hangingIndent: '    ' }).map((l) => c.yellow(l)));
+    if (ctl.memory.length === 0) lines.push(...dim('Tip: run /init to create a COCO.md with instructions for this project.'));
     lines.push('');
     this.screen.print(lines);
   }
@@ -634,6 +643,9 @@ export class App implements CommandIO {
 
   private async command(input: string): Promise<void> {
     let outcome: Awaited<ReturnType<typeof runSlash>>;
+    // Commands that redraw the screen would only wipe their own echo.
+    const redraws = /^\/(clear|reset|new|resume|continue|exit|quit|q)\b/.test(input);
+    if (!redraws) this.screen.print([...renderUserPrompt(input, this.screen.width), '']);
     try {
       outcome = await runSlash(input, this.ctl, this);
     } catch (err) {
@@ -641,18 +653,18 @@ export class App implements CommandIO {
       return;
     }
     if (!outcome) {
+      this.screen.print('');
       this.draw();
       return;
     }
     if (outcome.type === 'unknown') {
-      this.print(c.red(`Unknown command: /${outcome.name}. Type /help to see what is available.`));
+      this.screen.print([c.red(`Unknown command: /${outcome.name}. Type /help to see what is available.`), '']);
       return;
     }
     if (outcome.type === 'compact') {
       await this.runTurn(this.ctl.compact(outcome.instructions));
       return;
     }
-    this.screen.print([...renderUserPrompt(outcome.display, this.screen.width), '']);
     // Rules granted by the command's front matter last for this session.
     for (const rule of outcome.allowedTools ?? []) this.ctl.permissions.addRule('allow', rule);
     await this.runTurn(this.ctl.submit(outcome.prompt, { display: outcome.display }));
@@ -660,7 +672,7 @@ export class App implements CommandIO {
 
   /** `!cmd`: run it directly and show the model what happened. */
   private async bashMode(command: string): Promise<void> {
-    this.screen.print(['', c.magenta(`! ${command}`)]);
+    this.screen.print(c.magenta(`! ${command}`));
     this.running = true;
     this.phase = 'tools';
     this.turnStart = Date.now();
@@ -699,6 +711,7 @@ export class App implements CommandIO {
   }
 
   private bashAbort: (() => void) | null = null;
+  private modelWasPicked = false;
 
   // --------------------------------------------------------------------- turn
 
@@ -903,7 +916,6 @@ export class App implements CommandIO {
       if (!result) return null;
       if (result.text) answers[q.question] = q.multiSelect ? [...result.values.filter((v) => v !== '__other__'), result.text].join(', ') : result.text;
       else answers[q.question] = q.multiSelect ? result.values.filter((v) => v !== '__other__').join(', ') : result.value;
-      this.screen.print(c.dim(`  ${q.question} → ${answers[q.question]}`));
     }
     return answers;
   }
@@ -1024,12 +1036,14 @@ export class App implements CommandIO {
     }
 
     for (const run of this.toolRuns.values()) {
+      if (this.dialog && (run.name === 'AskUserQuestion' || run.name === 'ExitPlanMode')) continue;
       lines.push(toolHeader(run.name, run.label, width, 'running'));
       const tail = run.progress.replace(/\s+$/, '').split('\n').slice(-4);
       for (const l of tail) if (l.trim()) lines.push(c.dim(truncate(`  │ ${l}`, width)));
     }
 
-    if (this.running) {
+    // While a dialog waits for the user nothing is running, so no spinner.
+    if (this.running && !this.dialog) {
       if (lines.length) lines.push('');
       lines.push(this.spinnerLine());
       const todos = this.ctl.session.todos;
@@ -1056,7 +1070,7 @@ export class App implements CommandIO {
     const rule = borderColor('─'.repeat(width));
     lines.push(rule);
     const layout = this.editor.layout(Math.max(10, width - 2));
-    const promptChar = bashMode ? c.magenta('!') : memoryMode ? c.yellow('#') : c.bold('>');
+    const promptChar = bashMode ? c.magenta('>') : memoryMode ? c.yellow('>') : c.bold('>');
     const inputStart = lines.length;
     if (this.editor.isEmpty) {
       const hint = this.running ? 'Type to queue a message for when the model is done' : 'Ask coco to do something';
