@@ -5,6 +5,7 @@
  */
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentEvent, PermissionAnswer, PermissionPrompt } from '../agent/loop.ts';
 import type { CommandIO, ResolvedCommand, SelectOption } from '../commands/builtin.ts';
@@ -24,9 +25,10 @@ import { APP_NAME, VERSION } from '../version.ts';
 import { c, formatBytes, formatContext, formatCount, formatDuration, padEnd, stringWidth, truncate, wrapText } from './ansi.ts';
 import type { Dialog, DialogOption, SelectResult } from './dialog.ts';
 import { SelectDialog } from './dialog.ts';
+import type { EditorSearch } from './editor.ts';
 import { Editor } from './editor.ts';
 import type { Key } from './keys.ts';
-import { KeyParser } from './keys.ts';
+import { ChordPrefix, KeyParser } from './keys.ts';
 import { MarkdownStream, renderMarkdown } from './markdown.ts';
 import { BULLET, renderHistory, renderTodos, renderToolResult, renderUserPrompt, toolHeader, withBullet } from './render.ts';
 import { Screen } from './screen.ts';
@@ -35,6 +37,30 @@ const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', 
 const BRACKETED_PASTE_ON = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
 const MAX_COMPLETIONS = 8;
+
+/** The panel shown for "?" on an empty prompt: a key and what it does. */
+const SHORTCUTS: [string, string][] = [
+  ['!', 'run a shell command'],
+  ['/', 'commands'],
+  ['@', 'attach a file'],
+  ['#', 'save a note to memory'],
+  ['alt+enter', 'new line'],
+  ['up', 'history, or a queued message'],
+  ['esc', 'interrupt'],
+  ['esc esc', 'clear the prompt, or rewind'],
+  ['shift+tab', 'change mode'],
+  ['ctrl+r', 'search history'],
+  ['ctrl+g', 'edit in $EDITOR'],
+  ['ctrl+s', 'stash or restore the prompt'],
+  ['ctrl+_', 'undo'],
+  ['alt+d', 'delete the next word'],
+  ['ctrl+t', 'show or hide the task list'],
+  ['ctrl+o', 'verbose output'],
+  ['alt+p', 'switch model'],
+  ['alt+t', 'thinking on or off'],
+  ['ctrl+l', 'clear the screen'],
+  ['ctrl+z', 'suspend'],
+];
 
 interface ToolRun {
   name: string;
@@ -61,6 +87,8 @@ export class App implements CommandIO {
   private readonly screen: Screen;
   private readonly editor = new Editor();
   private readonly parser = new KeyParser();
+  /** ctrl+x, waiting for the ctrl+e that opens the editor. */
+  private readonly chord = new ChordPrefix();
   private dialog: Dialog | null = null;
   private completion: Completion | null = null;
   private completionDismissed = '';
@@ -91,8 +119,15 @@ export class App implements CommandIO {
   private escTimer: NodeJS.Timeout | null = null;
   private exitResolve: ((code: number) => void) | null = null;
   private exiting = false;
+  /** The shortcuts panel is showing (until the next key). */
+  private helpOpen = false;
+  /** ctrl+t: keep the task list on screen when the model is not working too. */
+  private tasksPinned = false;
+  /** Another program (an editor) has the terminal and the keyboard. */
+  private lent = false;
   /** Resolves once the model is connected; prompts typed earlier wait for it. */
   private ready: Promise<void>;
+  private started = false;
   private markReady: () => void = () => {};
   private readonly historyFile: string;
 
@@ -139,16 +174,98 @@ export class App implements CommandIO {
   }
 
   async editFile(file: string): Promise<void> {
+    await this.runEditor(file);
+  }
+
+  /**
+   * Run $VISUAL / $EDITOR on a file with the terminal handed over to it.
+   * Resolves with the editor's exit status, null when it could not be run or
+   * was killed.
+   */
+  private async runEditor(file: string): Promise<number | null> {
     const editor = process.env.VISUAL || process.env.EDITOR || (process.platform === 'win32' ? 'notepad' : 'vi');
     this.screen.suspend();
     this.setRaw(false);
-    await new Promise<void>((resolve) => {
+    // The keyboard is the editor's now: if we kept reading it too, each keystroke would go to one of us at random.
+    process.stdin.pause();
+    this.lent = true;
+    // Out of raw mode the terminal turns ctrl+c into a signal for us as well as for the editor.
+    const ignore = (): void => {};
+    process.on('SIGINT', ignore);
+    const status = await new Promise<number | null>((resolve) => {
       const { shell, args } = shellPath();
       const child = spawn(shell, args(`${editor} ${JSON.stringify(file)}`), { stdio: 'inherit', env: commandEnv() });
-      child.on('error', () => resolve());
-      child.on('close', () => resolve());
+      child.on('error', () => resolve(null));
+      child.on('close', (code) => resolve(code));
     });
+    process.off('SIGINT', ignore);
+    this.lent = false;
+    if (this.exiting) return status;
+    process.stdin.resume();
     this.setRaw(true);
+    this.screen.resume();
+    this.draw();
+    return status;
+  }
+
+  /** ctrl+g, ctrl+x ctrl+e: write the prompt in the user's editor. */
+  private async editPrompt(): Promise<void> {
+    if (this.lent) return;
+    // Pastes go out in full: the point is to see and change what will be sent.
+    const before = this.editor.value();
+    const written = before === '' ? '' : `${before}\n`;
+    let dir: string;
+    let file: string;
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), `${APP_NAME}-prompt-`));
+      file = path.join(dir, 'prompt.md');
+      fs.writeFileSync(file, written, { mode: 0o600 });
+    } catch (err) {
+      this.setNotice(`Could not write the prompt to a file for the editor: ${(err as Error).message}`, 4000);
+      return;
+    }
+    const status = await this.runEditor(file);
+    let after: string | null = null;
+    try {
+      after = fs.readFileSync(file, 'utf8');
+    } catch {
+      // no file left to read: handled like an editor that failed
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (this.exiting) return;
+    if (status !== 0 || after === null) {
+      this.setNotice(`The editor ${status === 0 ? 'left no file' : status === null ? 'could not be run' : `exited with status ${status}`}: prompt left as it was`, 4000);
+      return;
+    }
+    if (after === written) return;
+    this.editor.replaceAll(after.replace(/\r?\n$/, ''));
+    this.updateCompletion();
+    this.draw();
+  }
+
+  /** ctrl+z: give the terminal back to the shell and stop, like any terminal program. */
+  private suspend(): void {
+    if (process.platform === 'win32') return; // no job control to come back from
+    this.screen.suspend();
+    this.setRaw(false);
+    try {
+      process.kill(process.pid, 'SIGTSTP');
+    } catch {
+      // not stopped: carry on below
+    }
+    // Running again. Usually that is the shell's "fg", and SIGCONT repeats this harmlessly; but with no
+    // job control above us the kernel discards the stop and no SIGCONT follows, so it cannot be left to that.
+    this.resumeTerminal();
+  }
+
+  /** After a stop (ours, or one sent from outside): take the terminal back and redraw. */
+  private resumeTerminal(): void {
+    if (this.exiting || this.lent) return;
+    // Whoever had the terminal meanwhile set its modes, and setRawMode skips a mode it believes is already on.
+    this.setRaw(false);
+    this.setRaw(true);
+    // Forget where the live region was drawn: the cursor is somewhere else now.
+    this.screen.suspend();
     this.screen.resume();
     this.draw();
   }
@@ -192,6 +309,7 @@ export class App implements CommandIO {
     process.stdout.on('resize', () => this.draw());
     process.on('SIGTERM', () => void this.quit(143));
     process.on('SIGHUP', () => void this.quit(129));
+    if (process.platform !== 'win32') process.on('SIGCONT', () => this.resumeTerminal());
     // A stray error must not leave the terminal in raw mode with a dead UI.
     const report = (err: unknown) => {
       if (this.exiting) return;
@@ -266,6 +384,7 @@ export class App implements CommandIO {
       this.print(c.dim(m));
     }
     void this.refreshStatusLine();
+    this.started = true;
     this.markReady();
     this.draw();
     if (opts.initialPrompt?.trim()) await this.submit(opts.initialPrompt.trim());
@@ -354,10 +473,26 @@ export class App implements CommandIO {
 
   private handleKey(key: Key): void {
     if (this.exiting) return;
+    if (key.ctrl && !key.meta && key.name === 'z') {
+      this.suspend();
+      return;
+    }
     if (this.dialog) {
       this.dialog.handleKey(key);
       return;
     }
+
+    const afterPrefix = this.chord.take();
+    if (afterPrefix && key.ctrl && key.name === 'e') {
+      void this.editPrompt();
+      return;
+    }
+    if (this.helpOpen) {
+      this.helpOpen = false;
+      // The keys that mean "close this" only close it; any other key also does its usual job.
+      if (key.name === 'escape' || (key.name === 'char' && key.text === '?')) return;
+    }
+    if (this.editor.search && this.searchKey(key)) return;
 
     if (key.ctrl && key.name === 'c') {
       if (this.running) {
@@ -365,7 +500,7 @@ export class App implements CommandIO {
         return;
       }
       if (!this.editor.isEmpty) {
-        this.editor.clear();
+        this.editor.discard();
         this.completion = null;
         return;
       }
@@ -395,7 +530,7 @@ export class App implements CommandIO {
       const double = Date.now() - this.lastEscape < 800;
       this.lastEscape = Date.now();
       if (!this.editor.isEmpty) {
-        if (double) this.editor.clear();
+        if (double) this.editor.discard();
         else this.setNotice('Press esc again to clear', 800);
       } else if (double) {
         void this.command('/rewind');
@@ -416,6 +551,45 @@ export class App implements CommandIO {
     if (key.ctrl && key.name === 'o') {
       this.verbose = !this.verbose;
       this.setNotice(`Verbose output ${this.verbose ? 'on' : 'off'}`, 1500);
+      return;
+    }
+    if (key.ctrl && !key.meta) {
+      switch (key.name) {
+        case 't':
+          this.tasksPinned = !this.tasksPinned;
+          return;
+        case 'g':
+          void this.editPrompt();
+          return;
+        case 'x':
+          this.chord.arm();
+          return;
+        case 'r':
+          this.completion = null;
+          this.editor.searchStart();
+          return;
+        case 's':
+          this.toggleStash();
+          return;
+        case '_':
+        case '-': // ctrl+shift+- where the terminal reports the keys separately
+          if (key.name === '-' && !key.shift) break;
+          if (this.editor.undo()) this.updateCompletion();
+          else this.setNotice('Nothing to undo', 1500);
+          return;
+        default:
+          break;
+      }
+    }
+    if (key.meta && !key.ctrl && key.name === 'p') {
+      this.keyCommand('/model');
+      return;
+    }
+    if (key.meta && !key.ctrl && key.name === 't') {
+      // "Off" first: with the setting unset, a model that can reason does.
+      const on = this.ctl.settings.thinking === false;
+      this.ctl.settings.thinking = on;
+      this.setNotice(`Thinking ${on ? 'on' : 'off'} for this session`, 2500);
       return;
     }
 
@@ -454,7 +628,8 @@ export class App implements CommandIO {
         if (key.ctrl) ed.insert('\n');
         break;
       case 'char':
-        if (key.text) ed.insert(key.text);
+        if (key.text === '?' && ed.isEmpty) this.helpOpen = true;
+        else if (key.text) ed.insert(key.text);
         break;
       case 'paste':
         if (key.text) ed.paste(key.text);
@@ -464,7 +639,8 @@ export class App implements CommandIO {
         else ed.backspace();
         break;
       case 'delete':
-        ed.del();
+        if (key.meta || key.ctrl) ed.killWordForward();
+        else ed.del();
         break;
       case 'left':
         if (key.meta || key.ctrl) ed.wordLeft();
@@ -475,7 +651,7 @@ export class App implements CommandIO {
         else ed.right();
         break;
       case 'up':
-        if (!ed.up(inputWidth)) ed.historyPrev();
+        this.moveUp(inputWidth);
         break;
       case 'down':
         if (!ed.down(inputWidth)) ed.historyNext();
@@ -496,6 +672,9 @@ export class App implements CommandIO {
         if (key.ctrl) ed.left();
         else if (key.meta) ed.wordLeft();
         break;
+      case 'd':
+        if (key.meta) ed.killWordForward();
+        break;
       case 'f':
         if (key.ctrl) ed.right();
         else if (key.meta) ed.wordRight();
@@ -513,7 +692,7 @@ export class App implements CommandIO {
         if (key.ctrl) ed.yank();
         break;
       case 'p':
-        if (key.ctrl && !ed.up(inputWidth)) ed.historyPrev();
+        if (key.ctrl) this.moveUp(inputWidth);
         break;
       case 'n':
         if (key.ctrl && !ed.down(inputWidth)) ed.historyNext();
@@ -522,6 +701,62 @@ export class App implements CommandIO {
         break;
     }
     this.updateCompletion();
+  }
+
+  /**
+   * A key while a reverse history search is open. Returns false for a key
+   * that ends the search and still has its usual job to do.
+   */
+  private searchKey(key: Key): boolean {
+    const ed = this.editor;
+    const accept = (): void => {
+      ed.searchAccept();
+      // A recalled "/command" is not being typed: no menu until it is edited.
+      this.completionDismissed = ed.text;
+    };
+    if (key.name === 'escape' || (key.ctrl && (key.name === 'c' || key.name === 'g'))) ed.searchCancel();
+    else if (key.ctrl && !key.meta && key.name === 'r') ed.searchOlder();
+    else if (key.name === 'backspace' && !key.ctrl && !key.meta) ed.searchBackspace();
+    else if ((key.name === 'char' || key.name === 'paste') && key.text) ed.searchInput(key.text);
+    else if (key.name === 'return' && !key.meta && !key.shift) accept();
+    else {
+      // As in readline, any other key keeps the match and then does what it always does.
+      accept();
+      return false;
+    }
+    return true;
+  }
+
+  /** ctrl+s: set the prompt aside, or bring the last one set aside back into an empty prompt. */
+  private toggleStash(): void {
+    const ed = this.editor;
+    if (ed.stash()) this.setNotice('Prompt stashed (ctrl+s on an empty prompt brings it back)', 2500);
+    else if (ed.unstash()) this.setNotice(ed.stashCount ? `Stashed prompt restored (${ed.stashCount} more stashed)` : 'Stashed prompt restored', 2500);
+    else this.setNotice('Nothing to stash', 1500);
+    this.completionDismissed = ed.text;
+    this.completion = null;
+  }
+
+  /** Up: back into the queue while the model works, else up a row, else back in history. */
+  private moveUp(inputWidth: number): void {
+    const ed = this.editor;
+    const queued = this.ctl.queued;
+    if (this.running && ed.isEmpty && queued.length > 0) {
+      const last = queued.pop()!;
+      ed.set(last.display ?? messageText(last.content));
+      this.completionDismissed = ed.text;
+      return;
+    }
+    if (!ed.up(inputWidth)) ed.historyPrev();
+  }
+
+  /** Run a slash command from a key, under the rules for a typed one. */
+  private keyCommand(input: string): void {
+    if (this.running) {
+      this.setNotice('Commands are unavailable while the model is working (esc to interrupt)', 2500);
+      return;
+    }
+    if (this.started) void this.command(input);
   }
 
   private updateCompletion(): void {
@@ -1004,18 +1239,64 @@ export class App implements CommandIO {
     else {
       const mode = ctl.permissions.mode;
       const color = mode === 'plan' ? c.cyan : mode === 'acceptEdits' ? c.magenta : mode === 'bypassPermissions' ? c.red : c.dim;
-      left = mode === 'default' ? c.dim('? /help · shift+tab to change mode') : color(`⏵⏵ ${modeLabel(mode)} (shift+tab to cycle)`);
+      left = mode === 'default' ? c.dim('? for shortcuts · shift+tab to change mode') : color(`⏵⏵ ${modeLabel(mode)} (shift+tab to cycle)`);
     }
     let right = '';
     if (ctl.client && ctl.agent) {
       const used = ctl.agent.contextTokens();
       const pct = Math.min(100, Math.round((used / ctl.client.profile.contextWindow) * 100));
       const color = pct > 85 ? c.red : pct > 65 ? c.yellow : c.dim;
-      right = `${c.dim(truncate(ctl.client.model, 32))} ${c.dim('·')} ${color(`${pct}% context`)}`;
+      const stashed = this.editor.stashCount;
+      right = `${stashed ? c.dim(`${stashed} stashed · `) : ''}${c.dim(truncate(ctl.client.model, 32))} ${c.dim('·')} ${color(`${pct}% context`)}`;
     }
     const gap = width - stringWidth(left) - stringWidth(right) - 2;
     if (gap < 1) return `  ${truncate(left, width - 2)}`;
     return `  ${left}${' '.repeat(gap)}${right}`;
+  }
+
+  /** The line that stands in for the footer during a reverse history search, and where the cursor goes on it. */
+  private searchLine(search: EditorSearch, width: number): { line: string; col: number } {
+    const label = `(reverse-i-search${search.exhausted ? ': no older match' : ''})'`;
+    let found: string;
+    if (search.match !== null) found = search.match.replace(/\s+/g, ' ');
+    else if (search.query) found = c.yellow('no match');
+    else found = c.dim('type to search your prompts · ctrl+r for an older match · enter to keep · esc to cancel');
+    const line = truncate(`${c.dim(label)}${search.query}${c.dim("':")} ${found}`, width);
+    return { line, col: Math.min(Math.max(0, width - 1), stringWidth(label) + stringWidth(search.query)) };
+  }
+
+  /** The shortcuts panel: as many columns as fit, at most `maxRows` rows. */
+  private helpPanel(width: number, maxRows: number): string[] {
+    const items = SHORTCUTS.filter(([key]) => key !== 'ctrl+z' || process.platform !== 'win32');
+    const keyWidth = Math.max(...items.map(([key]) => stringWidth(key))) + 2;
+    const cellWidth = keyWidth + Math.max(...items.map(([, what]) => stringWidth(what))) + 2;
+    const columns = Math.max(1, Math.min(3, Math.floor((width - 2) / cellWidth)));
+    const rows = Math.ceil(items.length / columns);
+    const lines: string[] = [];
+    for (let r = 0; r < rows; r++) {
+      let line = ' ';
+      for (let col = 0; col < columns; col++) {
+        const item = items[col * rows + r];
+        if (item) line += padEnd(` ${padEnd(item[0], keyWidth)}${c.dim(item[1])}`, cellWidth);
+      }
+      lines.push(truncate(line.trimEnd(), width));
+    }
+    if (lines.length <= maxRows) return lines;
+    return maxRows > 0 ? [...lines.slice(0, maxRows - 1), c.dim(truncate('  … /help has the rest', width))] : [];
+  }
+
+  /** The task list under the prompt (ctrl+t), in at most `maxRows` rows. */
+  private pinnedTasks(width: number, maxRows: number): string[] {
+    if (maxRows <= 0) return [];
+    const todos = this.ctl.session.todos;
+    if (todos.length === 0) return [c.dim(truncate('  No tasks yet · ctrl+t to hide', width))];
+    const done = todos.filter((t) => t.status === 'completed').length;
+    const lines = [c.dim(truncate(`  Tasks · ${done} of ${todos.length} done · ctrl+t to hide`, width))];
+    const rows = renderTodos(todos, width, '  ');
+    const room = maxRows - 1;
+    if (rows.length <= room) lines.push(...rows);
+    else if (room > 0) lines.push(...rows.slice(0, room - 1), c.dim(truncate(`  … +${rows.length - room + 1} more`, width)));
+    return lines;
   }
 
   /** Build and show the live region. */
@@ -1047,11 +1328,15 @@ export class App implements CommandIO {
     }
 
     // While a dialog waits for the user nothing is running, so no spinner.
+    let tasksShown = false;
     if (this.running && !this.dialog) {
       if (lines.length) lines.push('');
       lines.push(this.spinnerLine());
       const todos = this.ctl.session.todos;
-      if (todos.length && todos.some((t) => t.status !== 'completed')) lines.push(...renderTodos(todos, width, '  ').slice(0, 8));
+      if (todos.length && todos.some((t) => t.status !== 'completed')) {
+        lines.push(...renderTodos(todos, width, '  ').slice(0, 8));
+        tasksShown = true;
+      }
       for (const q of this.ctl.queued) {
         lines.push(c.dim(truncate(`  ↳ queued: ${(q.display ?? messageText(q.content)).replace(/\s+/g, ' ')}`, width)));
       }
@@ -1077,7 +1362,7 @@ export class App implements CommandIO {
     const promptChar = bashMode ? c.magenta('>') : memoryMode ? c.yellow('>') : c.bold('>');
     const inputStart = lines.length;
     if (this.editor.isEmpty) {
-      const hint = this.running ? 'Type to queue a message for when the model is done' : 'Ask coco to do something';
+      const hint = !this.running ? 'Ask coco to do something' : this.ctl.queued.length ? 'Press up to edit the queued message' : 'Type to queue a message for when the model is done';
       lines.push(`${promptChar} ${c.dim(truncate(hint, width - 2))}`);
     } else {
       // Keep the cursor row visible when the prompt is taller than the space for it.
@@ -1090,7 +1375,15 @@ export class App implements CommandIO {
     cursor = { row: inputStart + layout.cursorRow, col: 2 + layout.cursorCol };
     lines.push(rule);
 
-    if (this.completion) {
+    // Whatever goes under the prompt has to leave the prompt itself on screen.
+    const room = (): number => this.screen.rows - 1 - lines.length;
+    const search = this.editor.search;
+    if (search) {
+      // The prompt box previews the match; typing goes to the query.
+      const { line, col } = this.searchLine(search, width);
+      cursor = { row: lines.length, col };
+      lines.push(line);
+    } else if (this.completion) {
       const comp = this.completion;
       const start = Math.min(Math.max(0, comp.index - MAX_COMPLETIONS + 1), Math.max(0, comp.items.length - MAX_COMPLETIONS));
       const labelWidth = Math.min(40, Math.max(...comp.items.map((i) => stringWidth(i.label))) + 2);
@@ -1100,9 +1393,13 @@ export class App implements CommandIO {
         const line = `  ${selected ? c.cyan(label) : label}${item.hint ? c.dim(` ${item.hint}`) : ''}`;
         lines.push(truncate(selected ? c.bold(line) : line, width));
       });
+    } else if (this.helpOpen) {
+      lines.push(...this.helpPanel(width, Math.max(1, room())));
     } else {
       lines.push(this.footer(width));
     }
+    // The list under the spinner is the same one: it is not shown twice.
+    if (this.tasksPinned && !tasksShown) lines.push(...this.pinnedTasks(width, room()));
     this.screen.setLive(lines, cursor);
   }
 }

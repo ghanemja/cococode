@@ -37,7 +37,18 @@ export interface HookBase {
   permissionMode?: () => string;
 }
 
-function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRoot: string, signal?: AbortSignal): Promise<RawResult> {
+/** Seconds a command hook may run when it sets no timeout of its own. */
+const DEFAULT_TIMEOUT = 600;
+const PROMPT_TIMEOUT = 30;
+/** Hook output added to the conversation is capped so one hook cannot flood the context. */
+const OUTPUT_CAP = 10_000;
+
+function capOutput(text: string): string {
+  if (text.length <= OUTPUT_CAP) return text;
+  return `${text.slice(0, OUTPUT_CAP)}\n… [hook output truncated: ${text.length - OUTPUT_CAP} more characters]`;
+}
+
+function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRoot: string, signal?: AbortSignal, defaultSeconds = DEFAULT_TIMEOUT): Promise<RawResult> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
@@ -62,7 +73,7 @@ function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRo
       signal?.removeEventListener('abort', onAbort);
       resolve({ code, stdout, stderr, timedOut, aborted });
     };
-    const seconds = typeof hook.timeout === 'number' && hook.timeout > 0 ? hook.timeout : 60;
+    const seconds = typeof hook.timeout === 'number' && hook.timeout > 0 ? hook.timeout : defaultSeconds;
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(proc, 'SIGKILL');
@@ -87,18 +98,29 @@ function runHookCommand(hook: HookCommand, stdin: string, cwd: string, projectRo
   });
 }
 
-function matcherApplies(matcher: string | undefined, subject: string | undefined): boolean {
+/**
+ * A matcher made only of letters, digits, `_`, `-`, spaces, `,` and `|` is an
+ * exact name or a list of names. Anything else is an unanchored regular expression.
+ */
+export function matcherApplies(matcher: string | undefined, subject: string | undefined): boolean {
   if (!matcher || matcher === '*' || matcher === '') return true;
   if (subject === undefined) return true;
+  if (/^[A-Za-z0-9_\- ,|]+$/.test(matcher)) {
+    return matcher
+      .split(/[,|]/)
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .includes(subject);
+  }
   try {
-    return new RegExp(`^(?:${matcher})$`).test(subject);
+    return new RegExp(matcher).test(subject);
   } catch {
     return matcher === subject;
   }
 }
 
-/** Events whose plain stdout is added to the model's context. */
-const CONTEXT_EVENTS = new Set<HookEvent>(['UserPromptSubmit', 'SessionStart']);
+/** Events whose plain stdout is added to the model's context (for PreCompact: to the summary instructions). */
+const CONTEXT_EVENTS = new Set<HookEvent>(['UserPromptSubmit', 'SessionStart', 'PreCompact']);
 
 export class HookRunner {
   private readonly getConfig: () => HooksConfig | undefined;
@@ -167,7 +189,16 @@ export class HookRunner {
       ...payload,
     });
 
-    const results = await Promise.all(commands.map((h) => runHookCommand(h, stdin, cwd, this.base.projectRoot, signal)));
+    // Prompt hooks hold up the user's message, so they get a short default. Hooks at
+    // exit share a small budget, raised to the largest timeout any of them asks for.
+    let defaultSeconds = event === 'UserPromptSubmit' ? PROMPT_TIMEOUT : DEFAULT_TIMEOUT;
+    let hooksToRun = commands;
+    if (event === 'SessionEnd') {
+      const largest = Math.max(0, ...commands.map((h) => (typeof h.timeout === 'number' && h.timeout > 0 ? h.timeout : 0)));
+      defaultSeconds = Math.min(60, Math.max(1.5, largest));
+      hooksToRun = commands.map((h) => ({ ...h, timeout: defaultSeconds }));
+    }
+    const results = await Promise.all(hooksToRun.map((h) => runHookCommand(h, stdin, cwd, this.base.projectRoot, signal, defaultSeconds)));
     const contexts: string[] = [];
     const reasons: string[] = [];
 
@@ -223,13 +254,23 @@ export class HookRunner {
             reasons.push(typeof specific.permissionDecisionReason === 'string' ? specific.permissionDecisionReason : 'Denied by PreToolUse hook.');
           }
         }
+        // PermissionRequest hooks answer the approval prompt: { decision: { behavior: "allow" | "deny" } }.
+        const answer = isRecord(specific.decision) ? specific.decision : undefined;
+        if (answer && (answer.behavior === 'allow' || answer.behavior === 'deny')) {
+          if (answer.behavior === 'deny' || outcome.permissionDecision !== 'deny') outcome.permissionDecision = answer.behavior;
+          if (answer.behavior === 'deny') {
+            outcome.blocked = true;
+            reasons.push(typeof answer.message === 'string' ? answer.message : 'Denied by PermissionRequest hook.');
+          }
+        }
         if (isRecord(specific.updatedInput)) outcome.updatedInput = specific.updatedInput;
         if (typeof specific.additionalContext === 'string') contexts.push(specific.additionalContext);
       }
     });
 
-    if (reasons.length) outcome.reason = reasons.join('\n');
-    if (contexts.length) outcome.additionalContext = contexts.join('\n\n');
+    if (reasons.length) outcome.reason = capOutput(reasons.join('\n'));
+    if (contexts.length) outcome.additionalContext = capOutput(contexts.join('\n\n'));
+    outcome.messages = outcome.messages.map(capOutput);
     return outcome;
   }
 }

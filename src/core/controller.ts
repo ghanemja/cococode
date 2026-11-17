@@ -9,7 +9,7 @@ import type { AgentEvent, PermissionAnswer, PermissionPrompt } from '../agent/lo
 import { Agent } from '../agent/loop.ts';
 import { buildSubagentPrompt, buildSystemPrompt, gatherEnv, type EnvInfo } from '../agent/systemPrompt.ts';
 import type { AgentDefinition, CustomCommand, OutputStyle, SkillDefinition } from '../config/extensions.ts';
-import { loadAgents, loadCommands, loadOutputStyles, loadSkills } from '../config/extensions.ts';
+import { loadAgents, loadCommands, loadOutputStyles, loadSkills, BUILTIN_AGENTS, BUILTIN_STYLES } from '../config/extensions.ts';
 import { configDir, displayPath, expandHome, readJsonFile, writeJsonFile } from '../config/paths.ts';
 import type { LoadedSettings, Settings } from '../config/settings.ts';
 import { DEFAULTS, loadSettings, mergeSettings, updateSettingsFile } from '../config/settings.ts';
@@ -17,7 +17,8 @@ import { HookRunner } from '../hooks/hooks.ts';
 import { loadMcpServers } from '../mcp/config.ts';
 import { McpManager } from '../mcp/manager.ts';
 import type { MemoryFile } from '../memory/memory.ts';
-import { loadMemory, renderMemory } from '../memory/memory.ts';
+import { autoMemoryPrompt, loadAutoMemory } from '../memory/autoMemory.ts';
+import { loadMemory, loadedPaths, onDemandInstructions, renderMemory, renderOnDemand } from '../memory/memory.ts';
 import { PermissionManager } from '../permissions/manager.ts';
 import type { DetectedServer, ModelInfo, Provider } from '../providers/index.ts';
 import { ModelClient, ProviderError, createProvider, detectServers, profileModel, providerConfigs, rankModels, resolveProvider } from '../providers/index.ts';
@@ -58,9 +59,19 @@ export interface ControllerOptions {
   /** Do not write a transcript (--no-session-persistence). */
   persist?: boolean;
   interactive: boolean;
+  /** Use this id for the session instead of a generated one (--session-id). */
+  sessionId?: string;
+  /** Name for the session, usable with --resume (--name). */
+  sessionName?: string;
+  /** Skip everything user- or project-defined: memory files, hooks, MCP servers, skills, commands, agents (--bare, --safe-mode). */
+  bare?: boolean;
+  /** Use only the MCP servers given with --mcp-config (--strict-mcp-config). */
+  strictMcp?: boolean;
+  /** Subagents defined for this session only (--agents). */
+  extraAgents?: AgentDefinition[];
 }
 
-const SUBAGENT_EXCLUDED = new Set(['Agent', 'AskUserQuestion', 'ExitPlanMode']);
+const SUBAGENT_EXCLUDED = new Set(['Agent', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']);
 const IMAGE_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
 
 interface AppState {
@@ -103,15 +114,39 @@ export class Controller implements RuntimeHandle {
     this.opts = opts;
     this.loaded = loadSettings({ projectRoot: opts.cwd, extra: opts.extraSettings, overrides: opts.overrides });
     this.settings = this.loaded.merged;
-    this.session = new SessionState({ cwd: opts.cwd, settings: this.settings });
+    this.session = new SessionState({ id: opts.sessionId, cwd: opts.cwd, settings: this.settings });
     for (const dir of opts.addDirs ?? []) this.session.addDir(dir);
     this.permissions = this.makePermissions();
     this.transcript = this.makeTranscript();
     this.hooks = this.makeHooks();
+    this.sessionName = opts.sessionName;
     this.reloadExtensions();
   }
 
+  /** Name shown in session lists and accepted by --resume. Written with the first message. */
+  sessionName: string | undefined;
+  private nameWritten = false;
+
+  rename(name: string): void {
+    this.sessionName = name.trim() || undefined;
+    this.nameWritten = false;
+    this.writeName();
+  }
+
+  /** The transcript file only exists once there is a message, so the name is written then. */
+  private writeName(): void {
+    if (this.nameWritten || !this.sessionName || !this.agent?.messages.length) return;
+    this.transcript.title(this.sessionName);
+    this.nameWritten = true;
+  }
+
   private makePermissions(): PermissionManager {
+    const manager = this.newPermissionManager();
+    manager.autoMemory = !this.opts.bare && (this.settings.autoMemoryEnabled ?? true);
+    return manager;
+  }
+
+  private newPermissionManager(): PermissionManager {
     return new PermissionManager(this.session, {
       settings: this.settings.permissions,
       mode: this.opts.overrides?.permissions?.defaultMode,
@@ -129,7 +164,7 @@ export class Controller implements RuntimeHandle {
   }
 
   private makeHooks(): HookRunner {
-    return new HookRunner(() => this.settings.hooks, {
+    return new HookRunner(() => (this.settings.disableAllHooks || this.opts.bare ? undefined : this.settings.hooks), {
       sessionId: this.session.id,
       transcriptPath: this.transcript.path,
       projectRoot: this.session.projectRoot,
@@ -145,12 +180,54 @@ export class Controller implements RuntimeHandle {
   /** Re-read commands, agents, skills, output styles and memory files from disk. */
   reloadExtensions(): void {
     const root = this.session.projectRoot;
+    if (this.opts.bare) {
+      // Nothing user- or project-defined: only what ships with coco.
+      this.commands = [];
+      this.agentDefs = [...(this.opts.extraAgents ?? []), ...BUILTIN_AGENTS];
+      this.skillDefs = [];
+      this.styles = BUILTIN_STYLES;
+      this.memory = [];
+      this.memoryText = '';
+      return;
+    }
     this.commands = loadCommands(root, this.claudeCompat);
-    this.agentDefs = loadAgents(root, this.claudeCompat);
+    // Agents given on the command line win over files of the same name.
+    const flagged = this.opts.extraAgents ?? [];
+    this.agentDefs = [...flagged, ...loadAgents(root, this.claudeCompat).filter((a) => !flagged.some((f) => f.name === a.name))];
     this.skillDefs = loadSkills(root, this.claudeCompat);
     this.styles = loadOutputStyles(root, this.claudeCompat);
-    this.memory = loadMemory(root, this.claudeCompat);
-    this.memoryText = renderMemory(this.memory);
+    this.memory = loadMemory(root, this.claudeCompat, this.memoryExcludes());
+    this.deliveredInstructions = loadedPaths(this.memory);
+    // Auto memory is read once per session: changing the system prompt mid-session would
+    // make a local server re-evaluate the whole prompt on the next request.
+    const auto = this.autoMemoryOn() ? autoMemoryPrompt(loadAutoMemory(root)) : '';
+    this.memoryText = [renderMemory(this.memory), auto].filter(Boolean).join('\n\n');
+    if (this.permissions) this.permissions.autoMemory = this.autoMemoryOn();
+  }
+
+  /** Instruction files already given to the model, so each is delivered once. */
+  private deliveredInstructions = new Set<string>();
+
+  private memoryExcludes(): string[] {
+    // Instruction files inside dependencies were not written for this project.
+    return ['**/node_modules/**', ...(this.settings.claudeMdExcludes ?? [])];
+  }
+
+  private autoMemoryOn(): boolean {
+    return !this.opts.bare && (this.settings.autoMemoryEnabled ?? true);
+  }
+
+  /**
+   * Instructions that apply to a file the model just read or edited and were not
+   * loaded at launch: memory files in its directory, and rules scoped to its path.
+   */
+  private instructionsFor(toolName: string, input: Record<string, unknown>): string | undefined {
+    if (this.opts.bare) return undefined;
+    const raw = toolName === 'NotebookEdit' ? input.notebook_path : toolName === 'Read' || toolName === 'Edit' || toolName === 'Write' ? input.file_path : undefined;
+    if (typeof raw !== 'string' || !raw) return undefined;
+    const abs = path.resolve(this.session.cwd, expandHome(raw));
+    const files = onDemandInstructions(this.session.projectRoot, abs, this.claudeCompat, this.deliveredInstructions, this.memoryExcludes());
+    return files.length ? renderOnDemand(files) : undefined;
   }
 
   // ------------------------------------------------------------- workspace trust
@@ -249,6 +326,20 @@ export class Controller implements RuntimeHandle {
     this.client = new ModelClient(provider, model, profile, this.settings);
     this.session.vision = profile.vision;
     if (this.env) this.env.model = model;
+    // Unless the user chose a limit, one tool result may fill at most a fifth of the window:
+    // the 30,000-character default suits a 200k-token model, not a 16k one.
+    if (this.settings.maxToolOutputChars === undefined || this.derivedOutputCap) {
+      this.derivedOutputCap = true;
+      this.settings.maxToolOutputChars = Math.max(4000, Math.min(DEFAULTS.maxToolOutputChars, Math.floor(profile.contextWindow * 3.5 * 0.2)));
+    }
+  }
+
+  private derivedOutputCap = false;
+
+  enterPlanMode(): boolean {
+    if (this.permissions.mode === 'bypassPermissions' || this.permissions.mode === 'dontAsk') return false;
+    this.permissions.mode = 'plan';
+    return true;
   }
 
   /** Switch model (and optionally provider) mid-session. */
@@ -293,7 +384,9 @@ export class Controller implements RuntimeHandle {
       disabled: this.settings.disabledMcpServers,
     });
     this.mcpErrors = errors;
-    const usable = this.untrusted ? servers.filter((s) => s.scope === 'user' || s.scope === 'flag') : servers;
+    if (this.opts.bare && !this.opts.mcpConfigFiles?.length) return;
+    const explicitOnly = this.opts.strictMcp || this.opts.bare;
+    const usable = explicitOnly ? servers.filter((s) => s.scope === 'flag') : this.untrusted ? servers.filter((s) => s.scope === 'user' || s.scope === 'flag') : servers;
     if (usable.length === 0) return;
     this.mcp = new McpManager(usable, { clientVersion: VERSION, cwd: this.session.projectRoot });
     await this.mcp.connectAll();
@@ -309,7 +402,9 @@ export class Controller implements RuntimeHandle {
    */
   tools(): Tool[] {
     const hidden = new Set<string>();
-    if (this.permissions.mode !== 'plan') hidden.add('ExitPlanMode');
+    // Entering plan mode is offered outside it, leaving it only inside it.
+    hidden.add(this.permissions.mode === 'plan' ? 'EnterPlanMode' : 'ExitPlanMode');
+    if (this.permissions.mode === 'bypassPermissions' || this.permissions.mode === 'dontAsk') hidden.add('EnterPlanMode');
     if (this.skillDefs.length === 0) hidden.add('Skill');
     if (!this.projectHasNotebooks()) hidden.add('NotebookEdit');
     const all = [...this.builtin.filter((t) => !hidden.has(t.name)), ...(this.mcp?.tools() ?? [])];
@@ -365,7 +460,38 @@ export class Controller implements RuntimeHandle {
       transcript: this.transcript,
       maxTurns: this.opts.maxTurns,
       drainQueued: () => this.queued.splice(0),
+      fallback: (index) => this.fallbackClient(index),
+      carryOver: () => ({
+        skills: [...this.invokedSkills].map(([name, content]) => ({ name, content })),
+        plan: this.approvedPlan,
+      }),
+      // The repository has usually changed by the time a session is long enough to compact.
+      onCompacted: () => {
+        this.env = gatherEnv(this.session.cwd, this.session.projectRoot, this.session.additionalDirs, this.client.model);
+        // On-demand instructions lived in tool results that are gone now: deliver them again when next relevant.
+        this.deliveredInstructions = loadedPaths(this.memory);
+      },
+      afterTool: (toolName, input) => this.instructionsFor(toolName, input),
     });
+  }
+
+  /** Skills invoked this session (most recent last), so compaction can restate them. */
+  private invokedSkills = new Map<string, string>();
+  /** The plan the user approved in plan mode, restated after compaction. */
+  private approvedPlan: string | undefined;
+  private fallbackClients = new Map<string, ModelClient>();
+
+  /** The nth configured fallback model, connected on first use. */
+  private async fallbackClient(index: number): Promise<ModelClient | undefined> {
+    const configured = this.settings.fallbackModel;
+    const models = (Array.isArray(configured) ? configured : configured ? [configured] : []).filter((m) => m && m !== this.client.model).slice(0, 3);
+    const model = models[index];
+    if (!model) return undefined;
+    const cached = this.fallbackClients.get(model);
+    if (cached) return cached;
+    const client = new ModelClient(this.provider, model, await profileModel(this.provider, model, this.settings), this.settings);
+    this.fallbackClients.set(model, client);
+    return client;
   }
 
   /** Call after setting `ui` so the agent picks up the interactive callbacks. */
@@ -422,6 +548,7 @@ export class Controller implements RuntimeHandle {
     const message = this.buildUserMessage(text, opts, context);
     this.agent.messages.push(message);
     this.transcript.message(message);
+    this.writeName();
     yield* this.agent.resume(signal);
   }
 
@@ -524,6 +651,8 @@ export class Controller implements RuntimeHandle {
     this.transcript = this.makeTranscript();
     this.hooks = this.makeHooks();
     this.queued = [];
+    this.invokedSkills.clear();
+    this.approvedPlan = undefined;
     const totals = this.agent.totals;
     this.agent = this.makeAgent();
     this.agent.totals = totals;
@@ -532,10 +661,16 @@ export class Controller implements RuntimeHandle {
   }
 
   /** Load an earlier conversation and continue it. */
-  resume(summary: Pick<SessionSummary, 'path'>): Message[] {
+  resume(summary: Pick<SessionSummary, 'path'>, opts: { fork?: boolean } = {}): Message[] {
     const loaded = loadSession(summary.path);
     const additionalDirs = this.session.additionalDirs;
-    this.session = new SessionState({ id: loaded.id, cwd: this.session.projectRoot, settings: this.settings });
+    // A fork continues the conversation under a new id and leaves the original untouched.
+    const id = opts.fork ? this.opts.sessionId : loaded.id;
+    this.session = new SessionState({ id, cwd: this.session.projectRoot, settings: this.settings });
+    if (!opts.fork && loaded.title && !this.opts.sessionName) {
+      this.sessionName = loaded.title;
+      this.nameWritten = true;
+    }
     this.session.additionalDirs = additionalDirs;
     this.session.vision = this.client?.profile.vision ?? false;
     // New turns must be numbered above every existing one. After a compaction or a
@@ -555,7 +690,9 @@ export class Controller implements RuntimeHandle {
     const mode = this.permissions.mode;
     this.permissions = this.makePermissions();
     this.permissions.mode = mode;
-    this.transcript = this.makeTranscript(true);
+    this.transcript = this.makeTranscript(!opts.fork);
+    // The fork's transcript starts with the whole conversation so far, so it stands alone.
+    if (opts.fork && loaded.messages.length) this.transcript.compacted(loaded.messages);
     this.hooks = this.makeHooks();
     if (this.client) {
       const totals = this.agent?.totals;
@@ -566,6 +703,32 @@ export class Controller implements RuntimeHandle {
       this.resumedMessages = loaded.messages;
     }
     return loaded.messages;
+  }
+
+  /**
+   * Continue the current conversation as a new session (/branch). The original
+   * transcript stays as it is and can be resumed separately. Returns its id.
+   */
+  branch(name?: string): string {
+    const previous = this.session.id;
+    const messages = this.agent.messages;
+    const { additionalDirs, todos, cwd, turn, readFiles, vision } = this.session;
+    this.session = new SessionState({ cwd: this.session.projectRoot, settings: this.settings });
+    Object.assign(this.session, { additionalDirs, todos, cwd, turn, readFiles, vision });
+    const mode = this.permissions.mode;
+    this.permissions = this.makePermissions();
+    this.permissions.mode = mode;
+    this.transcript = this.makeTranscript();
+    if (messages.length) this.transcript.compacted(messages);
+    this.hooks = this.makeHooks();
+    const totals = this.agent.totals;
+    this.agent = this.makeAgent();
+    this.agent.load(messages);
+    this.agent.totals = totals;
+    this.sessionName = name?.trim() || undefined;
+    this.nameWritten = false;
+    this.writeName();
+    return previous;
   }
 
   /** User turns that can be rewound to, oldest first. */
@@ -651,7 +814,11 @@ export class Controller implements RuntimeHandle {
   loadSkill(name: string): SkillInfo | undefined {
     const wanted = name.toLowerCase();
     const skill = this.skillDefs.find((s) => s.name.toLowerCase() === wanted);
-    return skill ? { name: skill.name, description: skill.description, baseDir: skill.baseDir, body: skill.body } : undefined;
+    if (!skill) return undefined;
+    // Loading a skill is invoking it: remember it (most recent last) for compaction.
+    this.invokedSkills.delete(skill.name);
+    this.invokedSkills.set(skill.name, skill.body);
+    return { name: skill.name, description: skill.description, baseDir: skill.baseDir, body: skill.body };
   }
 
   get askUser(): RuntimeHandle['askUser'] {
@@ -662,7 +829,10 @@ export class Controller implements RuntimeHandle {
     if (!this.ui.approvePlan) return undefined;
     return async (plan, signal) => {
       const res = await this.ui.approvePlan!(plan, signal);
-      if (res.approved) this.permissions.mode = res.mode ?? 'default';
+      if (res.approved) {
+        this.permissions.mode = res.mode ?? 'default';
+        this.approvedPlan = plan;
+      }
       return res;
     };
   }
@@ -685,7 +855,12 @@ export class Controller implements RuntimeHandle {
       this.tools().filter((t) => !SUBAGENT_EXCLUDED.has(t.name)),
       def.tools,
     );
-    const system = buildSubagentPrompt(def.prompt, { ...this.env, cwd: this.session.cwd }, this.memoryText);
+    let startContext = '';
+    if (this.hooks.has('SubagentStart')) {
+      const started = await this.hooks.run('SubagentStart', { agent_type: def.name }, def.name, req.signal);
+      startContext = started.additionalContext ?? '';
+    }
+    const system = [buildSubagentPrompt(def.prompt, { ...this.env, cwd: this.session.cwd }, this.memoryText), startContext].filter(Boolean).join('\n\n');
     const agent = new Agent({
       client,
       tools: () => tools,

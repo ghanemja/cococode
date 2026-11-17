@@ -13,15 +13,30 @@ export interface RunOptions {
   maxOutput?: number;
   /** How long to wait after SIGTERM before SIGKILL. */
   killGraceMs?: number;
+  /**
+   * Manager that may take the running process over as a background shell. With
+   * it the command can be moved to the background on demand
+   * (`ShellManager.detachForeground`) and, when `onTimeout` is 'background',
+   * at its timeout.
+   */
+  shells?: ShellManager;
+  /**
+   * What happens when the timeout expires: the command is killed (the default),
+   * or it is handed to `shells` and left running while this call returns.
+   */
+  onTimeout?: 'kill' | 'background';
 }
 
 export interface RunResult {
+  /** Everything printed, or everything printed so far when the command was moved to the background. */
   output: string;
   exitCode: number | null;
   timedOut: boolean;
   interrupted: boolean;
   /** Working directory after the command, when it could be determined. */
   cwd?: string;
+  /** Id of the background shell that now runs the command, when it was moved there instead of finishing. */
+  backgroundId?: string;
 }
 
 export function shellPath(): { shell: string; args: (cmd: string) => string[] } {
@@ -120,9 +135,14 @@ class OutputBuffer {
  * Run a shell command to completion. The session's working directory is
  * tracked by recording `pwd` when the shell exits, so `cd` persists between
  * calls even though each command runs in a fresh shell.
+ *
+ * With `opts.shells` the command need not be waited for to the end: it can be
+ * moved to the background, where it keeps running as a background shell, and
+ * the promise then resolves at once with the output so far and `backgroundId`.
  */
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const { shell, args } = shellPath();
     const posix = process.platform !== 'win32' || Boolean(process.env.COCO_SHELL);
     let cwdFile: string | undefined;
@@ -161,33 +181,33 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     proc.stderr?.on('data', onChunk);
 
     let exitTimer: NodeJS.Timeout | undefined;
+    let terminating = false;
     const terminate = () => {
+      terminating = true;
       killTree(proc, 'SIGTERM');
       // Not cancelled when the shell exits: a child that ignores SIGTERM must still go.
       const killTimer = setTimeout(() => killTree(proc, 'SIGKILL', true), opts.killGraceMs ?? 2000);
       killTimer.unref();
     };
 
-    const timer = opts.timeoutMs
-      ? setTimeout(() => {
-          timedOut = true;
-          terminate();
-        }, opts.timeoutMs)
-      : undefined;
-
     const onAbort = () => {
       interrupted = true;
       terminate();
     };
-    if (opts.signal?.aborted) onAbort();
-    else opts.signal?.addEventListener('abort', onAbort, { once: true });
-
-    const finish = (exitCode: number | null) => {
-      if (settled) return;
+    let timer: NodeJS.Timeout | undefined;
+    let untrack: (() => void) | undefined;
+    /** Stop everything that could still act on the process on this call's behalf. */
+    const release = () => {
       settled = true;
       if (timer) clearTimeout(timer);
       if (exitTimer) clearTimeout(exitTimer);
       opts.signal?.removeEventListener('abort', onAbort);
+      untrack?.();
+    };
+
+    const finish = (exitCode: number | null) => {
+      if (settled) return;
+      release();
       // Stop listening to pipes a background child may still hold open.
       proc.stdout?.destroy();
       proc.stderr?.destroy();
@@ -204,16 +224,59 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       resolve({ output: buffer.toString(), exitCode, timedOut, interrupted, cwd });
     };
 
-    proc.on('error', (err) => {
+    const onError = (err: Error) => {
       buffer.push(`\n${err.message}`);
       finish(127);
-    });
-    proc.on('close', (code) => finish(code));
+    };
+    const onClose = (code: number | null) => finish(code);
     // `close` waits for every holder of the output pipes. A command that leaves
     // something running (`server &`) would otherwise hang until the timeout.
-    proc.on('exit', (code) => {
+    const onExit = (code: number | null) => {
       exitTimer = setTimeout(() => finish(code), 250);
-    });
+    };
+    proc.on('error', onError);
+    proc.on('close', onClose);
+    proc.on('exit', onExit);
+
+    /**
+     * Hand the running process to the shell manager and return without waiting
+     * for it. Returns the id of the background shell, or undefined when there is
+     * nothing left to hand over (the command is finishing or being killed).
+     */
+    const moveToBackground = (atTimeout: boolean): string | undefined => {
+      if (settled || terminating || !opts.shells) return undefined;
+      if (proc.pid === undefined || proc.exitCode !== null || proc.signalCode !== null) return undefined;
+      release();
+      // The same turn of the event loop detaches these listeners and attaches the
+      // manager's, so no output falls between the two.
+      proc.stdout?.off('data', onChunk);
+      proc.stderr?.off('data', onChunk);
+      proc.off('error', onError);
+      proc.off('close', onClose);
+      proc.off('exit', onExit);
+      const output = buffer.toString();
+      const shell = opts.shells.adopt(proc, command, output, { startedAt, delivered: true });
+      // Nobody reads the working directory of a background shell; do not leave its record behind.
+      if (cwdFile) proc.once('exit', () => fs.rmSync(cwdFile, { force: true }));
+      resolve({ output, exitCode: null, timedOut: atTimeout, interrupted: false, backgroundId: shell.id });
+      return shell.id;
+    };
+
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => {
+        if (opts.onTimeout === 'background' && opts.shells) {
+          // When this declines, the command is already exiting or being killed, and `finish` is on its way.
+          moveToBackground(true);
+          return;
+        }
+        timedOut = true;
+        terminate();
+      }, opts.timeoutMs);
+    }
+    untrack = opts.shells?.trackForeground(() => moveToBackground(false));
+
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -241,35 +304,70 @@ interface ShellEntry extends BackgroundShell {
 
 const MAX_BACKGROUND_BUFFER = 1_000_000;
 
-/** Long-running commands started with `run_in_background`. */
+export interface AdoptOptions {
+  /** When the command was started, if that was before it was taken over. */
+  startedAt?: number;
+  /**
+   * True when the caller has already passed on the output produced so far, so
+   * that `read` returns only what comes after it. Otherwise the first `read`
+   * returns it.
+   */
+  delivered?: boolean;
+}
+
+/**
+ * Long-running commands: those started with `run_in_background`, and
+ * foreground commands that were moved to the background while running.
+ */
 export class ShellManager {
   private shells = new Map<string, ShellEntry>();
   private counter = 0;
+  /** Foreground commands that can be moved to the background, as the functions that do it. */
+  private foreground = new Set<() => string | undefined>();
   /** How long a killed shell gets to exit before its process group is SIGKILLed. */
   killGraceMs = 2000;
 
   start(command: string, cwd: string, env?: Record<string, string>): BackgroundShell {
     const { shell, args } = shellPath();
-    const id = `bash_${++this.counter}`;
     const proc = spawn(shell, args(command), {
       cwd,
       env: commandEnv(env),
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     });
+    return this.track(proc, command, '', {});
+  }
+
+  /**
+   * Take over a child process that is already running, as a background shell
+   * like any other: its output so far is kept, later output is collected, and
+   * `read`, `kill`, `list` and `killAll` treat it the same. The process must
+   * have piped stdout and stderr and, to be killed along with what it started,
+   * its own process group (`detached`). Whoever ran it until now must have
+   * stopped listening to it.
+   */
+  adopt(proc: ChildProcess, command: string, outputSoFar = '', options: AdoptOptions = {}): BackgroundShell {
+    return this.track(proc, command, outputSoFar, options);
+  }
+
+  private track(proc: ChildProcess, command: string, output: string, options: AdoptOptions): BackgroundShell {
+    const id = `bash_${++this.counter}`;
+    const dropped = Math.max(0, output.length - MAX_BACKGROUND_BUFFER);
     const entry: ShellEntry = {
       id,
       command,
-      startedAt: Date.now(),
+      startedAt: options.startedAt ?? Date.now(),
       status: 'running',
       exitCode: null,
       proc,
-      output: '',
+      output: dropped ? output.slice(dropped) : output,
       readOffset: 0,
-      dropped: 0,
+      dropped,
     };
-    proc.stdout?.setEncoding('utf8');
-    proc.stderr?.setEncoding('utf8');
+    if (options.delivered) entry.readOffset = entry.output.length;
+    // A stream that is already decoding keeps its decoder: a second one would lose half a character.
+    if (proc.stdout && !proc.stdout.readableEncoding) proc.stdout.setEncoding('utf8');
+    if (proc.stderr && !proc.stderr.readableEncoding) proc.stderr.setEncoding('utf8');
     const onChunk = (text: string) => {
       entry.output += text;
       if (entry.output.length > MAX_BACKGROUND_BUFFER) {
@@ -286,12 +384,43 @@ export class ShellManager {
       entry.status = 'failed';
       entry.exitCode = 127;
     });
-    proc.on('close', (code) => {
+    const ended = (code: number | null) => {
       if (entry.status === 'running') entry.status = code === 0 ? 'completed' : 'failed';
       entry.exitCode = code;
-    });
+    };
+    proc.on('close', ended);
+    // An adopted process may have ended already, in which case `close` may never come.
+    if (proc.exitCode !== null || proc.signalCode !== null) ended(proc.exitCode);
     this.shells.set(id, entry);
     return entry;
+  }
+
+  /**
+   * Register a running foreground command. `detach` moves it to the background
+   * and returns the id of the shell that took it over, or undefined when the
+   * command can no longer be moved. Returns a function that removes the
+   * registration, to call when the command is no longer in the foreground.
+   */
+  trackForeground(detach: () => string | undefined): () => void {
+    this.foreground.add(detach);
+    return () => {
+      this.foreground.delete(detach);
+    };
+  }
+
+  /** How many foreground commands are running and could be moved to the background. */
+  foregroundCount(): number {
+    return this.foreground.size;
+  }
+
+  /** Move every running foreground command to the background. Returns the ids of the shells that took them over. */
+  detachForeground(): string[] {
+    const ids: string[] = [];
+    for (const detach of [...this.foreground]) {
+      const id = detach();
+      if (id !== undefined) ids.push(id);
+    }
+    return ids;
   }
 
   list(): BackgroundShell[] {

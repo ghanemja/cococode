@@ -185,8 +185,13 @@ export function ruleMatches(rule: Rule, actualTool: string, req: PermissionReque
       return matchPathSpec(rule.spec, req.target, ctx);
     case 'web':
       return rule.spec.startsWith('domain:') ? matchDomainSpec(rule.spec, req.target) : rule.spec === req.target;
-    default:
-      return rule.spec === req.target;
+    default: {
+      // Names (subagent types, skills): case-insensitive, and "name *" covers any arguments.
+      const spec = rule.spec.toLowerCase();
+      const target = req.target.toLowerCase();
+      if (spec.endsWith(' *')) return target === spec.slice(0, -2) || target.startsWith(spec.slice(0, -1));
+      return spec === target;
+    }
   }
 }
 

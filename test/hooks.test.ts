@@ -289,11 +289,13 @@ describe('HookRunner exit codes', { skip }, () => {
 });
 
 describe('HookRunner output', { skip }, () => {
-  test('plain stdout becomes context for UserPromptSubmit and SessionStart only', async () => {
+  test('plain stdout becomes context only for prompt, session-start and pre-compact hooks', async () => {
     const say = 'echo "Today is Tuesday."';
     assert.equal((await runner(on('UserPromptSubmit', say)).run('UserPromptSubmit', { prompt: 'hi' })).additionalContext, 'Today is Tuesday.');
     assert.equal((await runner(on('SessionStart', say)).run('SessionStart', {}, 'startup')).additionalContext, 'Today is Tuesday.');
-    for (const event of ['PreToolUse', 'PostToolUse', 'Stop', 'SubagentStop', 'PreCompact', 'Notification', 'SessionEnd'] as const) {
+    // For PreCompact the text is guidance for the summary.
+    assert.equal((await runner(on('PreCompact', say)).run('PreCompact', {}, 'manual')).additionalContext, 'Today is Tuesday.');
+    for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'SubagentStop', 'SubagentStart', 'PostCompact', 'Notification', 'SessionEnd'] as const) {
       assert.equal((await runner(on(event, say)).run(event, {}, 'Bash')).additionalContext, undefined, event);
     }
   });
@@ -403,11 +405,63 @@ describe('HookRunner output', { skip }, () => {
   });
 
   test('multi-byte output survives being split across pipe reads', async () => {
-    // 60,000 three-byte characters: the 64 KiB pipe buffer splits one of them.
-    const outcome = await runner(on('SessionStart', "yes '€' | head -n 60000 | tr -d '\\n'")).run('SessionStart', {}, 'startup');
-    const text = outcome.additionalContext ?? '';
-    assert.equal(text.length, 60000);
+    // 60,000 three-byte characters: the 64 KiB pipe buffer splits one of them. The hook
+    // reports them on stderr with exit 2, where the decoded text reaches us as the reason.
+    const outcome = await runner(on('PreToolUse', "yes '€' | head -n 60000 | tr -d '\\n' >&2; exit 2")).run('PreToolUse', {}, 'Bash');
+    const text = outcome.reason ?? '';
     assert.ok(!text.includes(REPLACEMENT));
-    assert.ok(/^€+$/.test(text));
+    assert.ok(/^€{10000}\n… \[hook output truncated: 50000 more characters\]$/.test(text), text.slice(-80));
+  });
+
+  test('output added to the conversation is capped at 10,000 characters', async () => {
+    const big = "head -c 25000 /dev/zero | tr '\\0' x";
+    const context = (await runner(on('SessionStart', big)).run('SessionStart', {}, 'startup')).additionalContext!;
+    assert.equal(context.length, 10_000 + '\n… [hook output truncated: 15000 more characters]'.length);
+    assert.ok(context.endsWith('[hook output truncated: 15000 more characters]'));
+    const small = (await runner(on('SessionStart', 'echo fine')).run('SessionStart', {}, 'startup')).additionalContext;
+    assert.equal(small, 'fine');
+  });
+
+  test('matchers: plain names are exact or lists, anything else is an unanchored regex', async () => {
+    const { matcherApplies } = await import('../src/hooks/hooks.ts');
+    assert.equal(matcherApplies('Edit', 'Edit'), true);
+    assert.equal(matcherApplies('Edit', 'NotebookEdit'), false);
+    assert.equal(matcherApplies('Edit|Write', 'Write'), true);
+    assert.equal(matcherApplies('Edit, Write', 'Write'), true);
+    assert.equal(matcherApplies('Edit|Write', 'Read'), false);
+    assert.equal(matcherApplies('mcp__github__.*', 'mcp__github__create_issue'), true);
+    assert.equal(matcherApplies('^Bash', 'BashOutput'), true);
+    assert.equal(matcherApplies('Notebook.*', 'NotebookEdit'), true);
+    assert.equal(matcherApplies('otebook.', 'NotebookEdit'), true, 'a regex is not anchored');
+    assert.equal(matcherApplies('*', 'Anything'), true);
+    assert.equal(matcherApplies('', 'Anything'), true);
+    assert.equal(matcherApplies('([', '(['), true, 'an invalid regex falls back to exact comparison');
+  });
+
+  test('default timeouts: ten minutes for commands, thirty seconds for prompt hooks, a short shared budget at exit', async () => {
+    // A hook slower than the old 60 s default is not practical to run here, so check the
+    // short budgets directly: a SessionEnd hook is cut off after about 1.5 s by default...
+    const started = Date.now();
+    const cut = await runner(on('SessionEnd', 'sleep 5; echo late')).run('SessionEnd', {});
+    assert.ok(Date.now() - started < 3500, `took ${Date.now() - started}ms`);
+    assert.ok(cut.messages.some((m) => /timed out/.test(m)));
+    // ...unless a hook asks for longer, which raises the budget for all of them.
+    const config: HooksConfig = { SessionEnd: [{ hooks: [{ type: 'command', command: 'sleep 2; echo done > finished.txt', timeout: 10 }] }] };
+    const dir = tempProject();
+    const patient = new HookRunner(() => config, { sessionId: 's', projectRoot: dir, cwd: () => dir });
+    await patient.run('SessionEnd', {});
+    assert.equal(fs.readFileSync(path.join(dir, 'finished.txt'), 'utf8'), 'done\n');
+  });
+
+  test('a PermissionRequest hook can approve or refuse in place of the user', async () => {
+    const allow = `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'`;
+    const deny = `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"not on Fridays"}}}'`;
+    assert.equal((await runner(on('PermissionRequest', allow)).run('PermissionRequest', {}, 'Bash')).permissionDecision, 'allow');
+    const refused = await runner(on('PermissionRequest', deny)).run('PermissionRequest', {}, 'Bash');
+    assert.equal(refused.permissionDecision, 'deny');
+    assert.equal(refused.reason, 'not on Fridays');
+    // Deny wins when hooks disagree, whatever the order.
+    assert.equal((await runner(on('PermissionRequest', allow, deny)).run('PermissionRequest', {}, 'Bash')).permissionDecision, 'deny');
+    assert.equal((await runner(on('PermissionRequest', deny, allow)).run('PermissionRequest', {}, 'Bash')).permissionDecision, 'deny');
   });
 });

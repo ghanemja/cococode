@@ -2,6 +2,7 @@
 // A tiny MCP server over stdio, used by test/mcp.test.ts.
 // It deliberately misbehaves in a few ways real servers do: it logs a
 // non-JSON line to stdout, paginates tools/list, and can crash on demand.
+// COCO_MOCK_NO_RESOURCES=1 makes it a server without the resources capability.
 import * as readline from 'node:readline';
 
 const TOOLS = [
@@ -39,11 +40,13 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' } } },
   },
   { name: 'dotted.name', description: 'A tool whose name needs sanitising', inputSchema: { type: 'object' } },
+  { name: 'list_roots', description: 'Ask the client for its roots and return them', inputSchema: { type: 'object' } },
 ];
 const PAGE_SIZE = 5;
 
 let cancelled = 0;
 let serverRequestId = 0;
+let clientCapabilities = {};
 const sleeping = new Map(); // request id -> timer
 const awaitingClient = new Map(); // server request id -> callback
 
@@ -105,7 +108,20 @@ function callTool(id, name, args) {
     case 'ping_client':
       return askClient('ping', (response) => reply(id, text(response.error ? 'ping failed' : 'pong received')));
     case 'ask_client':
-      return askClient('roots/list', (response) => reply(id, text(`client error ${response.error?.code}`)));
+      return askClient('sampling/createMessage', (response) => reply(id, text(`client error ${response.error?.code}`)));
+    case 'list_roots':
+      return askClient('roots/list', (response) =>
+        reply(
+          id,
+          text(
+            JSON.stringify({
+              advertised: clientCapabilities.roots !== undefined,
+              roots: response.result?.roots,
+              error: response.error?.code,
+            }),
+          ),
+        ),
+      );
     case 'env':
       return reply(id, text(process.env[String(args.name)] ?? '(unset)'));
     case 'dotted.name':
@@ -127,9 +143,12 @@ function handle(message) {
   const { id, method, params = {} } = message;
   switch (method) {
     case 'initialize':
+      clientCapabilities = params.capabilities ?? {};
       return reply(id, {
         protocolVersion: params.protocolVersion ?? '2025-06-18',
-        capabilities: { tools: { listChanged: true }, prompts: {}, resources: {} },
+        capabilities: process.env.COCO_MOCK_NO_RESOURCES
+          ? { tools: { listChanged: true }, prompts: {} }
+          : { tools: { listChanged: true }, prompts: {}, resources: {} },
         serverInfo: { name: 'mock-mcp', version: '1.2.3' },
         instructions: 'Mock server instructions.',
       });
@@ -178,6 +197,9 @@ function handle(message) {
         resources: [{ uri: 'mock://readme', name: 'readme', description: 'A readme', mimeType: 'text/plain' }],
       });
     case 'resources/read':
+      // Not listed: a resource large enough to need clamping.
+      if (params.uri === 'mock://big') return reply(id, { contents: [{ uri: params.uri, mimeType: 'text/plain', text: 'r'.repeat(50000) }] });
+      if (params.uri === 'mock://binary') return reply(id, { contents: [{ uri: params.uri, mimeType: 'image/png', blob: 'aGVsbG8=' }] });
       if (params.uri !== 'mock://readme') return fail(id, -32002, `Resource not found: ${params.uri}`);
       return reply(id, { contents: [{ uri: params.uri, mimeType: 'text/plain', text: 'mock readme contents' }] });
     default:

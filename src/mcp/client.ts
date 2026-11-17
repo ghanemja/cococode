@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { McpHttpConfig, McpServerConfig, McpStdioConfig } from './config.ts';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { MIN_SERVER_TIMEOUT_MS, type McpHttpConfig, type McpServerConfig, type McpStdioConfig } from './config.ts';
 
 /**
  * A small Model Context Protocol client: JSON-RPC 2.0 over stdio, Streamable
@@ -9,6 +11,13 @@ import type { McpHttpConfig, McpServerConfig, McpStdioConfig } from './config.ts
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
+/** Tool calls may run long: a local server gets 30 minutes, a remote one 5. */
+const DEFAULT_STDIO_TOOL_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_REMOTE_TOOL_TIMEOUT_MS = 5 * 60_000;
+/** setTimeout fires at once for anything larger. */
+const MAX_TIMER_MS = 2_147_483_647;
+/** JSON-RPC error code used for requests that ran out of time. */
+export const MCP_TIMEOUT_CODE = -32001;
 const STDERR_TAIL = 4096;
 
 type JsonRpcId = string | number;
@@ -91,13 +100,19 @@ export interface McpResourceContent {
 }
 
 export interface McpClientOptions {
-  /** Timeout for ordinary requests, including tool calls. Default 60s (or MCP_TOOL_TIMEOUT). */
+  /**
+   * Timeout for every request, tool calls included. Without it, MCP_TOOL_TIMEOUT applies; failing
+   * that, tool calls use the server's `timeout` or a transport default (30 min stdio, 5 min
+   * http/sse) and other requests use 60s.
+   */
   requestTimeoutMs?: number;
   /** Timeout for starting the transport and for `initialize`. Default 30s (or MCP_TIMEOUT). */
   connectTimeoutMs?: number;
   clientVersion?: string;
   /** Working directory for stdio servers that do not set their own. */
   cwd?: string;
+  /** Directories offered to the server through roots/list. None means the capability is not advertised. */
+  roots?: string[];
   /** Server notifications such as notifications/tools/list_changed. */
   onNotification?: (method: string, params: unknown) => void;
   /** Called once when an established connection is lost (not on an explicit close()). */
@@ -382,6 +397,7 @@ class HttpTransport implements Transport {
   async send(message: JsonRpcMessage, signal?: AbortSignal): Promise<void> {
     const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
     const requestId = message.method !== undefined && message.id !== undefined && message.id !== null ? message.id : undefined;
+    const sentSession = this.sessionId;
 
     let res: Response;
     try {
@@ -395,7 +411,10 @@ class HttpTransport implements Transport {
       if (isAbortError(err)) throw err;
       const cause = (err as { cause?: { message?: string; code?: string } }).cause;
       const why = cause?.code ?? cause?.message ?? (err as Error).message;
-      throw new McpError(`Could not reach ${this.config.url}: ${why}`);
+      const error = new McpError(`Could not reach ${this.config.url}: ${why}`);
+      // There is no socket to watch, so an unreachable server is how a dropped connection shows up.
+      this.onclose?.(error);
+      throw error;
     }
 
     const sid = res.headers.get('mcp-session-id');
@@ -405,7 +424,10 @@ class HttpTransport implements Transport {
       const body = await res.text().catch(() => '');
       const hint = res.status === 401 || res.status === 403 ? ' (authentication required; set a header in the server config)' : '';
       const detail = body.trim() ? `: ${body.trim().slice(0, 300)}` : '';
-      throw new McpError(`HTTP ${res.status} ${res.statusText}${hint}${detail}`.trim(), res.status);
+      const error = new McpError(`HTTP ${res.status} ${res.statusText}${hint}${detail}`.trim(), res.status);
+      // 404 for a session the server issued means it expired or the server restarted: a new handshake is needed.
+      if (res.status === 404 && sentSession) this.onclose?.(error);
+      throw error;
     }
 
     const type = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -600,13 +622,21 @@ export class McpClient {
   private readonly opts: McpClientOptions;
   private readonly requestTimeoutMs: number;
   private readonly connectTimeoutMs: number;
+  /** Timeout applied to tools/call: option, then MCP_TOOL_TIMEOUT, then the server's `timeout`, then the transport default. */
+  readonly toolTimeoutMs: number;
+  private readonly roots: { uri: string; name: string }[];
 
   constructor(name: string, config: McpServerConfig, opts: McpClientOptions = {}) {
     this.name = name;
     this.config = config;
     this.opts = opts;
-    this.requestTimeoutMs = opts.requestTimeoutMs ?? envTimeout('MCP_TOOL_TIMEOUT') ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    this.connectTimeoutMs = opts.connectTimeoutMs ?? envTimeout('MCP_TIMEOUT') ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    const fromEnv = envTimeout('MCP_TOOL_TIMEOUT');
+    this.requestTimeoutMs = clampTimer(opts.requestTimeoutMs ?? fromEnv ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    this.connectTimeoutMs = clampTimer(opts.connectTimeoutMs ?? envTimeout('MCP_TIMEOUT') ?? DEFAULT_CONNECT_TIMEOUT_MS);
+    const perServer = typeof config.timeout === 'number' && Number.isFinite(config.timeout) && config.timeout >= MIN_SERVER_TIMEOUT_MS ? config.timeout : undefined;
+    const transportDefault = 'url' in config ? DEFAULT_REMOTE_TOOL_TIMEOUT_MS : DEFAULT_STDIO_TOOL_TIMEOUT_MS;
+    this.toolTimeoutMs = clampTimer(opts.requestTimeoutMs ?? fromEnv ?? perServer ?? transportDefault);
+    this.roots = toRoots(opts.roots);
   }
 
   get connected(): boolean {
@@ -640,7 +670,8 @@ export class McpClient {
         'initialize',
         {
           protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
+          // listChanged is false: the project directory does not change during a session.
+          capabilities: this.roots.length ? { roots: { listChanged: false } } : {},
           clientInfo: { name: 'cococode', version: this.opts.clientVersion ?? '0.1.0' },
         },
         { timeoutMs: this.connectTimeoutMs },
@@ -699,7 +730,7 @@ export class McpClient {
       };
 
       const timer = setTimeout(
-        () => cancel(new McpError(`Request timed out after ${seconds(timeoutMs)}: ${method}`, -32001), 'timeout'),
+        () => cancel(new McpError(`Request timed out after ${seconds(timeoutMs)}: ${method}`, MCP_TIMEOUT_CODE), 'timeout'),
         timeoutMs,
       );
       const onAbort = () => cancel(abortError(), 'cancelled by user');
@@ -741,11 +772,11 @@ export class McpClient {
 
     if (message.method !== undefined) {
       if (message.id !== undefined && message.id !== null) {
-        // Server-initiated request. We only implement ping.
-        const reply: JsonRpcMessage =
-          message.method === 'ping'
-            ? { jsonrpc: '2.0', id: message.id, result: {} }
-            : { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } };
+        // Server-initiated request. We implement ping, and roots/list when roots were offered.
+        let reply: JsonRpcMessage;
+        if (message.method === 'ping') reply = { jsonrpc: '2.0', id: message.id, result: {} };
+        else if (message.method === 'roots/list' && this.roots.length) reply = { jsonrpc: '2.0', id: message.id, result: { roots: this.roots } };
+        else reply = { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } };
         void this.transport?.send(reply).catch(() => {});
       } else {
         try {
@@ -823,7 +854,7 @@ export class McpClient {
   }
 
   callTool(name: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<McpCallResult> {
-    return this.request<McpCallResult>('tools/call', { name, arguments: args ?? {} }, { signal });
+    return this.request<McpCallResult>('tools/call', { name, arguments: args ?? {} }, { signal, timeoutMs: this.toolTimeoutMs });
   }
 
   listPrompts(): Promise<McpPromptInfo[]> {
@@ -838,8 +869,8 @@ export class McpClient {
     return this.listOptional<McpResourceInfo>('resources', 'resources/list', 'resources');
   }
 
-  async readResource(uri: string): Promise<McpResourceContent[]> {
-    const result = await this.request<{ contents?: McpResourceContent[] }>('resources/read', { uri });
+  async readResource(uri: string, signal?: AbortSignal): Promise<McpResourceContent[]> {
+    const result = await this.request<{ contents?: McpResourceContent[] }>('resources/read', { uri }, { signal });
     return Array.isArray(result?.contents) ? result.contents : [];
   }
 
@@ -865,9 +896,28 @@ function seconds(ms: number): string {
   return ms >= 1000 ? `${Math.round(ms / 100) / 10}s` : `${ms}ms`;
 }
 
+function clampTimer(ms: number): number {
+  return Math.min(ms, MAX_TIMER_MS);
+}
+
+/** Directories as MCP roots (file:// URIs). A path that cannot be converted is left out. */
+function toRoots(dirs: string[] | undefined): { uri: string; name: string }[] {
+  const roots: { uri: string; name: string }[] = [];
+  for (const dir of dirs ?? []) {
+    if (typeof dir !== 'string' || !dir) continue;
+    try {
+      const abs = path.resolve(dir);
+      roots.push({ uri: pathToFileURL(abs).href, name: path.basename(abs) || abs });
+    } catch {
+      // not a usable path
+    }
+  }
+  return roots;
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new McpError(message, -32001)), ms);
+    const timer = setTimeout(() => reject(new McpError(message, MCP_TIMEOUT_CODE)), ms);
     promise.then(
       (value) => {
         clearTimeout(timer);

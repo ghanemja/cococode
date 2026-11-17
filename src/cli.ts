@@ -9,6 +9,7 @@ import type { McpScope, McpServerConfig } from './mcp/config.ts';
 import { addMcpServer, loadMcpServers, mcpConfigPath, removeMcpServer } from './mcp/config.ts';
 import { NO_SERVER_HELP, ProviderError, detectServers, rankModels } from './providers/index.ts';
 import { findSession, listSessions } from './session/store.ts';
+import { enableDebug } from './util/debug.ts';
 import { PERMISSION_MODES, type ImagePart, type PermissionMode } from './types.ts';
 import { c, formatBytes, formatCount, formatDuration, padEnd, plural, setColorEnabled } from './ui/ansi.ts';
 import type { OutputFormat } from './ui/print.ts';
@@ -42,6 +43,18 @@ Options:
       --system-prompt <text>       Replace the built-in system prompt
       --system-prompt-file <file>  Same, read from a file
       --append-system-prompt <text>    Add to the system prompt
+      --append-system-prompt-file <file>   Same, read from a file
+      --fallback-model <names>     Models to try, in order, when the main model fails (comma-separated)
+      --effort <level>             Reasoning level for models that take one (low, medium, high) or on/off
+  -n, --name <name>                Name the session so it can be resumed by name
+      --session-id <uuid>          Use a specific session id
+      --fork-session               With --resume/--continue: continue in a new session, leaving the original as it is
+      --strict-mcp-config          Use only the MCP servers given with --mcp-config
+      --bare                       Ignore memory files, hooks, MCP servers, skills, commands and custom agents
+      --disable-slash-commands     Treat input starting with / as plain text
+      --include-partial-messages   With stream-json: also emit text as it streams
+      --debug [categories]         Log requests, responses and tool calls to stderr (api, tools)
+      --debug-file <path>          Write that log to a file instead
       --output-format <fmt>        With -p: text (default), json or stream-json
       --max-turns <n>              With -p: stop after n model turns
       --image <files...>           With -p: attach images (vision models only)
@@ -74,11 +87,12 @@ interface ParsedArgs {
 const VALUE_FLAGS = new Set([
   'model', 'provider', 'base-url', 'api-key', 'context', 'max-output-tokens', 'tool-mode', 'permission-mode',
   'system-prompt', 'system-prompt-file', 'append-system-prompt', 'output-format', 'max-turns', 'settings',
-  'scope', 'transport', 'input-format',
+  'scope', 'transport', 'input-format', 'append-system-prompt-file', 'session-id', 'name', 'effort', 'fallback-model',
+  'debug-file',
 ]);
 const LIST_FLAGS = new Set(['allowedTools', 'allowed-tools', 'disallowedTools', 'disallowed-tools', 'tools', 'add-dir', 'mcp-config', 'env', 'header', 'image']);
 const OPTIONAL_VALUE_FLAGS = new Set(['resume']);
-const SHORT: Record<string, string> = { p: 'print', c: 'continue', r: 'resume', m: 'model', v: 'version', h: 'help', s: 'scope', e: 'env', t: 'transport', H: 'header' };
+const SHORT: Record<string, string> = { p: 'print', c: 'continue', r: 'resume', m: 'model', v: 'version', h: 'help', s: 'scope', e: 'env', t: 'transport', H: 'header', n: 'name' };
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const flags: ParsedArgs['flags'] = {};
@@ -120,6 +134,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     } else if (OPTIONAL_VALUE_FLAGS.has(name)) {
       if (inline !== undefined) flags[name] = inline;
       // Only something shaped like a session id is taken as one; anything else is the prompt.
+      // (A session name is given with an equals sign: --resume=my-feature.)
       else if (i + 1 < argv.length && /^[0-9a-f]{8}(-[0-9a-f-]*)?$/i.test(argv[i + 1]!)) flags[name] = argv[++i]!;
       else flags[name] = true;
     } else {
@@ -197,7 +212,12 @@ function settingsFromFlags(flags: ParsedArgs['flags']): Settings {
     s.toolMode = toolMode;
   }
   let mode = str(flags, 'permission-mode') as PermissionMode | undefined;
+  if ((mode as string) === 'manual') mode = 'default'; // Claude Code's name for the default mode
   if (mode && !PERMISSION_MODES.includes(mode)) fail(`--permission-mode must be one of: ${PERMISSION_MODES.join(', ')}.`);
+  const effort = str(flags, 'effort');
+  if (effort) s.thinking = effort === 'on' ? true : effort === 'off' || effort === 'none' ? false : effort;
+  const fallback = str(flags, 'fallback-model');
+  if (fallback) s.fallbackModel = fallback.split(',').map((m) => m.trim()).filter(Boolean);
   if (flags['dangerously-skip-permissions']) mode = 'bypassPermissions';
   if (mode) s.permissions = { defaultMode: mode };
   if (flags.verbose) s.verbose = true;
@@ -235,7 +255,8 @@ function cmdSessions(): number {
     return 0;
   }
   for (const s of sessions) {
-    process.stdout.write(`${c.cyan(s.id)}  ${c.dim(padEnd(`${formatDuration(Date.now() - s.modifiedAt.getTime())} ago`, 12))} ${s.firstPrompt.slice(0, 70)}\n`);
+    const label = s.title ? `${c.bold(s.title)} ${c.dim('·')} ${s.firstPrompt.slice(0, 50)}` : s.firstPrompt.slice(0, 70);
+    process.stdout.write(`${c.cyan(s.id)}  ${c.dim(padEnd(`${formatDuration(Date.now() - s.modifiedAt.getTime())} ago`, 12))} ${label}\n`);
   }
   process.stdout.write(c.dim(`\nResume one with: ${APP_NAME} --resume <id>\n`));
   return 0;
@@ -399,6 +420,24 @@ export async function main(argv: string[]): Promise<number> {
   const maxTurns = str(flags, 'max-turns') ? Number(str(flags, 'max-turns')) : undefined;
   if (maxTurns !== undefined && !(maxTurns > 0)) return fail('--max-turns must be a positive number.');
 
+  let appendSystemPrompt = str(flags, 'append-system-prompt');
+  const appendFile = str(flags, 'append-system-prompt-file');
+  if (appendFile) {
+    try {
+      appendSystemPrompt = [appendSystemPrompt, fs.readFileSync(appendFile, 'utf8')].filter(Boolean).join('\n\n');
+    } catch (err) {
+      return fail(`Could not read --append-system-prompt-file: ${(err as Error).message}`);
+    }
+  }
+  const sessionId = str(flags, 'session-id');
+  if (sessionId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+    return fail('--session-id must be a UUID, for example 123e4567-e89b-12d3-a456-426614174000.');
+  }
+  if (flags.debug || str(flags, 'debug-file')) {
+    const file = enableDebug(str(flags, 'debug-file'), typeof flags.debug === 'string' ? flags.debug : undefined);
+    if (file) process.stderr.write(c.dim(`Debug log: ${file}\n`));
+  }
+
   const options: ControllerOptions = {
     cwd: process.cwd(),
     overrides: settingsFromFlags(flags),
@@ -409,10 +448,14 @@ export async function main(argv: string[]): Promise<number> {
     addDirs: list(flags, 'add-dir'),
     mcpConfigFiles: list(flags, 'mcp-config'),
     systemPrompt,
-    appendSystemPrompt: str(flags, 'append-system-prompt'),
+    appendSystemPrompt,
     maxTurns,
     persist: !flags['no-session-persistence'],
     interactive,
+    sessionId,
+    sessionName: str(flags, 'name'),
+    bare: Boolean(flags.bare || flags['safe-mode']),
+    strictMcp: Boolean(flags['strict-mcp-config']),
   };
 
   let ctl: Controller;
@@ -424,16 +467,17 @@ export async function main(argv: string[]): Promise<number> {
 
   // Work out which earlier session, if any, to load.
   let resumed = false;
+  const fork = Boolean(flags['fork-session']);
   const resumeFlag = flags.resume;
   if (typeof resumeFlag === 'string') {
     const found = findSession(ctl.session.projectRoot, resumeFlag);
     if (!found) return fail(`No session matching "${resumeFlag}" in this directory. Run "${APP_NAME} sessions" to list them.`);
-    ctl.resume(found);
+    ctl.resume(found, { fork });
     resumed = true;
   } else if (flags.continue || (resumeFlag === true && !interactive)) {
     const latest = listSessions(ctl.session.projectRoot, 1)[0];
     if (latest) {
-      ctl.resume(latest);
+      ctl.resume(latest, { fork });
       resumed = true;
     } else if (flags.continue) {
       process.stderr.write(c.dim('No earlier conversation here; starting a new one.\n'));
@@ -475,7 +519,14 @@ export async function main(argv: string[]): Promise<number> {
     await ctl.runSessionHook('SessionStart', { source: resumed ? 'resume' : 'startup' }, resumed ? 'resume' : 'startup');
     const { runPrint } = await import('./ui/print.ts');
     const images = list(flags, 'image') ?? [];
-    const code = await runPrint(ctl, { prompt, format, verbose: Boolean(flags.verbose), images: images.length ? loadImages(images) : undefined });
+    const code = await runPrint(ctl, {
+      prompt,
+      format,
+      verbose: Boolean(flags.verbose),
+      images: images.length ? loadImages(images) : undefined,
+      includePartial: Boolean(flags['include-partial-messages']),
+      disableSlashCommands: Boolean(flags['disable-slash-commands']),
+    });
     await ctl.shutdown();
     return code;
   }

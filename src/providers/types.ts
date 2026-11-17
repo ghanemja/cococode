@@ -12,6 +12,8 @@ export interface ChatRequest {
   contextWindow?: number;
   thinking?: boolean | string;
   keepAlive?: string;
+  /** Ask for the whole reply in one response instead of a stream. Defaults to streaming. */
+  stream?: boolean;
 }
 
 export type StreamEvent =

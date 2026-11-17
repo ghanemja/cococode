@@ -1,16 +1,24 @@
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
+import type { AgentDefinition, SkillDefinition } from '../src/config/extensions.ts';
 import {
   BUILTIN_AGENTS,
   BUILTIN_STYLES,
   expandCommand,
+  expandSkill,
+  findAgent,
   loadAgents,
   loadCommands,
   loadOutputStyles,
   loadSkills,
+  modelVisibleSkills,
+  parseAgentsJson,
+  skillListing,
   splitArgs,
+  userInvocableSkills,
 } from '../src/config/extensions.ts';
 import { asList, asString, parseFrontmatter, stripBom } from '../src/util/frontmatter.ts';
 import { tempProject, writeFiles } from './helpers.ts';
@@ -271,6 +279,304 @@ describe('expandCommand', () => {
   test('leading and trailing whitespace of the result is trimmed', async () => {
     assert.equal(await expandCommand({ body: '\n\n  Hello $1  \n\n' }, 'x'), 'Hello x');
   });
+
+  test('$ARGUMENTS[N] counts from 0 while $1 is still the first argument', async () => {
+    const out = await expandCommand({ body: 'a=$ARGUMENTS[0] b=$ARGUMENTS[1] one=$1 two=$2 zero=$0' }, 'x "y z"');
+    assert.equal(out, 'a=x b=y z one=x two=y z zero=$0');
+  });
+
+  test('$ARGUMENTS[N] past the last argument expands to nothing', async () => {
+    assert.equal(await expandCommand({ body: '[$ARGUMENTS[2]] [$ARGUMENTS[0]] [$ARGUMENTS[10]]' }, 'only'), '[] [only] []');
+    // Without a number in the brackets it is $ARGUMENTS followed by text.
+    assert.equal(await expandCommand({ body: '$ARGUMENTS[x] $ARGUMENTS[]' }, 'only'), 'only[x] only[]');
+  });
+
+  test('session, project and command directory variables, in either spelling', async () => {
+    const file = path.join(path.sep, 'proj', '.coco', 'commands', 'git', 'sync.md');
+    const command = {
+      body: 'S=${COCO_SESSION_ID}|${CLAUDE_SESSION_ID} P=${COCO_PROJECT_DIR}|${CLAUDE_PROJECT_DIR} D=${COCO_SKILL_DIR}|${CLAUDE_SKILL_DIR}',
+      path: file,
+    };
+    const out = await expandCommand(command, '', undefined, { sessionId: 'sess-1', projectDir: '/proj' });
+    const dir = path.dirname(file);
+    assert.equal(out, `S=sess-1|sess-1 P=/proj|/proj D=${dir}|${dir}`);
+  });
+
+  test('variables with no value are left as typed', async () => {
+    const body = 'S=${CLAUDE_SESSION_ID} P=${COCO_PROJECT_DIR} D=${CLAUDE_SKILL_DIR} E=${CLAUDE_EFFORT} H=${HOME}';
+    assert.equal(await expandCommand({ body }, ''), body);
+    assert.equal(await expandCommand({ body }, '', undefined, { sessionId: '', projectDir: undefined }), body);
+    assert.equal(await expandCommand({ body: '${COCO_SESSION_ID} ${COCO_PROJECT_DIR}' }, '', undefined, { projectDir: '/p' }), '${COCO_SESSION_ID} /p');
+  });
+
+  test('a backslash keeps a placeholder as text', async () => {
+    const body = 'Costs \\$1.00, not $1. \\$ARGUMENTS, \\$ARGUMENTS[0] and \\${CLAUDE_SESSION_ID} stay.';
+    const out = await expandCommand({ body }, 'five', undefined, { sessionId: 's' });
+    assert.equal(out, 'Costs $1.00, not five. $ARGUMENTS, $ARGUMENTS[0] and ${CLAUDE_SESSION_ID} stay.');
+  });
+
+  test('a backslash that escapes nothing is left alone', async () => {
+    const body = 'echo \\$HOME \\$0 C:\\dir\\ \\n \\$';
+    assert.equal(await expandCommand({ body }, ''), body);
+  });
+
+  test('a fenced ! block runs as one script and is replaced by its output', async () => {
+    const seen: string[] = [];
+    const run = async (cmd: string) => {
+      seen.push(cmd);
+      return '\n  M src/a.ts\n?? b.ts\n\n';
+    };
+    const body = 'Changes:\n```!\ngit status --short\ngit log -1 --format=%s -- $1\n```\nReview them.';
+    // The first line of the output keeps its indentation; blank lines around it go.
+    assert.equal(await expandCommand({ body }, 'src', run), 'Changes:\n  M src/a.ts\n?? b.ts\nReview them.');
+    assert.deepEqual(seen, ['git status --short\ngit log -1 --format=%s -- src']);
+  });
+
+  test('a fenced block that may not or cannot run is marked', async () => {
+    const body = 'Versions:\n```!\nnode -v\nnpm -v\n```';
+    assert.equal(await expandCommand({ body }, ''), 'Versions:\n[command not run: node -v\nnpm -v]');
+    assert.equal(await expandCommand({ body }, '', async () => null), 'Versions:\n[command not permitted: node -v\nnpm -v]');
+  });
+
+  test('only a fence opened with ```! on a line of its own is a command', async () => {
+    const run = async () => 'RAN';
+    const bodies = [
+      '```bash\nls\n```',
+      '```\n!ls\n```',
+      '```!\nnever closed',
+      '```!\n\n```',
+      'text ```!\nls\n```',
+      '```! ls\nls\n```',
+      '````!\nls\n````',
+    ];
+    for (const body of bodies) assert.equal(await expandCommand({ body }, '', run), body);
+  });
+
+  test('indented blocks and CRLF line endings', async () => {
+    const run = async (cmd: string) => `<${cmd}>`;
+    assert.equal(await expandCommand({ body: '- step:\n  ```!\n  pwd\n  ```\n- next' }, '', run), '- step:\n  <  pwd>\n- next');
+    assert.equal(await expandCommand({ body: 'a\r\n```!\r\npwd\r\nls\r\n```\r\nb' }, '', run), 'a\r\n<pwd\nls>\r\nb');
+  });
+
+  test('inline and fenced commands in one body land in the right places', async () => {
+    const run = (cmd: string) => new Promise<string>((resolve) => setTimeout(() => resolve(cmd.toUpperCase()), cmd.startsWith('slow') ? 30 : 1));
+    const body = '!`fast`\n```!\nslow one\nslow two\n```\n!`fast` end';
+    assert.equal(await expandCommand({ body }, '', run), 'FAST\nSLOW ONE\nSLOW TWO\nFAST end');
+  });
+
+  test('a runner that throws marks the command instead of failing the expansion', async () => {
+    const run = async () => {
+      throw new Error('spawn failed');
+    };
+    assert.equal(await expandCommand({ body: 'Who: !`whoami`.' }, '', run), 'Who: [command failed: whoami: spawn failed].');
+  });
+
+  test('a fenced block that arrives through an argument is never run', async () => {
+    const seen: string[] = [];
+    const run = async (cmd: string) => {
+      seen.push(cmd);
+      return 'RAN';
+    };
+    const args = '```!\nrm -rf /\n```';
+    assert.equal(await expandCommand({ body: 'Notes:\n$ARGUMENTS\nEnd' }, args, run), `Notes:\n${args}\nEnd`);
+    assert.equal(await expandCommand({ body: 'Notes.' }, args, run), `Notes.\n\nARGUMENTS: ${args}`);
+    // Nor can an argument supply the body of a command the file only began.
+    assert.equal(await expandCommand({ body: 'Run !$1 now' }, '`whoami`', run), 'Run !`whoami` now');
+    assert.deepEqual(seen, []);
+  });
+
+  test('variables and escapes inside an argument are left as typed', async () => {
+    const args = '${CLAUDE_SESSION_ID} \\$1 $ARGUMENTS[0]';
+    assert.equal(await expandCommand({ body: 'Got: $ARGUMENTS' }, args, undefined, { sessionId: 'secret' }), `Got: ${args}`);
+  });
+
+  test('ARGUMENTS is appended only when no placeholder received the arguments', async () => {
+    // An escaped placeholder and a variable are not uses of the arguments.
+    assert.equal(await expandCommand({ body: 'Price is \\$1.' }, 'x'), 'Price is $1.\n\nARGUMENTS: x');
+    assert.equal(await expandCommand({ body: 'In ${COCO_PROJECT_DIR}.' }, 'x', undefined, { projectDir: '/p' }), 'In /p.\n\nARGUMENTS: x');
+    // A placeholder inside a command is a use.
+    assert.equal(await expandCommand({ body: 'Log: !`git log $1`' }, 'main', async (cmd) => cmd), 'Log: git log main');
+    assert.equal(await expandCommand({ body: 'Item: $ARGUMENTS[0]' }, 'x'), 'Item: x');
+    // A placeholder past the last argument received nothing, so what was typed is not lost.
+    assert.equal(await expandCommand({ body: 'Second: $2.' }, 'only'), 'Second: .\n\nARGUMENTS: only');
+    assert.equal(await expandCommand({ body: 'Second: $ARGUMENTS[1].' }, 'only'), 'Second: .\n\nARGUMENTS: only');
+  });
+});
+
+describe('expandSkill', () => {
+  test('$N counts from 0 in a skill and from 1 in a command file', async () => {
+    const body = 'first=$0 second=$1 third=$2';
+    assert.equal(await expandSkill({ body }, 'a "b c" d', {}), 'first=a second=b c third=d');
+    // The same text as a legacy command: $1 is the first argument and $0 is not a placeholder.
+    assert.equal(await expandCommand({ body }, 'a "b c" d'), 'first=$0 second=a third=b c');
+  });
+
+  test('$N is short for $ARGUMENTS[N], with any number of digits', async () => {
+    const args = 'a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11';
+    assert.equal(await expandSkill({ body: '$0|$ARGUMENTS[0]|$10|$ARGUMENTS[10]|$11|$ARGUMENTS[11]' }, args, {}), 'a0|a0|a10|a10|a11|a11');
+    // In a command file $10 is $1 followed by a zero, and $ARGUMENTS[N] counts from 0 all the same.
+    assert.equal(await expandCommand({ body: '$10|$ARGUMENTS[10]' }, args), 'a00|a10');
+  });
+
+  test('an index past the last argument expands to nothing', async () => {
+    assert.equal(await expandSkill({ body: '[$0] [$1] [$ARGUMENTS[1]] [$7] [$ARGUMENTS[99999999999999999999]]' }, 'only', {}), '[only] [] [] [] []');
+  });
+
+  test('$ARGUMENTS is everything that was typed, trimmed', async () => {
+    assert.equal(await expandSkill({ body: 'Fix $ARGUMENTS now. Again: $ARGUMENTS' }, '  "the bug"  in auth ', {}), 'Fix "the bug"  in auth now. Again: "the bug"  in auth');
+  });
+
+  test('the context is optional', async () => {
+    assert.equal(await expandSkill({ body: 'Hello $0' }, 'there'), 'Hello there');
+  });
+
+  test('named arguments map to positions in order', async () => {
+    const skill = { body: 'Fix issue $issue on branch $branch ($ARGUMENTS[0], $1).', argumentNames: ['issue', 'branch'] };
+    assert.equal(await expandSkill(skill, '42 "feat/login page"', {}), 'Fix issue 42 on branch feat/login page (42, feat/login page).');
+    assert.equal(await expandSkill(skill, '42', {}), 'Fix issue 42 on branch  (42, ).');
+    // Without the declaration the names are ordinary text.
+    assert.equal(await expandSkill({ body: 'Fix $issue' }, '42', {}), 'Fix $issue\n\nARGUMENTS: 42');
+  });
+
+  test('a name that is the start of another name', async () => {
+    const skill = { body: '$file|$filename|$file.$filename|$files|$file_name|$file-$filename-x|$filename2', argumentNames: ['file', 'filename'] };
+    assert.equal(await expandSkill(skill, 'F N', {}), 'F|N|F.N|$files|$file_name|F-N-x|$filename2');
+    // Whatever order they were declared in.
+    assert.equal(await expandSkill({ body: '$file $filename', argumentNames: ['filename', 'file'] }, 'N F', {}), 'F N');
+  });
+
+  test('names may hold hyphens and underscores', async () => {
+    const skill = { body: '$pr-number / $pr / $target_env / $pr-other', argumentNames: ['pr', 'pr-number', 'target_env'] };
+    assert.equal(await expandSkill(skill, 'A B C', {}), 'B / A / C / A-other');
+  });
+
+  test('names that cannot be placeholders are skipped but keep their position', async () => {
+    const skill = { body: 'x=$x y=$y', argumentNames: ['0', 'x', 'ARGUMENTS', 'y', 'x', 'has space', 'a.b'] };
+    assert.equal(await expandSkill(skill, 'a b c d e', {}), 'x=b y=d');
+  });
+
+  test('skill directory, session and project variables, in either spelling', async () => {
+    const skill = {
+      body: 'python ${CLAUDE_SKILL_DIR}/run.py; ${COCO_SKILL_DIR} ${CLAUDE_SESSION_ID} ${COCO_SESSION_ID} ${CLAUDE_PROJECT_DIR} ${COCO_PROJECT_DIR}',
+      baseDir: '/skills/pdf',
+    };
+    const out = await expandSkill(skill, '', { sessionId: 'abc123', projectDir: '/work/app' });
+    assert.equal(out, 'python /skills/pdf/run.py; /skills/pdf abc123 abc123 /work/app /work/app');
+  });
+
+  test('variables without a value are left untouched', async () => {
+    const body = '${CLAUDE_SKILL_DIR} ${COCO_SESSION_ID} ${CLAUDE_PROJECT_DIR} ${CLAUDE_EFFORT} ${claude_session_id} $CLAUDE_SESSION_ID ${COCO_SESSION_ID';
+    assert.equal(await expandSkill({ body }, '', {}), body);
+    assert.equal(await expandSkill({ body: '${COCO_SESSION_ID} ${COCO_PROJECT_DIR} ${COCO_SKILL_DIR}' }, '', { sessionId: 's1' }), 's1 ${COCO_PROJECT_DIR} ${COCO_SKILL_DIR}');
+  });
+
+  test('a backslash keeps a placeholder as text', async () => {
+    const skill = {
+      body: 'Costs \\$1.00 or \\$0.50; \\$ARGUMENTS, \\$ARGUMENTS[1], \\$name and \\${CLAUDE_SKILL_DIR} are text; $0 and $name are not.',
+      argumentNames: ['name'],
+      baseDir: '/s',
+    };
+    assert.equal(await expandSkill(skill, 'x', {}), 'Costs $1.00 or $0.50; $ARGUMENTS, $ARGUMENTS[1], $name and ${CLAUDE_SKILL_DIR} are text; x and x are not.');
+    // Which is why a price needs one: unescaped, $1 is the second argument.
+    assert.equal(await expandSkill({ body: 'Costs $1.00 today' }, '', {}), 'Costs .00 today');
+    // A backslash in front of anything else stays.
+    const other = 'echo \\$HOME \\$undeclared C:\\dir\\ \\n \\$';
+    assert.equal(await expandSkill({ body: other }, '', {}), other);
+  });
+
+  test('inline and fenced commands run with arguments and variables filled in', async () => {
+    const seen: string[] = [];
+    const runBash = async (cmd: string) => {
+      seen.push(cmd);
+      return `out(${cmd})\n`;
+    };
+    const skill = {
+      body: 'Diff: !`git diff $0`\n```!\npython ${COCO_SKILL_DIR}/scan.py $target\ngit log -1\n```\nDone.',
+      baseDir: '/skills/scan',
+      argumentNames: ['target'],
+    };
+    assert.equal(await expandSkill(skill, 'main', { runBash }), 'Diff: out(git diff main)\nout(python /skills/scan/scan.py main\ngit log -1)\nDone.');
+    assert.deepEqual(seen.sort(), ['git diff main', 'python /skills/scan/scan.py main\ngit log -1']);
+  });
+
+  test('commands that may not or cannot run are marked', async () => {
+    const skill = { body: 'A: !`whoami`\n```!\nid\nuname\n```' };
+    assert.equal(await expandSkill(skill, '', {}), 'A: [command not run: whoami]\n[command not run: id\nuname]');
+    assert.equal(await expandSkill(skill, '', { runBash: async () => null }), 'A: [command not permitted: whoami]\n[command not permitted: id\nuname]');
+    const failing = async () => {
+      throw new Error('spawn failed');
+    };
+    assert.equal(await expandSkill({ body: 'A: !`whoami`' }, '', { runBash: failing }), 'A: [command failed: whoami: spawn failed]');
+  });
+
+  test('text that arrives through an argument is never executed or expanded again', async () => {
+    const seen: string[] = [];
+    const runBash = async (cmd: string) => {
+      seen.push(cmd);
+      return 'RAN';
+    };
+    const ctx = { sessionId: 'sess', projectDir: '/proj', runBash };
+    const skill = { body: 'All: $ARGUMENTS\nFirst: $0\nNamed: $what', argumentNames: ['what'], baseDir: '/skill' };
+
+    // An inline command.
+    assert.equal(await expandSkill(skill, '!`cat ~/.ssh/id_rsa`', ctx), 'All: !`cat ~/.ssh/id_rsa`\nFirst: !`cat\nNamed: !`cat');
+    // A fenced block, on lines of its own.
+    const fenced = '```!\nrm -rf /\n```';
+    assert.equal(await expandSkill({ body: 'Notes:\n$ARGUMENTS\nEnd' }, fenced, ctx), `Notes:\n${fenced}\nEnd`);
+    // Appended arguments are not scanned either.
+    assert.equal(await expandSkill({ body: 'Explain.' }, '!`whoami`', ctx), 'Explain.\n\nARGUMENTS: !`whoami`');
+    assert.equal(await expandSkill({ body: 'Explain.' }, fenced, ctx), `Explain.\n\nARGUMENTS: ${fenced}`);
+    // An argument cannot complete a command the file only began.
+    assert.equal(await expandSkill({ body: 'Run !$0 now' }, '`whoami`', ctx), 'Run !`whoami` now');
+    assert.deepEqual(seen, []);
+
+    // Placeholders, variables and escapes inside an argument stay as typed.
+    const tricky = '$0 $1 $what $ARGUMENTS $ARGUMENTS[0] ${CLAUDE_SESSION_ID} ${COCO_SKILL_DIR} \\$0';
+    assert.equal(await expandSkill({ body: 'Got: $ARGUMENTS', argumentNames: ['what'], baseDir: '/skill' }, tricky, ctx), `Got: ${tricky}`);
+    assert.equal(await expandSkill({ body: 'Got: $what', argumentNames: ['what'] }, '"$ARGUMENTS ${COCO_SESSION_ID}" tail', ctx), 'Got: $ARGUMENTS ${COCO_SESSION_ID}');
+    assert.equal(await expandSkill({ body: 'Got.', baseDir: '/skill' }, tricky, ctx), `Got.\n\nARGUMENTS: ${tricky}`);
+  });
+
+  test('an argument used inside a command from the file reaches the runner, which decides', async () => {
+    const seen: string[] = [];
+    const runBash = async (cmd: string) => {
+      seen.push(cmd);
+      return /^echo [a-z]+$/.test(cmd) ? 'ok' : null;
+    };
+    assert.equal(await expandSkill({ body: 'Say: !`echo $0`' }, 'hello', { runBash }), 'Say: ok');
+    assert.equal(await expandSkill({ body: 'Say: !`echo $0`' }, '"a; rm -rf /"', { runBash }), 'Say: [command not permitted: echo a; rm -rf /]');
+    assert.deepEqual(seen, ['echo hello', 'echo a; rm -rf /']);
+  });
+
+  test('command output and variable values are not expanded again', async () => {
+    const seen: string[] = [];
+    const runBash = async (cmd: string) => {
+      seen.push(cmd);
+      return '$0 $ARGUMENTS !`second` ${COCO_SESSION_ID}\n```!\nthird\n```';
+    };
+    const out = await expandSkill({ body: '!`first`\n${COCO_SESSION_ID} | $0' }, 'arg', { sessionId: '$0 !`fourth`', runBash });
+    assert.equal(out, '$0 $ARGUMENTS !`second` ${COCO_SESSION_ID}\n```!\nthird\n```\n$0 !`fourth` | arg');
+    assert.deepEqual(seen, ['first']);
+  });
+
+  test('ARGUMENTS is appended only when no placeholder received the arguments', async () => {
+    // Nothing in the body refers to the arguments.
+    assert.equal(await expandSkill({ body: 'Summarize the changes.\n' }, 'since monday', {}), 'Summarize the changes.\n\nARGUMENTS: since monday');
+    // Variables, escapes and commands are not argument placeholders.
+    const noUse = { body: 'In ${COCO_PROJECT_DIR}: \\$0 !`date`' };
+    assert.equal(await expandSkill(noUse, 'x', { projectDir: '/p', runBash: async () => 'today' }), 'In /p: $0 today\n\nARGUMENTS: x');
+    // Any placeholder that received something counts, also inside a command.
+    for (const placeholder of ['$ARGUMENTS', '$0', '$ARGUMENTS[0]', '$first', '!`echo $0`', '```!\necho $first\n```']) {
+      const out = await expandSkill({ body: `Do:\n${placeholder}`, argumentNames: ['first'] }, 'x', { runBash: async (cmd) => cmd });
+      assert.ok(!out.includes('ARGUMENTS:'), `${placeholder} -> ${out}`);
+    }
+    // A placeholder past the last argument received nothing, so what was typed is not lost.
+    assert.equal(await expandSkill({ body: 'Second: $1.' }, 'only', {}), 'Second: .\n\nARGUMENTS: only');
+    assert.equal(await expandSkill({ body: 'Second: $second.', argumentNames: ['first', 'second'] }, 'only', {}), 'Second: .\n\nARGUMENTS: only');
+    // No arguments, nothing to append.
+    assert.equal(await expandSkill({ body: 'Summarize.' }, '  ', {}), 'Summarize.');
+    assert.equal(await expandSkill({ body: 'Do $0 $ARGUMENTS' }, '', {}), 'Do');
+  });
 });
 
 describe('extension loading', () => {
@@ -376,6 +682,29 @@ describe('extension loading', () => {
     test('no command directories at all', () => {
       assert.deepEqual(loadCommands(root, true), []);
     });
+
+    test('an unquoted bracketed hint, space-separated rules and Claude model aliases', () => {
+      writeFiles(root, {
+        '.claude/commands/pr.md': '---\nargument-hint: [pr-number] [priority]\nallowed-tools: Bash(git add *) Bash(git commit *)\nmodel: sonnet\n---\nReview PR $1.',
+        '.claude/commands/commit.md': '---\nargument-hint: [message]\nallowed-tools:\n  - Bash(git commit *)\n  - Read\nmodel: llama3.3\n---\nCommit with $ARGUMENTS.',
+        '.claude/commands/plain.md': '---\nargument-hint: <file> <format>\n---\nConvert.',
+      });
+      const byName = Object.fromEntries(loadCommands(root, true).map((c) => [c.name, c]));
+      assert.equal(byName.pr!.argumentHint, '[pr-number] [priority]');
+      assert.deepEqual(byName.pr!.allowedTools, ['Bash(git add *)', 'Bash(git commit *)']);
+      assert.equal(byName.pr!.model, undefined);
+      assert.equal(byName.commit!.argumentHint, '[message]');
+      assert.deepEqual(byName.commit!.allowedTools, ['Bash(git commit *)', 'Read']);
+      assert.equal(byName.commit!.model, 'llama3.3');
+      assert.equal(byName.plain!.argumentHint, '<file> <format>');
+    });
+
+    test('a loaded command expands the directory it lives in', async () => {
+      writeFiles(root, { '.coco/commands/tools/lint.md': 'Run !`sh ${COCO_SKILL_DIR}/lint.sh $1` in ${CLAUDE_PROJECT_DIR}.' });
+      const [command] = loadCommands(root, true);
+      const out = await expandCommand(command!, 'src', async (cmd) => `<${cmd}>`, { projectDir: root });
+      assert.equal(out, `Run <sh ${path.join(root, '.coco', 'commands', 'tools')}/lint.sh src> in ${root}.`);
+    });
   });
 
   describe('loadAgents', () => {
@@ -440,18 +769,172 @@ describe('extension loading', () => {
       assert.equal(agents.find((a) => a.name === 'explore')!.source, 'builtin');
     });
 
-    test('project beats user; nested directories are not scanned', () => {
+    // Changed from "nested directories are not scanned": Claude Code scans agents/ subfolders recursively.
+    test('project beats user; nested directories are scanned', () => {
       writeFiles(root, {
         '.coco/agents/dup.md': 'project',
         '.coco-home/agents/dup.md': 'user',
         'home/.claude/agents/mine.md': 'from claude home',
-        '.coco/agents/nested/deep.md': 'ignored',
+        '.coco/agents/nested/deep.md': 'found',
       });
       const byName = Object.fromEntries(loadAgents(root, true).map((a) => [a.name, a]));
       assert.equal(byName.dup!.prompt, 'project');
       assert.equal(byName.mine!.source, 'user');
-      assert.equal(byName.deep, undefined);
+      assert.equal(byName.deep!.prompt, 'found');
       assert.equal(Object.fromEntries(loadAgents(root, false).map((a) => [a.name, a])).mine, undefined);
+    });
+
+    test('every documented field; the ones coco does not use are ignored', () => {
+      writeFiles(root, {
+        '.claude/agents/reviewer.md': [
+          '---',
+          'name: code-reviewer',
+          'description: Reviews code for quality',
+          'tools: Read, Grep, Bash(git diff *)',
+          'disallowedTools: Write, Edit',
+          'model: qwen3-coder:30b',
+          'permissionMode: acceptEdits',
+          'maxTurns: 12',
+          'skills:',
+          '  - api-conventions',
+          '  - error-handling',
+          'mcpServers:',
+          '  - github',
+          'hooks:',
+          '  PreToolUse:',
+          '    - matcher: "Bash"',
+          '      hooks:',
+          '        - type: command',
+          'memory: project',
+          'background: true',
+          'omitClaudeMd: true',
+          'effort: high',
+          'isolation: worktree',
+          'color: blue',
+          'initialPrompt: Review the staged changes.',
+          '---',
+          'You are a code reviewer.',
+          '',
+        ].join('\n'),
+      });
+      assert.deepEqual(findAgent(loadAgents(root, true), 'code-reviewer'), {
+        name: 'code-reviewer',
+        description: 'Reviews code for quality',
+        tools: ['Read', 'Grep', 'Bash(git diff *)'],
+        disallowedTools: ['Write', 'Edit'],
+        model: 'qwen3-coder:30b',
+        permissionMode: 'acceptEdits',
+        maxTurns: 12,
+        skills: ['api-conventions', 'error-handling'],
+        omitMemory: true,
+        effort: 'high',
+        initialPrompt: 'Review the staged changes.',
+        background: true,
+        color: 'blue',
+        prompt: 'You are a code reviewer.',
+        source: 'project',
+        path: path.join(root, '.claude', 'agents', 'reviewer.md'),
+      });
+    });
+
+    test('list fields as lists or comma strings; values that make no sense are dropped', () => {
+      writeFiles(root, {
+        '.coco/agents/a.md': '---\ntools: [Read, Grep]\ndisallowedTools:\n  - Write\n  - Edit\nskills: one, two\nmaxTurns: "7"\nomitClaudeMd: false\nbackground: false\ninitialPrompt: |\n  Line one\n  Line two\n---\nA',
+        '.coco/agents/b.md': '---\nmaxTurns: 0\nmodel: fable\nomitClaudeMd: sometimes\nskills: [solo]\ndisallowedTools: Bash\n---\nB',
+        '.coco/agents/c.md': '---\nmaxTurns: 2.5\nmodel: Fable\ncolor:\n---\nC',
+        '.coco/agents/d.md': '---\nmaxTurns: -3\nmodel: opus[1m]\n---\nD',
+      });
+      const byName = Object.fromEntries(loadAgents(root, true).map((a) => [a.name, a]));
+      assert.deepEqual(byName.a!.tools, ['Read', 'Grep']);
+      assert.deepEqual(byName.a!.disallowedTools, ['Write', 'Edit']);
+      assert.deepEqual(byName.a!.skills, ['one', 'two']);
+      assert.equal(byName.a!.maxTurns, 7);
+      assert.equal(byName.a!.omitMemory, false);
+      assert.equal(byName.a!.background, false);
+      assert.equal(byName.a!.initialPrompt, 'Line one\nLine two');
+      assert.deepEqual(byName.b, { name: 'b', description: '', skills: ['solo'], disallowedTools: ['Bash'], prompt: 'B', source: 'project', path: path.join(root, '.coco', 'agents', 'b.md') });
+      assert.deepEqual(Object.keys(byName.c!).sort(), ['description', 'name', 'path', 'prompt', 'source']);
+      assert.deepEqual(Object.keys(byName.d!).sort(), ['description', 'name', 'path', 'prompt', 'source']);
+    });
+
+    test('subfolders are scanned four levels deep and the name alone identifies an agent', () => {
+      writeFiles(root, {
+        '.coco/agents/review/security.md': '---\ndescription: Security review\n---\nproject security',
+        '.coco/agents/a/b/c/d/four.md': 'four levels down',
+        '.coco/agents/a/b/c/d/e/five.md': 'five levels down',
+        '.coco/agents/team/renamed.md': '---\nname: lead\n---\nnamed by its front matter',
+        '.coco/agents/team/notes.txt': 'not an agent',
+        '.coco-home/agents/other/place/security.md': 'user security',
+        '.coco-home/agents/deep/mine.md': 'user mine',
+        'home/.claude/agents/x/y/claude-user.md': 'claude user',
+      });
+      const agents = loadAgents(root, true);
+      const byName = Object.fromEntries(agents.map((a) => [a.name, a]));
+      // The same name in a project subfolder and in a different user subfolder: the project wins.
+      assert.equal(agents.filter((a) => a.name === 'security').length, 1);
+      assert.equal(byName.security!.prompt, 'project security');
+      assert.equal(byName.security!.source, 'project');
+      assert.equal(byName.security!.path, path.join(root, '.coco', 'agents', 'review', 'security.md'));
+      // Folders do not become part of the name.
+      assert.equal(byName['review:security'], undefined);
+      assert.equal(byName.four!.prompt, 'four levels down');
+      assert.equal(byName.five, undefined);
+      assert.equal(byName.lead!.prompt, 'named by its front matter');
+      assert.equal(byName.renamed, undefined);
+      assert.equal(byName.notes, undefined);
+      assert.equal(byName.mine!.source, 'user');
+      assert.equal(byName['claude-user']!.source, 'user');
+      assert.equal(Object.fromEntries(loadAgents(root, false).map((a) => [a.name, a]))['claude-user'], undefined);
+    });
+
+    test('within one directory the file nearest the top wins', () => {
+      writeFiles(root, {
+        '.coco/agents/a/dup.md': 'nested a',
+        '.coco/agents/dup.md': 'top',
+        '.coco/agents/z/dup.md': 'nested z',
+        '.coco/agents/m/only.md': 'nested m',
+        '.coco/agents/b/c/only.md': 'nested b/c',
+      });
+      const byName = Object.fromEntries(loadAgents(root, true).map((a) => [a.name, a.prompt]));
+      assert.equal(byName.dup, 'top');
+      assert.equal(byName.only, 'nested m');
+    });
+
+    test('names are compared without regard to case', () => {
+      writeFiles(root, {
+        '.claude/agents/Explore.md': '---\nname: Explore\ndescription: Mine\n---\nCustom explore.',
+        '.coco/agents/reviewer.md': 'project reviewer',
+        '.coco-home/agents/REVIEWER.md': 'user reviewer',
+      });
+      const agents = loadAgents(root, true);
+      const explore = agents.filter((a) => a.name.toLowerCase() === 'explore');
+      assert.deepEqual(explore.map((a) => [a.name, a.source, a.prompt]), [['Explore', 'project', 'Custom explore.']]);
+      const reviewer = agents.filter((a) => a.name.toLowerCase() === 'reviewer');
+      assert.deepEqual(reviewer.map((a) => [a.name, a.prompt]), [['reviewer', 'project reviewer']]);
+      assert.equal(findAgent(agents, 'explore')!.prompt, 'Custom explore.');
+      assert.equal(findAgent(agents, 'plan')!.source, 'builtin');
+    });
+
+    test('session agents are merged in ahead of files and built-ins', () => {
+      writeFiles(root, { '.coco/agents/reviewer.md': 'project reviewer', '.coco/agents/tester.md': 'project tester' });
+      const session = parseAgentsJson('{"Reviewer": {"prompt": "session reviewer"}, "plan": {"description": "My planner", "prompt": "session plan"}}');
+      assert.equal(session.error, undefined);
+      const agents = loadAgents(root, true, session.agents);
+      assert.deepEqual(
+        agents.map((a) => `${a.name}:${a.source}`),
+        ['Reviewer:flag', 'plan:flag', 'tester:project', 'general-purpose:builtin', 'explore:builtin'],
+      );
+      assert.equal(findAgent(agents, 'reviewer')!.prompt, 'session reviewer');
+      assert.equal(findAgent(agents, 'Plan')!.prompt, 'session plan');
+      // Without them, nothing changes.
+      assert.equal(findAgent(loadAgents(root, true), 'reviewer')!.prompt, 'project reviewer');
+      assert.deepEqual(loadAgents(root, true, []), loadAgents(root, true));
+    });
+
+    test('an unreadable agents directory is not an error', () => {
+      writeFiles(root, { '.coco/agents': 'a file where a directory should be', '.claude/agents/ok.md': 'fine' });
+      const agents = loadAgents(root, true);
+      assert.equal(findAgent(agents, 'ok')!.prompt, 'fine');
     });
   });
 
@@ -496,6 +979,158 @@ describe('extension loading', () => {
         [['linked', 'shared']],
       );
     });
+
+    test('every documented field in its plain form; unknown fields are ignored', () => {
+      writeFiles(root, {
+        '.claude/skills/fix-issue/SKILL.md': [
+          '---',
+          'name: fix-issue',
+          'description: Fix a GitHub issue',
+          'when_to_use: When the user mentions an issue number',
+          'argument-hint: [issue] [branch]',
+          'arguments: issue branch',
+          'disable-model-invocation: true',
+          'user-invocable: false',
+          'allowed-tools: Bash(gh issue view *) Bash(git commit *) Read',
+          'disallowed-tools: WebFetch, WebSearch',
+          'model: qwen3-coder:30b',
+          'effort: high',
+          'context: fork',
+          'agent: Explore',
+          'background: true',
+          'hooks:',
+          '  PreToolUse:',
+          '    - matcher: "Bash"',
+          '      hooks:',
+          '        - type: command',
+          '          command: "./check.sh"',
+          'paths: src/**/*.{ts,tsx}, docs/**',
+          'shell: bash',
+          'metadata:',
+          '  author: someone',
+          '  version: "1.0"',
+          'license: MIT',
+          'compatibility: needs the gh CLI',
+          'made-up-field: whatever',
+          '---',
+          'Fix issue $issue on $branch.',
+          '',
+        ].join('\n'),
+      });
+      assert.deepEqual(loadSkills(root, true), [
+        {
+          name: 'fix-issue',
+          description: 'Fix a GitHub issue',
+          whenToUse: 'When the user mentions an issue number',
+          argumentHint: '[issue] [branch]',
+          argumentNames: ['issue', 'branch'],
+          disableModelInvocation: true,
+          userInvocable: false,
+          allowedTools: ['Bash(gh issue view *)', 'Bash(git commit *)', 'Read'],
+          disallowedTools: ['WebFetch', 'WebSearch'],
+          model: 'qwen3-coder:30b',
+          effort: 'high',
+          fork: true,
+          agent: 'Explore',
+          paths: ['src/**/*.{ts,tsx}', 'docs/**'],
+          baseDir: path.join(root, '.claude', 'skills', 'fix-issue'),
+          body: 'Fix issue $issue on $branch.\n',
+          source: 'project',
+        },
+      ]);
+    });
+
+    test('list fields written as YAML lists', () => {
+      writeFiles(root, {
+        '.coco/skills/block/SKILL.md':
+          '---\narguments:\n  - src\n  - dest\nallowed-tools:\n  - Bash(git add *)\n  - "Bash(npm run test:*)"\ndisallowed-tools:\n  - Write\npaths:\n  - "src/**"\n  - test/**\nargument-hint: [src]\n---\nBody',
+        '.coco/skills/inline/SKILL.md': '---\narguments: [src, dest]\nallowed-tools: [Read, "Bash(echo a, b)"]\ndisallowed-tools: [Write, Edit]\npaths: [lib/**, "*.md"]\n---\nBody',
+        '.coco/skills/commas/SKILL.md': '---\narguments: src, dest\nallowed-tools: Read, Bash(echo a, b)\ndisallowed-tools: Write\npaths: lib/**\nargument-hint: <src> <dest>\n---\nBody',
+      });
+      const byName = Object.fromEntries(loadSkills(root, true).map((s) => [s.name, s]));
+      assert.deepEqual(byName.block!.argumentNames, ['src', 'dest']);
+      assert.deepEqual(byName.block!.allowedTools, ['Bash(git add *)', 'Bash(npm run test:*)']);
+      assert.deepEqual(byName.block!.disallowedTools, ['Write']);
+      assert.deepEqual(byName.block!.paths, ['src/**', 'test/**']);
+      assert.equal(byName.block!.argumentHint, '[src]');
+      assert.deepEqual(byName.inline!.argumentNames, ['src', 'dest']);
+      assert.deepEqual(byName.inline!.allowedTools, ['Read', 'Bash(echo a, b)']);
+      assert.deepEqual(byName.inline!.disallowedTools, ['Write', 'Edit']);
+      assert.deepEqual(byName.inline!.paths, ['lib/**', '*.md']);
+      assert.deepEqual(byName.commas!.argumentNames, ['src', 'dest']);
+      assert.deepEqual(byName.commas!.allowedTools, ['Read', 'Bash(echo a, b)']);
+      assert.deepEqual(byName.commas!.disallowedTools, ['Write']);
+      assert.deepEqual(byName.commas!.paths, ['lib/**']);
+      assert.equal(byName.commas!.argumentHint, '<src> <dest>');
+    });
+
+    test('defaults: both the user and the model may start it, in the conversation', () => {
+      writeFiles(root, { '.coco/skills/plain/SKILL.md': '---\ndescription: Plain\n---\nBody' });
+      assert.deepEqual(loadSkills(root, true), [
+        {
+          name: 'plain',
+          description: 'Plain',
+          disableModelInvocation: false,
+          userInvocable: true,
+          fork: false,
+          baseDir: path.join(root, '.coco', 'skills', 'plain'),
+          body: 'Body',
+          source: 'project',
+        },
+      ]);
+    });
+
+    test('booleans, context and model values are read leniently', () => {
+      writeFiles(root, {
+        '.claude/skills/a/SKILL.md': '---\nmodel: sonnet\ncontext: Fork\nuser-invocable: "false"\ndisable-model-invocation: yes\n---\nA',
+        '.claude/skills/b/SKILL.md': '---\nmodel: inherit\ncontext: inline\nuser-invocable: maybe\ndisable-model-invocation: false\neffort:\nagent:\n---\nB',
+        '.claude/skills/c/SKILL.md': '---\nmodel: fable\nuser-invocable: true\n---\nC',
+        '.claude/skills/d/SKILL.md': '---\nmodel: mistral-small\n---\nD',
+      });
+      const byName = Object.fromEntries(loadSkills(root, true).map((s) => [s.name, s]));
+      assert.deepEqual(
+        [byName.a!.model, byName.a!.fork, byName.a!.userInvocable, byName.a!.disableModelInvocation],
+        [undefined, true, false, true],
+      );
+      assert.deepEqual(
+        [byName.b!.model, byName.b!.fork, byName.b!.userInvocable, byName.b!.disableModelInvocation, byName.b!.effort, byName.b!.agent],
+        [undefined, false, true, false, undefined, undefined],
+      );
+      assert.equal(byName.c!.model, undefined);
+      assert.equal(byName.d!.model, 'mistral-small');
+    });
+
+    test('field names are also accepted with underscores or in camel case', () => {
+      writeFiles(root, {
+        '.coco/skills/alt/SKILL.md': '---\nwhenToUse: On request\nallowed_tools: Read\nargumentHint: <x>\ndisableModelInvocation: true\nuser_invocable: false\n---\nBody',
+      });
+      const [skill] = loadSkills(root, true);
+      assert.equal(skill!.whenToUse, 'On request');
+      assert.deepEqual(skill!.allowedTools, ['Read']);
+      assert.equal(skill!.argumentHint, '<x>');
+      assert.equal(skill!.disableModelInvocation, true);
+      assert.equal(skill!.userInvocable, false);
+    });
+
+    test('who may start a skill, from its front matter', () => {
+      writeFiles(root, {
+        '.coco/skills/both/SKILL.md': '---\ndescription: Both\n---\nBody',
+        '.coco/skills/model-only/SKILL.md': '---\ndescription: Background knowledge\nuser-invocable: false\n---\nBody',
+        '.coco/skills/user-only/SKILL.md': '---\ndescription: Deploy\ndisable-model-invocation: true\n---\nBody',
+      });
+      const skills = loadSkills(root, true);
+      assert.deepEqual(modelVisibleSkills(skills).map((s) => s.name), ['both', 'model-only']);
+      assert.deepEqual(userInvocableSkills(skills).map((s) => s.name), ['both', 'user-only']);
+    });
+
+    test('a loaded skill expands its own directory, names and 0-based arguments', async () => {
+      writeFiles(root, {
+        '.coco/skills/migrate/SKILL.md': '---\narguments: [component, from, to]\n---\nMigrate $component from $from to $to ($0, $1, $2).\nHelper: ${COCO_SKILL_DIR}/migrate.sh\n',
+      });
+      const [skill] = loadSkills(root, true);
+      const out = await expandSkill(skill!, 'SearchBar React Vue', {});
+      assert.equal(out, `Migrate SearchBar from React to Vue (SearchBar, React, Vue).\nHelper: ${path.join(root, '.coco', 'skills', 'migrate')}/migrate.sh`);
+    });
   });
 
   describe('loadOutputStyles', () => {
@@ -524,5 +1159,270 @@ describe('extension loading', () => {
       assert.equal(style[0]!.prompt, 'My own explanatory style.');
       assert.equal(style[0]!.source, 'user');
     });
+  });
+});
+
+describe('skill visibility and listing', () => {
+  const skill = (over: Partial<SkillDefinition>): SkillDefinition => ({
+    name: 'x',
+    description: '',
+    disableModelInvocation: false,
+    userInvocable: true,
+    fork: false,
+    baseDir: '/skills/x',
+    body: '',
+    source: 'project',
+    ...over,
+  });
+  const ellipsis = String.fromCodePoint(0x2026);
+
+  test('modelVisibleSkills drops disable-model-invocation; userInvocableSkills drops user-invocable: false', () => {
+    const skills = [
+      skill({ name: 'both' }),
+      skill({ name: 'user-only', disableModelInvocation: true }),
+      skill({ name: 'model-only', userInvocable: false }),
+      skill({ name: 'neither', disableModelInvocation: true, userInvocable: false }),
+    ];
+    assert.deepEqual(modelVisibleSkills(skills).map((s) => s.name), ['both', 'model-only']);
+    assert.deepEqual(userInvocableSkills(skills).map((s) => s.name), ['both', 'user-only']);
+    assert.deepEqual(modelVisibleSkills([]), []);
+    assert.deepEqual(userInvocableSkills([]), []);
+    // The input is not modified.
+    assert.equal(skills.length, 4);
+  });
+
+  test('skillListing is the description, then when_to_use, on one line', () => {
+    assert.equal(skillListing({ description: 'Deploy the app' }), 'Deploy the app');
+    assert.equal(skillListing({ description: 'Deploy the app', whenToUse: 'Use when the user says ship it' }), 'Deploy the app - Use when the user says ship it');
+    assert.equal(skillListing({ description: '', whenToUse: 'Only this' }), 'Only this');
+    assert.equal(skillListing({ description: 'Line one\n  line two\n\nline three', whenToUse: ' spaced\tout ' }), 'Line one line two line three - spaced out');
+    assert.equal(skillListing(skill({ description: 'From a definition', whenToUse: 'when asked' })), 'From a definition - when asked');
+  });
+
+  test('skillListing falls back to the first line of the body', () => {
+    assert.equal(skillListing({ description: '', body: '\n# Release steps\n\nMore text.\n' }), 'Release steps');
+    assert.equal(skillListing({ description: 'Given', body: '# Heading' }), 'Given');
+    assert.equal(skillListing({ description: '' }), '');
+    assert.equal(skillListing({ description: '   ', body: '  ' }), '');
+  });
+
+  test('skillListing is cut to maxChars with an ellipsis', () => {
+    const long = skillListing({ description: 'd'.repeat(200), whenToUse: 'w'.repeat(200) });
+    assert.equal(long, `${'d'.repeat(200)} - ${'w'.repeat(46)}${ellipsis}`);
+    assert.equal(long.length, 250);
+    // Exactly at the limit nothing is cut.
+    assert.equal(skillListing({ description: 'x'.repeat(250) }), 'x'.repeat(250));
+    assert.equal(skillListing({ description: 'x'.repeat(251) }), 'x'.repeat(249) + ellipsis);
+    assert.equal(skillListing({ description: 'hello wonderful world' }, 12), `hello wonde${ellipsis}`);
+    assert.equal(skillListing({ description: 'hello wonderful world' }, 21), 'hello wonderful world');
+    // No space is left in front of the ellipsis.
+    assert.equal(skillListing({ description: 'hello wonderful world' }, 7), `hello${ellipsis}`);
+    assert.equal(skillListing({ description: 'hello' }, 1), ellipsis);
+    assert.equal(skillListing({ description: 'hello' }, 0), '');
+    // A character outside the basic plane is not cut in half.
+    const emoji = String.fromCodePoint(0x1f600);
+    assert.equal(skillListing({ description: `ab${emoji}cd` }, 4), `ab${ellipsis}`);
+    assert.equal(skillListing({ description: `ab${emoji}cd` }, 5), `ab${emoji}${ellipsis}`);
+  });
+});
+
+describe('findAgent', () => {
+  const agent = (name: string, prompt = name): AgentDefinition => ({ name, description: '', prompt, source: 'project' });
+
+  test('the built-ins keep their names and answer to the ones Claude Code uses', () => {
+    assert.deepEqual(BUILTIN_AGENTS.map((a) => a.name), ['general-purpose', 'explore', 'plan']);
+    assert.equal(findAgent(BUILTIN_AGENTS, 'Explore')!.name, 'explore');
+    assert.equal(findAgent(BUILTIN_AGENTS, 'Plan')!.name, 'plan');
+    assert.equal(findAgent(BUILTIN_AGENTS, 'general-purpose')!.name, 'general-purpose');
+    assert.equal(findAgent(BUILTIN_AGENTS, 'GENERAL-PURPOSE')!.name, 'general-purpose');
+    assert.equal(findAgent(BUILTIN_AGENTS, 'explore'), BUILTIN_AGENTS[1]);
+    assert.equal(findAgent(BUILTIN_AGENTS, '  Explore '), BUILTIN_AGENTS[1]);
+  });
+
+  test('unknown and empty names find nothing', () => {
+    assert.equal(findAgent(BUILTIN_AGENTS, 'explorer'), undefined);
+    assert.equal(findAgent(BUILTIN_AGENTS, ''), undefined);
+    assert.equal(findAgent(BUILTIN_AGENTS, '   '), undefined);
+    assert.equal(findAgent([], 'explore'), undefined);
+    // A model may send anything as the agent type.
+    assert.equal(findAgent(BUILTIN_AGENTS, undefined as unknown as string), undefined);
+  });
+
+  test('an exact match is preferred to one that differs in case', () => {
+    const defs = [agent('Review', 'first'), agent('review', 'second')];
+    assert.equal(findAgent(defs, 'review')!.prompt, 'second');
+    assert.equal(findAgent(defs, 'Review')!.prompt, 'first');
+    assert.equal(findAgent(defs, 'REVIEW')!.prompt, 'first');
+  });
+});
+
+describe('parseAgentsJson', () => {
+  test('inline JSON keyed by agent name', () => {
+    const input = JSON.stringify({
+      reviewer: { description: 'Reviews code', prompt: '  You review code.\n', tools: ['Read', 'Grep'], model: 'sonnet' },
+      builder: {
+        description: 'Builds things',
+        prompt: 'You build.',
+        tools: ['Read', 'Edit'],
+        disallowedTools: ['WebFetch'],
+        model: 'qwen3:8b',
+        permissionMode: 'acceptEdits',
+        maxTurns: 5,
+        skills: ['conventions'],
+        omitClaudeMd: true,
+        effort: 'low',
+        initialPrompt: 'Start.',
+        background: true,
+        color: 'green',
+        mcpServers: { github: {} },
+        hooks: {},
+        memory: 'project',
+        somethingElse: 1,
+      },
+    });
+    assert.deepEqual(parseAgentsJson(input), {
+      agents: [
+        { name: 'reviewer', description: 'Reviews code', tools: ['Read', 'Grep'], prompt: 'You review code.', source: 'flag' },
+        {
+          name: 'builder',
+          description: 'Builds things',
+          tools: ['Read', 'Edit'],
+          disallowedTools: ['WebFetch'],
+          model: 'qwen3:8b',
+          permissionMode: 'acceptEdits',
+          maxTurns: 5,
+          skills: ['conventions'],
+          omitMemory: true,
+          effort: 'low',
+          initialPrompt: 'Start.',
+          background: true,
+          color: 'green',
+          prompt: 'You build.',
+          source: 'flag',
+        },
+      ],
+    });
+  });
+
+  test('a description is optional and whitespace around the JSON is fine', () => {
+    assert.deepEqual(parseAgentsJson('  \n{"quick": {"prompt": "Be quick."}}\n'), { agents: [{ name: 'quick', description: '', prompt: 'Be quick.', source: 'flag' }] });
+    assert.deepEqual(parseAgentsJson('{}'), { agents: [] });
+  });
+
+  test('tools and disallowedTools as comma strings', () => {
+    const { agents, error } = parseAgentsJson('{"a": {"prompt": "p", "tools": "Read, Grep,Glob, Bash(git log *)", "disallowedTools": "Write,Edit"}, "b": {"prompt": "p", "tools": "Read"}}');
+    assert.equal(error, undefined);
+    assert.deepEqual(agents[0]!.tools, ['Read', 'Grep', 'Glob', 'Bash(git log *)']);
+    assert.deepEqual(agents[0]!.disallowedTools, ['Write', 'Edit']);
+    assert.deepEqual(agents[1]!.tools, ['Read']);
+    assert.equal(agents[1]!.disallowedTools, undefined);
+  });
+
+  test('a path to a JSON file', () => {
+    const root = tempProject();
+    writeFiles(root, { 'conf/agents.json': `${BOM}{"helper": {"description": "Helps", "prompt": "You help.", "tools": "Read"}}\n` });
+    assert.deepEqual(parseAgentsJson(path.join(root, 'conf', 'agents.json')), {
+      agents: [{ name: 'helper', description: 'Helps', tools: ['Read'], prompt: 'You help.', source: 'flag' }],
+    });
+  });
+
+  test('the file is read through the reader that was passed in', () => {
+    const asked: string[] = [];
+    const reader = (p: string) => {
+      asked.push(p);
+      return '{"x": {"prompt": "X"}}';
+    };
+    assert.deepEqual(parseAgentsJson(' conf/agents.json ', reader).agents.map((a) => a.name), ['x']);
+    assert.deepEqual(parseAgentsJson('~/agents.json', reader).agents.map((a) => a.name), ['x']);
+    assert.deepEqual(asked, ['conf/agents.json', path.join(os.homedir(), 'agents.json')]);
+    // Inline JSON never touches the reader.
+    parseAgentsJson('{"y": {"prompt": "Y"}}', reader);
+    assert.equal(asked.length, 2);
+  });
+
+  test('a file that cannot be read', () => {
+    const missing = path.join(tempProject(), 'missing.json');
+    const res = parseAgentsJson(missing);
+    assert.deepEqual(res.agents, []);
+    assert.match(res.error!, /^Could not read the agents file .*missing\.json: .*ENOENT/);
+    const denied = parseAgentsJson('agents.json', () => {
+      throw new Error('EACCES: permission denied');
+    });
+    assert.deepEqual(denied.agents, []);
+    assert.match(denied.error!, /Could not read the agents file agents\.json: EACCES: permission denied/);
+  });
+
+  test('an agent without a prompt is reported and the others are kept', () => {
+    const res = parseAgentsJson(
+      JSON.stringify({
+        good: { prompt: 'ok' },
+        noprompt: { description: 'd', tools: ['Read'] },
+        blank: { prompt: '   ' },
+        wrongtype: { prompt: 5 },
+        text: 'just a string',
+        nothing: null,
+        badtools: { prompt: 'p', tools: 7 },
+        mixedtools: { prompt: 'p', disallowedTools: ['Read', 3] },
+      }),
+    );
+    assert.deepEqual(res.agents, [{ name: 'good', description: '', prompt: 'ok', source: 'flag' }]);
+    assert.match(res.error!, /agent "noprompt" needs a non-empty "prompt"/);
+    assert.match(res.error!, /agent "blank" needs a non-empty "prompt"/);
+    assert.match(res.error!, /agent "wrongtype" needs a non-empty "prompt"/);
+    assert.match(res.error!, /agent "text" must be an object/);
+    assert.match(res.error!, /agent "nothing" must be an object/);
+    assert.match(res.error!, /agent "badtools": "tools" must be a list of tool names or a comma-separated string/);
+    assert.match(res.error!, /agent "mixedtools": "disallowedTools" must be/);
+
+    const one = parseAgentsJson('{"solo": {"description": "no prompt"}}');
+    assert.deepEqual(one.agents, []);
+    assert.equal(one.error, 'The agents JSON has an invalid definition: agent "solo" needs a non-empty "prompt".');
+  });
+
+  test('invalid JSON', () => {
+    for (const input of ['{"a": {"prompt": "p"}', '{a: 1}', '{', '{"a": {"prompt": "p"}} trailing']) {
+      const res = parseAgentsJson(input);
+      assert.deepEqual(res.agents, [], input);
+      assert.match(res.error!, /^The agents JSON is not valid JSON: /, input);
+    }
+    const file = parseAgentsJson('agents.json', () => 'not json at all');
+    assert.deepEqual(file.agents, []);
+    assert.match(file.error!, /^The agents file agents\.json is not valid JSON: /);
+    assert.match(parseAgentsJson('agents.json', () => '').error!, /not valid JSON/);
+  });
+
+  test('anything but an object keyed by name', () => {
+    for (const content of ['[]', '[{"prompt": "p"}]', '"text"', '42', 'null', 'true']) {
+      const res = parseAgentsJson('agents.json', () => content);
+      assert.deepEqual(res.agents, [], content);
+      assert.match(res.error!, /^The agents file agents\.json must be a JSON object keyed by agent name/, content);
+    }
+    // Inline, such input does not start with a brace, so it is taken for a path that does not exist.
+    const res = parseAgentsJson('[{"prompt": "p"}]', () => {
+      throw new Error('ENOENT: no such file or directory');
+    });
+    assert.deepEqual(res.agents, []);
+    assert.match(res.error!, /Could not read the agents file .*Expected a JSON object keyed by agent name/);
+  });
+
+  test('empty input', () => {
+    for (const input of ['', '   ', '\n']) {
+      const res = parseAgentsJson(input);
+      assert.deepEqual(res.agents, []);
+      assert.match(res.error!, /^No agents were given/);
+    }
+  });
+
+  test('never throws', () => {
+    const reader = () => {
+      throw new Error('nope');
+    };
+    for (const input of ['{', '}', '{"a":', 'nul', '{"__proto__": {"prompt": "p"}}', '{"constructor": {"prompt": "p"}}', '{"a": null}', '{"a": []}', '{"": {"prompt": "p"}}']) {
+      assert.doesNotThrow(() => parseAgentsJson(input, reader), input);
+    }
+    assert.doesNotThrow(() => parseAgentsJson(undefined as unknown as string, reader));
+    assert.doesNotThrow(() => parseAgentsJson('agents.json', () => undefined as unknown as string));
+    assert.deepEqual(parseAgentsJson('{"__proto__": {"prompt": "p"}}').agents.map((a) => a.name), ['__proto__']);
+    assert.match(parseAgentsJson('{"": {"prompt": "p"}}').error!, /an agent has an empty name/);
   });
 });

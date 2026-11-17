@@ -1,7 +1,8 @@
 /**
  * Decodes raw terminal input into key events. Handles CSI/SS3 sequences,
  * modifier encodings (xterm, kitty, modifyOtherKeys), Alt-prefixed keys and
- * bracketed paste, including sequences split across reads.
+ * bracketed paste, including sequences split across reads. Two-key chords
+ * are tracked with ChordPrefix.
  */
 
 export interface Key {
@@ -70,6 +71,40 @@ function fromCodepoint(cp: number, mods: Pick<Key, 'ctrl' | 'meta' | 'shift'>): 
   const ch = String.fromCodePoint(cp);
   if (mods.ctrl || mods.meta) return key(ch.toLowerCase(), mods);
   return key('char', { ...mods, text: ch });
+}
+
+/** How long a chord prefix waits for its second key. */
+export const CHORD_TIMEOUT_MS = 1500;
+
+/**
+ * The first key of a two-key chord (ctrl+x, waiting for ctrl+e). It is
+ * short-lived: the very next key either completes the chord or is an
+ * ordinary key again, and a prefix nobody followed up on lapses by itself.
+ */
+export class ChordPrefix {
+  private armedAt: number | null = null;
+  private readonly timeoutMs: number;
+
+  constructor(timeoutMs: number = CHORD_TIMEOUT_MS) {
+    this.timeoutMs = timeoutMs;
+  }
+
+  /** The prefix key was pressed. */
+  arm(now: number = Date.now()): void {
+    this.armedAt = now;
+  }
+
+  /** Whether the prefix is waiting for its second key at this moment. */
+  pending(now: number = Date.now()): boolean {
+    return this.armedAt !== null && now - this.armedAt <= this.timeoutMs;
+  }
+
+  /** Call once for every key: true when that key directly follows the prefix. The prefix is used up either way. */
+  take(now: number = Date.now()): boolean {
+    const armed = this.pending(now);
+    this.armedAt = null;
+    return armed;
+  }
 }
 
 export class KeyParser {

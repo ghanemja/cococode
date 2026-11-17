@@ -83,15 +83,53 @@ export function recentTail(messages: Message[], maxTokens: number): Message[] {
 export interface CarriedState {
   /** The task list, already rendered. */
   todos?: string;
-  /** Files the model had read or edited, most recent last. */
+  /** Files the model had read or edited whose contents are not re-attached, most recent last. */
   files?: string[];
+  /** Recently used files small enough to give back in full. */
+  attached?: { path: string; content: string }[];
+  /** Instructions of skills invoked earlier in the session. */
+  skills?: { name: string; content: string }[];
+  /** The plan the user approved, if the session went through plan mode. */
+  plan?: string;
+  /** Context supplied by SessionStart hooks for the "compact" source. */
+  hookContext?: string;
+}
+
+/** Token budgets for what is re-attached after compaction, scaled to the window. */
+export function carryBudget(contextWindow: number): { perFile: number; files: number; perSkill: number; skills: number } {
+  return {
+    perFile: Math.min(5000, Math.floor(contextWindow * 0.06)),
+    files: Math.min(25_000, Math.floor(contextWindow * 0.15)),
+    perSkill: Math.min(5000, Math.floor(contextWindow * 0.06)),
+    skills: Math.min(25_000, Math.floor(contextWindow * 0.12)),
+  };
+}
+
+/** Skills that fit the budget: each cut to the per-skill limit, oldest dropped first. */
+export function fitSkills(skills: { name: string; content: string }[], perSkill: number, total: number): { name: string; content: string }[] {
+  const out: { name: string; content: string }[] = [];
+  let used = 0;
+  for (let i = skills.length - 1; i >= 0; i--) {
+    const skill = skills[i]!;
+    const maxChars = Math.floor(perSkill * 3.5);
+    const content = skill.content.length > maxChars ? `${skill.content.slice(0, maxChars)}\n… [truncated]` : skill.content;
+    const cost = estimateTokens(content);
+    if (used + cost > total) break;
+    used += cost;
+    out.unshift({ name: skill.name, content });
+  }
+  return out;
 }
 
 export function summaryMessage(summary: string, hasTail: boolean, state: CarriedState = {}): Message {
   // The plan and the working set are restated exactly, not left to the summary to remember.
   const extras: string[] = [];
+  if (state.plan) extras.push(`The plan the user approved:\n${state.plan.trim()}`);
   if (state.todos) extras.push(`Your task list at this point:\n${state.todos}`);
-  if (state.files?.length) extras.push(`Files you had open (their contents are no longer in context; Read them again before relying on them): ${state.files.join(', ')}`);
+  for (const skill of state.skills ?? []) extras.push(`Skill "${skill.name}" (loaded earlier, still in effect):\n${skill.content.trim()}`);
+  for (const file of state.attached ?? []) extras.push(`<file path="${file.path}" note="current content, re-attached after compaction">\n${file.content}\n</file>`);
+  if (state.files?.length) extras.push(`Other files you had open (their contents are no longer in context; Read them again before relying on them): ${state.files.join(', ')}`);
+  if (state.hookContext) extras.push(state.hookContext.trim());
   return {
     role: 'user',
     isMeta: true,

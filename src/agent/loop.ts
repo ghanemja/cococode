@@ -5,14 +5,16 @@ import type { ModelClient } from '../providers/index.ts';
 import { TRUNCATED_ARGS } from '../providers/textTools.ts';
 import { ProviderError, isTransientError } from '../providers/types.ts';
 import type { SessionState } from '../session/state.ts';
+import * as fs from 'node:fs';
 import { displayPath } from '../config/paths.ts';
 import { renderTodos } from '../tools/meta.ts';
 import { spillOutput } from '../tools/spill.ts';
 import { toolSpecs } from '../tools/registry.ts';
 import type { FileDiff, PermissionRequest, RuntimeHandle, Tool, ToolContext, ToolResult } from '../tools/types.ts';
 import type { AssistantMessage, ContentPart, Message, ToolCall, ToolResultMessage, Usage, UserMessage } from '../types.ts';
+import { debug } from '../util/debug.ts';
 import { validateInput } from '../util/schema.ts';
-import { microcompact, recentTail, summarize, summaryMessage } from './compact.ts';
+import { carryBudget, fitSkills, microcompact, recentTail, summarize, summaryMessage } from './compact.ts';
 import { TokenCalibrator, estimateTokens, messagesTokens, toolSpecTokens } from './tokens.ts';
 
 export type DoneReason = 'stop' | 'aborted' | 'max_turns' | 'error' | 'rejected' | 'hook_stop';
@@ -30,6 +32,8 @@ export type AgentEvent =
   | { type: 'usage'; usage: Usage }
   /** Output is being generated that is not displayed yet (tool-call arguments). */
   | { type: 'progress'; chars: number }
+  /** A failed request is about to be tried again. */
+  | { type: 'retry'; attempt: number; maxRetries: number; delayMs: number; error: string; status?: number }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'compact'; phase: 'start' | 'end'; before?: number; after?: number; auto: boolean }
   | { type: 'done'; reason: DoneReason; error?: string };
@@ -75,6 +79,14 @@ export interface AgentDeps {
   drainQueued?: () => UserMessage[];
   /** Wait between retries. Replaceable so tests do not actually wait. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** The nth model to fall back to when the session model fails for a reason retrying will not fix. */
+  fallback?: (index: number) => Promise<ModelClient | undefined>;
+  /** Session state to restate after compaction: skills invoked so far and the approved plan. */
+  carryOver?: () => { skills?: { name: string; content: string }[]; plan?: string };
+  /** Called after compaction replaced the conversation. */
+  onCompacted?: () => void;
+  /** Extra text for the model after a successful tool call (instructions that apply to the file just touched). */
+  afterTool?: (toolName: string, input: Record<string, unknown>) => string | undefined;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -167,6 +179,14 @@ const DROPPED_NOTE =
   'The connection dropped while you were replying, so your last message is incomplete. Continue exactly where it stopped, without repeating what you already wrote. If you were about to call a tool, call it now.';
 /** How many times a reply cut off at the output limit is continued automatically. */
 const MAX_CONTINUATIONS = 2;
+/** How many times in a row a reply cut off by a dropped connection is continued. */
+const MAX_DROP_CONTINUATIONS = 3;
+/** Rounds in a row where no tool call could be run before the turn is ended. */
+const MAX_UNUSABLE_ROUNDS = 3;
+/** Times in a row a Stop hook may send the model back to work. */
+const STOP_HOOK_BLOCK_CAP = 8;
+/** Compactions in a row that fail to get under the limit before giving up. */
+const MAX_INEFFECTIVE_COMPACTIONS = 3;
 const REPEAT_LIMIT = 3;
 /** Polling tools legitimately repeat with identical arguments. */
 const REPEAT_EXEMPT = new Set(['BashOutput']);
@@ -184,6 +204,7 @@ export class Agent {
   private lastFingerprint = '';
   private repeatCount = 0;
   private warnedTooSmall = false;
+  private unusableRounds = 0;
 
   constructor(deps: AgentDeps) {
     this.deps = deps;
@@ -266,6 +287,12 @@ export class Agent {
     let maxTokens: number | undefined;
     let transientRetries = 0;
     let continuations = 0;
+    let dropContinuations = 0;
+    let ineffectiveCompactions = 0;
+    let fallbackIndex = 0;
+    // The model for this turn: the session model, or a fallback after it failed.
+    let client = deps.client;
+    this.unusableRounds = 0;
     const maxRetries = deps.settings.maxRetries ?? DEFAULTS.maxRetries;
 
     for (;;) {
@@ -290,6 +317,21 @@ export class Agent {
           if (signal.aborted) {
             yield { type: 'done', reason: 'aborted' };
             return;
+          }
+          // Compaction that leaves the context over the limit will not do better by repeating.
+          if (this.contextTokens() > this.compactLimit()) {
+            if (++ineffectiveCompactions >= MAX_INEFFECTIVE_COMPACTIONS) {
+              yield {
+                type: 'done',
+                reason: 'error',
+                error:
+                  'Compaction is thrashing: the context was still over the limit after compacting three times in a row. ' +
+                  'A single file or tool result is probably too large for this context window. Use a larger context (--context), read large files in pieces, or /clear and restate the task.',
+              };
+              return;
+            }
+          } else {
+            ineffectiveCompactions = 0;
           }
         } else if (!this.warnedTooSmall) {
           this.warnedTooSmall = true;
@@ -318,7 +360,8 @@ export class Agent {
       let firstTokenAt = 0;
 
       try {
-        for await (const ev of deps.client.chat({ system, messages: this.messages, tools: specs, signal, maxTokens })) {
+        try {
+        for await (const ev of client.chat({ system, messages: this.messages, tools: specs, signal, maxTokens })) {
           if (ev.type === 'text') {
             firstTokenAt ||= Date.now();
             text += ev.text;
@@ -339,7 +382,14 @@ export class Agent {
             stopReason = ev.stopReason;
           }
         }
+        } catch (dropped) {
+          // Tool calls that arrived whole before the connection failed are still good: run them.
+          if (signal.aborted || !isTransientError(dropped) || calls.length === 0) throw dropped;
+          stopReason = 'tool_calls';
+          yield { type: 'notice', level: 'warn', text: 'The connection dropped after the model had requested tools. Running those; the reply above may be incomplete.' };
+        }
         transientRetries = 0;
+        dropContinuations = 0;
       } catch (err) {
         const aborted = signal.aborted || (err instanceof ProviderError && err.kind === 'aborted');
         if (aborted) {
@@ -359,16 +409,19 @@ export class Agent {
         // Transient failures (server restarting, model loading, a dropped connection, a stall)
         // are retried with backoff. A stall already cost a long wait, so it gets one more try.
         const allowed = err instanceof ProviderError && err.kind === 'timeout' ? Math.min(1, maxRetries) : maxRetries;
-        if (isTransientError(err) && transientRetries < allowed) {
+        if (isTransientError(err) && transientRetries < allowed && (!text.trim() || dropContinuations < MAX_DROP_CONTINUATIONS)) {
           transientRetries++;
           if (text.trim()) {
+            dropContinuations++;
             // What was already shown is kept, and the model is asked to carry on from it.
-            const partial: AssistantMessage = { role: 'assistant', content: text, model: deps.client.model, stopReason: 'error' };
+            const partial: AssistantMessage = { role: 'assistant', content: text, model: client.model, stopReason: 'error' };
             this.push(partial);
             yield { type: 'assistant', message: partial };
             this.push({ role: 'user', isMeta: true, content: DROPPED_NOTE });
           }
-          const delay = Math.min(30_000, 500 * 2 ** (transientRetries - 1));
+          const delay = Math.min(32_000, 500 * 2 ** (transientRetries - 1));
+          debug('api', `retry ${transientRetries}/${allowed} in ${delay}ms`, message);
+          yield { type: 'retry', attempt: transientRetries, maxRetries: allowed, delayMs: delay, error: message.split('\n')[0]!, status: err instanceof ProviderError ? err.status : undefined };
           yield {
             type: 'notice',
             level: 'warn',
@@ -382,6 +435,19 @@ export class Agent {
           }
           turns--;
           continue;
+        }
+        // Not something a retry fixes (or retries ran out): try the next fallback model, if any.
+        // Transport and request-size problems would fail the same way on another model.
+        const kind = err instanceof ProviderError ? err.kind : 'other';
+        if (deps.fallback && kind !== 'connection' && kind !== 'timeout' && kind !== 'context_overflow') {
+          const next = await deps.fallback(fallbackIndex++).catch(() => undefined);
+          if (next) {
+            client = next;
+            transientRetries = 0;
+            yield { type: 'notice', level: 'warn', text: `${message.split('\n')[0]} Switching to the fallback model ${next.model} for the rest of this turn.` };
+            turns--;
+            continue;
+          }
         }
         yield { type: 'done', reason: 'error', error: message };
         return;
@@ -401,7 +467,7 @@ export class Agent {
       this.totals.evalMs += usage.evalMs ?? 0;
       yield { type: 'usage', usage };
 
-      const assistant: AssistantMessage = { role: 'assistant', content: text, usage, model: deps.client.model, stopReason };
+      const assistant: AssistantMessage = { role: 'assistant', content: text, usage, model: client.model, stopReason };
       if (thinking) assistant.thinking = thinking;
       if (calls.length) assistant.toolCalls = calls;
 
@@ -417,8 +483,8 @@ export class Agent {
           // Typical of reasoning models: the budget went on thinking and nothing was answered.
           if (!lengthRetried) {
             lengthRetried = true;
-            const current = maxTokens ?? deps.client.profile.maxOutputTokens;
-            maxTokens = Math.min(current * 2, Math.floor(deps.client.profile.contextWindow / 2));
+            const current = maxTokens ?? client.profile.maxOutputTokens;
+            maxTokens = Math.min(current * 2, Math.floor(client.profile.contextWindow / 2));
             yield { type: 'notice', level: 'warn', text: `The model used its whole output budget before answering (often on reasoning). Retrying with ${maxTokens} tokens.` };
             continue;
           }
@@ -455,7 +521,7 @@ export class Agent {
         if (deps.hooks.has(hookEvent)) {
           const outcome = await deps.hooks.run(hookEvent, { stop_hook_active: stopHookBlocks > 0 }, undefined, signal);
           for (const m of outcome.messages) yield { type: 'notice', level: 'info', text: m };
-          if (outcome.blocked && outcome.reason && stopHookBlocks < 3) {
+          if (outcome.blocked && outcome.reason && stopHookBlocks < STOP_HOOK_BLOCK_CAP) {
             stopHookBlocks++;
             this.push({ role: 'user', isMeta: true, content: `A Stop hook asked you to keep going:\n${outcome.reason}` });
             continue;
@@ -481,6 +547,16 @@ export class Agent {
       const results = yield* this.executeTools(calls, tools, signal, state);
       for (const r of results) this.push(r);
       this.totals.toolUses += calls.length;
+      if (this.unusableRounds >= MAX_UNUSABLE_ROUNDS) {
+        yield {
+          type: 'done',
+          reason: 'error',
+          error:
+            `The model produced tool calls that could not be run ${MAX_UNUSABLE_ROUNDS} times in a row (malformed arguments or unknown tools). ` +
+            'This model may not handle tool calling reliably: try a larger context, --tool-mode prompt, or a model trained for tool use.',
+        };
+        return;
+      }
 
       if (signal.aborted) {
         this.push({ role: 'user', content: INTERRUPT_NOTE, isMeta: true });
@@ -553,6 +629,9 @@ export class Agent {
       if (!check.ok) return { call, tool, input: undefined, error: check.error };
       return { call, tool, input: check.value, error: undefined };
     });
+
+    // A round where nothing could even be attempted counts toward giving up on the turn.
+    this.unusableRounds = prepared.every((p) => !p.tool || p.error) ? this.unusableRounds + 1 : 0;
 
     // Consecutive read-only calls run together; anything else runs alone, in order.
     const batches: number[][] = [];
@@ -650,7 +729,7 @@ export class Agent {
 
     let hookDecision: 'allow' | 'ask' | undefined;
     if (deps.hooks.has('PreToolUse')) {
-      const pre = await deps.hooks.run('PreToolUse', { tool_name: tool.name, tool_input: input }, tool.name, signal);
+      const pre = await deps.hooks.run('PreToolUse', { tool_name: tool.name, tool_input: input, tool_use_id: call.id }, tool.name, signal);
       for (const m of pre.messages) queue.push({ type: 'notice', level: 'info', text: m });
       if (pre.stop) state.hookStop = pre.stopReason ?? '';
       if (pre.blocked) return { content: `Blocked by a PreToolUse hook: ${pre.reason ?? 'no reason given'}`, isError: true, summary: 'Blocked by hook' };
@@ -662,21 +741,37 @@ export class Agent {
     }
 
     const outcome = deps.permissions.evaluate(tool, input, ctx);
-    if (outcome.behavior === 'deny') return { content: outcome.message, isError: true, summary: 'Denied' };
+    if (outcome.behavior === 'deny') return { content: outcome.message, isError: true, summary: 'Denied', denied: true };
     const mustAsk = outcome.behavior === 'ask' && hookDecision !== 'allow';
     const hookForcesAsk = hookDecision === 'ask' && outcome.behavior === 'allow' && deps.permissions.mode !== 'bypassPermissions';
     if (mustAsk || hookForcesAsk) {
       const request: PermissionRequest =
         outcome.behavior === 'ask' ? outcome.request : (tool.permission?.(input, ctx) ?? { tool: tool.name, kind: 'other', description: tool.name });
-      if (!deps.requestPermission) {
+      // A PermissionRequest hook may answer in place of the user (useful in unattended runs).
+      let hookAnswer: 'allow' | 'deny' | 'ask' | undefined;
+      if (deps.hooks.has('PermissionRequest')) {
+        const asked = await deps.hooks.run(
+          'PermissionRequest',
+          { tool_name: tool.name, tool_input: input, permission_suggestions: outcome.behavior === 'ask' ? outcome.suggestions.map((s) => s.label) : [] },
+          tool.name,
+          signal,
+        );
+        for (const m of asked.messages) queue.push({ type: 'notice', level: 'info', text: m });
+        hookAnswer = asked.permissionDecision;
+        if (hookAnswer === 'deny') return { content: `Denied by a PermissionRequest hook: ${asked.reason ?? 'no reason given'}`, isError: true, summary: 'Denied by hook', denied: true };
+      }
+      if (hookAnswer === 'allow') {
+        // approved by the hook: fall through to execution
+      } else if (!deps.requestPermission) {
         return {
           content:
             `Permission is required to ${request.description}, and this session cannot ask the user. ` +
             'Continue without it if you can; otherwise explain what you needed.',
           isError: true,
           summary: 'Permission required',
+          denied: true,
         };
-      }
+      } else {
       let diff: FileDiff | null | undefined;
       try {
         diff = tool.preview?.(input, ctx);
@@ -695,15 +790,18 @@ export class Agent {
       if (signal.aborted) return { content: 'Not run: the user interrupted.', isError: true, summary: 'Interrupted' };
       if (!answer.allow) {
         if (answer.feedback?.trim()) {
-          return { content: `The user declined this action and said: ${answer.feedback.trim()}`, isError: true, summary: 'Declined' };
+          return { content: `The user declined this action and said: ${answer.feedback.trim()}`, isError: true, summary: 'Declined', denied: true };
         }
         state.rejected = true;
-        return { content: 'The user declined this action. Stop and wait for their instructions.', isError: true, summary: 'Declined' };
+        return { content: 'The user declined this action. Stop and wait for their instructions.', isError: true, summary: 'Declined', denied: true };
       }
       if (answer.suggestion) deps.permissions.applySuggestion(answer.suggestion);
+      }
     }
 
     let result: ToolResult;
+    const executionStarted = Date.now();
+    debug('tools', `call ${tool.name}`, input, 2000);
     try {
       result = await tool.execute(input, ctx);
     } catch (err) {
@@ -713,11 +811,30 @@ export class Agent {
     // Anything still too large for the context is saved in full and shown trimmed.
     if (result.content.length > max * 1.2) result = { ...result, content: spillOutput(session.id, call.id, result.content, max) };
 
-    if (deps.hooks.has('PostToolUse')) {
-      const post = await deps.hooks.run('PostToolUse', { tool_name: tool.name, tool_input: input, tool_response: result.content, tool_is_error: Boolean(result.isError) }, tool.name, signal);
+    debug('tools', `result ${tool.name}${result.isError ? ' (error)' : ''} ${Date.now() - executionStarted}ms`, result.content, 2000);
+    if (!result.isError && deps.afterTool) {
+      let extra: string | undefined;
+      try {
+        extra = deps.afterTool(tool.name, input);
+      } catch {
+        extra = undefined;
+      }
+      if (extra) result = { ...result, content: `${result.content}\n\n${extra}` };
+    }
+    // Success and failure are separate events, so a formatter hook does not run on a failed edit.
+    const postEvent = result.isError ? 'PostToolUseFailure' : 'PostToolUse';
+    if (deps.hooks.has(postEvent)) {
+      const payload = {
+        tool_name: tool.name,
+        tool_input: input,
+        tool_use_id: call.id,
+        duration_ms: Date.now() - executionStarted,
+        ...(result.isError ? { error: result.content, is_interrupt: signal.aborted } : { tool_response: result.content }),
+      };
+      const post = await deps.hooks.run(postEvent, payload, tool.name, signal);
       for (const m of post.messages) queue.push({ type: 'notice', level: 'info', text: m });
       if (post.stop) state.hookStop = post.stopReason ?? '';
-      const extra = [post.blocked && post.reason ? `PostToolUse hook feedback: ${post.reason}` : '', post.additionalContext ?? ''].filter(Boolean);
+      const extra = [post.blocked && post.reason ? `${postEvent} hook feedback: ${post.reason}` : '', post.additionalContext ?? ''].filter(Boolean);
       if (extra.length) result = { ...result, content: `${result.content}\n\n${extra.join('\n')}` };
     }
     return result;
@@ -776,14 +893,20 @@ export class Agent {
       }
     }
 
+    const trigger = opts.auto ? 'auto' : 'manual';
+    let instructions = opts.instructions;
     if (deps.hooks.has('PreCompact')) {
-      const outcome = await deps.hooks.run('PreCompact', { trigger: opts.auto ? 'auto' : 'manual', custom_instructions: opts.instructions ?? '' }, opts.auto ? 'auto' : 'manual', signal);
+      const outcome = await deps.hooks.run('PreCompact', { trigger, custom_instructions: opts.instructions ?? '' }, trigger, signal);
       for (const m of outcome.messages) yield { type: 'notice', level: 'info', text: m };
+      // What a PreCompact hook prints is extra guidance for the summary.
+      if (outcome.additionalContext) instructions = [instructions, outcome.additionalContext].filter(Boolean).join('\n');
     }
     yield { type: 'compact', phase: 'start', before, auto: opts.auto };
     let summary: string;
     try {
-      summary = await summarize(deps.client, this.messages, { instructions: opts.instructions, signal });
+      summary = await summarize(deps.client, this.messages, { instructions, signal });
+      // A reply with no summary in it is worth one more try before giving up.
+      if (!summary.trim() && !signal.aborted) summary = await summarize(deps.client, this.messages, { instructions, signal });
     } catch (err) {
       if (signal.aborted) return;
       yield { type: 'notice', level: 'error', text: `Compaction failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -803,15 +926,64 @@ export class Agent {
     }
     const tail = recentTail(this.messages, Math.floor(deps.client.profile.contextWindow * 0.2));
     // The plan and working set are carried over verbatim rather than trusted to the summary.
-    const todos = deps.depth === 0 && deps.session.todos.some((t) => t.status !== 'completed') ? renderTodos(deps.session.todos) : undefined;
-    const files = deps.depth === 0 ? [...deps.session.readFiles.keys()].slice(-12).map((f) => displayPath(f, deps.session.cwd)) : [];
-    this.messages = [summaryMessage(summary, tail.length > 0, { todos, files }), ...tail];
+    const main = deps.depth === 0;
+    const budget = carryBudget(deps.client.profile.contextWindow);
+    const todos = main && deps.session.todos.some((t) => t.status !== 'completed') ? renderTodos(deps.session.todos) : undefined;
+
+    // The files most recently in play come back in full when they are small enough,
+    // so work can continue without a round of re-reading; the rest are named.
+    const attached: { path: string; content: string }[] = [];
+    const named: string[] = [];
+    const kept = new Map<string, NonNullable<ReturnType<typeof deps.session.readFiles.get>>>();
+    if (main) {
+      const recent = [...deps.session.readFiles.keys()].slice(-12).reverse();
+      let used = 0;
+      for (const [index, file] of recent.entries()) {
+        const shown = displayPath(file, deps.session.cwd);
+        let content: string | undefined;
+        if (index < 5) {
+          try {
+            if (fs.statSync(file).size <= budget.perFile * 6) content = fs.readFileSync(file, 'utf8');
+          } catch {
+            content = undefined;
+          }
+        }
+        const cost = content === undefined ? Infinity : estimateTokens(content);
+        if (content !== undefined && cost <= budget.perFile && used + cost <= budget.files && !content.includes('\0')) {
+          used += cost;
+          attached.unshift({ path: shown, content });
+          kept.set(file, deps.session.readFiles.get(file)!);
+        } else {
+          named.unshift(shown);
+        }
+      }
+    }
+    const carried = main ? (deps.carryOver?.() ?? {}) : {};
+    const skills = fitSkills(carried.skills ?? [], budget.perSkill, budget.skills);
+
+    // SessionStart hooks for the "compact" source run again, as at the start of a session.
+    let hookContext: string | undefined;
+    if (main && deps.hooks.has('SessionStart')) {
+      const started = await deps.hooks.run('SessionStart', { source: 'compact' }, 'compact', signal);
+      for (const m of started.messages) yield { type: 'notice', level: 'info', text: m };
+      hookContext = started.additionalContext;
+    }
+
+    this.messages = [summaryMessage(summary, tail.length > 0, { todos, files: named, attached, skills, plan: carried.plan, hookContext }), ...tail];
     deps.transcript?.compacted(this.messages);
     this.lastUsage = undefined;
     this.usageIndex = 0;
     this.totals.compactions++;
-    // File contents are gone from context, so edits must re-read first.
-    if (deps.depth === 0) deps.session.readFiles.clear();
+    // Contents of files that were not re-attached are gone from context, so edits must re-read them first.
+    if (main) {
+      deps.session.readFiles.clear();
+      for (const [file, record] of kept) deps.session.readFiles.set(file, record);
+      deps.onCompacted?.();
+    }
+    if (deps.hooks.has('PostCompact')) {
+      const post = await deps.hooks.run('PostCompact', { trigger, compact_summary: summary }, trigger, signal);
+      for (const m of post.messages) yield { type: 'notice', level: 'info', text: m };
+    }
     yield { type: 'compact', phase: 'end', before, after: this.contextTokens(), auto: opts.auto };
   }
 

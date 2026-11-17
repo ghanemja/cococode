@@ -186,7 +186,7 @@ describe('coco -p', () => {
     const res = await coco(project(), ['-p', 'hi', ...base(server)]);
     assert.equal(res.code, 0, res.stderr);
     assert.equal(res.stdout, 'Ready now.\n');
-    assert.match(res.stderr, /model is loading Retrying in 500ms \(attempt 1 of 4\)/);
+    assert.match(res.stderr, /model is loading Retrying in 500ms \(attempt 1 of 10\)/);
     assert.equal(server.requests.length, 2);
   });
 
@@ -213,6 +213,142 @@ describe('coco -p', () => {
     const system = server.requests[0]!.body.messages[0].content as string;
     assert.ok(system.startsWith('You are a pirate.'));
     assert.ok(system.trimEnd().endsWith('Be brief.'));
+  });
+});
+
+describe('flags added for parity with Claude Code', () => {
+  test('--name, resume by name, --fork-session and --session-id', async () => {
+    const server = await mock([{ text: 'one' }, { text: 'two' }, { text: 'three' }, { text: 'four' }]);
+    const dir = project();
+    const first = JSON.parse((await coco(dir, ['-p', 'start the migration', '--name', 'migration', '--output-format', 'json', ...base(server)])).stdout);
+    assert.match((await coco(dir, ['sessions'])).stdout, /migration · start the migration/);
+
+    // Resume by name continues the same session.
+    const again = JSON.parse((await coco(dir, ['-p', 'continue', '--resume=migration', '--output-format', 'json', ...base(server)])).stdout);
+    assert.equal(again.session_id, first.session_id);
+    assert.deepEqual((server.requests[1]!.body.messages as any[]).map((m) => m.content).slice(1), ['start the migration', 'one', 'continue']);
+
+    // A fork carries the conversation into a new session with the id asked for; the original is untouched.
+    const forkId = '123e4567-e89b-42d3-a456-426614174000';
+    const forked = JSON.parse(
+      (await coco(dir, ['-p', 'try another way', '--resume', first.session_id, '--fork-session', '--session-id', forkId, '--output-format', 'json', ...base(server)])).stdout,
+    );
+    assert.equal(forked.session_id, forkId);
+    assert.deepEqual((server.requests[2]!.body.messages as any[]).map((m) => m.content).slice(1), ['start the migration', 'one', 'continue', 'two', 'try another way']);
+    await coco(dir, ['-p', 'back on the original', '--resume', first.session_id, ...base(server)]);
+    assert.deepEqual((server.requests[3]!.body.messages as any[]).map((m) => m.content).slice(1), ['start the migration', 'one', 'continue', 'two', 'back on the original']);
+
+    const bad = await coco(dir, ['-p', 'x', '--session-id', 'not-a-uuid', ...base(server)]);
+    assert.equal(bad.code, 1);
+    assert.match(bad.stderr, /--session-id must be a UUID/);
+  });
+
+  test('--bare ignores memory, hooks, skills and project MCP servers', async () => {
+    const server = await mock([{ toolCalls: [{ name: 'Bash', arguments: { command: 'true' } }] }, { text: 'ok' }]);
+    const dir = project({
+      'COCO.md': 'Always answer in French.',
+      '.coco/skills/deploy/SKILL.md': '---\ndescription: Ship it\n---\nRun make deploy.',
+      '.coco/settings.json': JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'touch hook-ran.txt' }] }] } }),
+      '.mcp.json': JSON.stringify({ mcpServers: { fixture: { command: 'node', args: [MCP_FIXTURE] } } }),
+    });
+    await coco(dir, ['-p', 'go', '--bare', '--dangerously-skip-permissions', ...base(server)]);
+    const system = server.requests[0]!.body.messages[0].content as string;
+    assert.ok(!system.includes('Always answer in French'));
+    assert.ok(!system.includes('deploy'));
+    const tools = (server.requests[0]!.body.tools as any[]).map((t) => t.function.name);
+    assert.ok(!tools.some((t) => t.startsWith('mcp__')));
+    assert.ok(!fs.existsSync(path.join(dir, 'hook-ran.txt')));
+  });
+
+  test('--strict-mcp-config uses only the servers given on the command line', async () => {
+    const server = await mock([{ text: 'a' }, { text: 'b' }]);
+    const dir = project({ '.mcp.json': JSON.stringify({ mcpServers: { fromproject: { command: 'node', args: [MCP_FIXTURE] } } }) });
+    const extra = JSON.stringify({ mcpServers: { fromflag: { command: 'node', args: [MCP_FIXTURE] } } });
+    await coco(dir, ['-p', 'hi', '--mcp-config', extra, ...base(server)]);
+    const both = (server.requests[0]!.body.tools as any[]).map((t) => t.function.name);
+    assert.ok(both.includes('mcp__fromproject__echo') && both.includes('mcp__fromflag__echo'));
+    await coco(dir, ['-p', 'hi', '--mcp-config', extra, '--strict-mcp-config', ...base(server)]);
+    const strict = (server.requests[1]!.body.tools as any[]).map((t) => t.function.name);
+    assert.ok(strict.includes('mcp__fromflag__echo') && !strict.includes('mcp__fromproject__echo'));
+  });
+
+  test('--append-system-prompt-file, --effort and the "manual" mode name', async () => {
+    const server = await mock([{ toolCalls: [{ name: 'Write', arguments: { file_path: 'x.txt', content: 'x' } }] }, { text: 'ok' }], { models: ['gpt-oss'] });
+    const dir = project({ 'extra.md': 'Prefer small functions.' });
+    const res = await coco(dir, ['-p', 'hi', '--append-system-prompt-file', 'extra.md', '--effort', 'low', '--permission-mode', 'manual'], {
+      env: { OLLAMA_HOST: server.root.replace('http://', '') },
+    });
+    assert.equal(res.code, 0, res.stderr);
+    assert.ok((server.requests[0]!.body.messages[0].content as string).trimEnd().endsWith('Prefer small functions.'));
+    assert.equal(server.requests[0]!.body.think, 'low');
+    // "manual" is the default mode: the write needed approval nobody could give.
+    assert.ok(!fs.existsSync(path.join(dir, 'x.txt')));
+  });
+
+  test('--disable-slash-commands sends a leading slash to the model as text', async () => {
+    const server = await mock([{ text: 'ok' }]);
+    await coco(project(), ['-p', '/help me understand this', '--disable-slash-commands', ...base(server)]);
+    assert.equal(lastMessage(server.requests[0]!, 'user').content, '/help me understand this');
+  });
+
+  test('stream-json reports retries, partial text and what was denied', async () => {
+    const server = await mock([
+      { error: { status: 503, message: 'model is loading' } },
+      { text: 'Trying.', toolCalls: [{ name: 'Write', arguments: { file_path: 'x.txt', content: 'x' } }] },
+      { text: 'I was not allowed.' },
+    ]);
+    const res = await coco(project(), ['-p', 'write x', '--output-format', 'stream-json', '--include-partial-messages', ...base(server)]);
+    const lines = res.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    const retry = lines.find((l) => l.subtype === 'api_retry');
+    assert.deepEqual(
+      { attempt: retry.attempt, max: retry.max_retries, delay: retry.retry_delay_ms, status: retry.error_status, error: retry.error },
+      { attempt: 1, max: 10, delay: 500, status: 503, error: 'model is loading' },
+    );
+    const streamed = lines.filter((l) => l.type === 'stream_event').map((l) => l.event.delta.text).join('');
+    assert.equal(streamed, 'Trying.I was not allowed.');
+    const result = lines.at(-1);
+    assert.equal(result.type, 'result');
+    assert.deepEqual(result.permission_denials, [{ tool_name: 'Write', tool_use_id: result.permission_denials[0].tool_use_id, tool_input: { file_path: 'x.txt', content: 'x' } }]);
+    assert.equal(result.total_cost_usd, 0);
+  });
+
+  test('--fallback-model takes over when the main model cannot answer', async () => {
+    const server = await mock((req) => (req.body.model === 'mock-model' ? { error: { status: 400, message: 'model requires more system memory' } } : { text: 'From the backup.' }), {
+      models: ['mock-model', 'backup-model'],
+    });
+    const res = await coco(project(), ['-p', 'hi', '--fallback-model', 'backup-model', ...base(server)]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(res.stdout, 'From the backup.\n');
+    assert.match(res.stderr, /Switching to the fallback model backup-model/);
+    assert.deepEqual(server.requests.map((r) => r.body.model), ['mock-model', 'backup-model']);
+  });
+
+  test('--debug-file records what was sent and what came back', async () => {
+    const server = await mock([{ toolCalls: [{ name: 'Read', arguments: { file_path: 'hello.txt' } }] }, { text: 'It says hello.' }]);
+    const dir = project();
+    const res = await coco(dir, ['-p', 'read it', '--debug-file', 'debug.log', ...base(server)]);
+    assert.equal(res.stdout, 'It says hello.\n', 'the log must not leak into the output');
+    const log = fs.readFileSync(path.join(dir, 'debug.log'), 'utf8');
+    assert.match(log, /\[api\] request custom mock-model \{"messages":1,"tools":\d+/);
+    assert.match(log, /\[tools\] call Read \{"file_path":"hello\.txt"\}/);
+    assert.match(log, /\[tools\] result Read \d+ms/);
+    assert.match(log, /\[api\] response \d+ms stop=stop[^\n]*It says hello\./);
+  });
+
+  test('SIGTERM stops the run and exits 143', async () => {
+    const server = await mock([{ text: 'too slow', delayMs: 20_000 }]);
+    const dir = project();
+    const child = spawn('node', [CLI, '-p', 'hi', ...base(server)], {
+      cwd: dir,
+      env: { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'), OLLAMA_HOST: '127.0.0.1:1' },
+      stdio: 'ignore',
+    });
+    // Wait until the request is in flight, then terminate.
+    for (let i = 0; i < 100 && server.requests.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(server.requests.length, 1);
+    child.kill('SIGTERM');
+    const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+    assert.equal(code, 143);
   });
 });
 

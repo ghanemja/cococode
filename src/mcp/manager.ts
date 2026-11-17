@@ -1,14 +1,15 @@
 import type { ImagePart, JsonSchema } from '../types.ts';
 import { clampOutput } from '../tools/shell.ts';
 import type { Tool, ToolContext, ToolResult } from '../tools/types.ts';
-import { McpClient, type McpCallResult, type McpContentBlock, type McpPromptInfo, type McpToolInfo } from './client.ts';
+import { MCP_TIMEOUT_CODE, McpClient, McpError, type McpCallResult, type McpContentBlock, type McpPromptInfo, type McpToolInfo } from './client.ts';
 import type { McpServerConfig, ScopedMcpServer } from './config.ts';
 
 export interface McpServerStatus {
   name: string;
   scope: string;
   config: McpServerConfig;
-  status: 'pending' | 'connected' | 'failed';
+  /** `disabled` servers are configured but switched off: not connected, no tools. */
+  status: 'pending' | 'connected' | 'failed' | 'disabled';
   error?: string;
   toolCount: number;
   instructions?: string;
@@ -31,11 +32,18 @@ export interface McpResource {
 
 export interface McpManagerOptions {
   connectTimeoutMs?: number;
-  /** Timeout for tool calls and other requests. */
+  /**
+   * Timeout for tool calls and other requests. Unset, MCP_TOOL_TIMEOUT applies, then (for tool
+   * calls) the server's `timeout` field, then 30 minutes for stdio and 5 minutes for http/sse.
+   */
   requestTimeoutMs?: number;
   clientVersion?: string;
-  /** Working directory for stdio servers that do not set one. */
+  /** The project directory: working directory for stdio servers that set none, and the root offered through roots/list. */
   cwd?: string;
+  /** Names of servers that start switched off. setEnabled(name, true) connects them later. */
+  disabled?: string[];
+  /** Waits out the backoff between connection attempts. Tests inject one that returns at once. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 interface Entry {
@@ -46,13 +54,106 @@ interface Entry {
   tools: McpToolInfo[];
   prompts: McpPromptInfo[];
   instructions?: string;
-  /** True once the server has connected at least once; lets a tool call retry after a crash. */
+  /** Whether the server advertised the resources capability when it last connected. */
+  resources: boolean;
+  /** True once the server has connected at least once; lets a later use bring a dropped connection back. */
   everConnected: boolean;
-  /** In-flight connect, shared so concurrent callers do not spawn the server twice. */
+  /** In-flight connect (with its retries), shared so concurrent callers do not spawn the server twice. */
   connecting?: Promise<void>;
+  /** Aborted to stop the in-flight connect: on close, disable, or a manual reconnect. */
+  cancel?: AbortController;
+  /** The client whose handshake is in flight, so it can be closed early. */
+  attempt?: McpClient;
+  /** Automatic reconnection attempts since the last request that succeeded. */
+  reconnects: number;
+  /** Set when automatic reconnection stopped; only reconnect() or setEnabled() clears it. */
+  gaveUp: boolean;
 }
 
-const MAX_DESCRIPTION = 1024;
+type ConnectMode = 'once' | 'first' | 'revive';
+
+export const DEFAULT_MAX_MCP_DESCRIPTION = 4096;
+/** Extra attempts for a remote server that cannot be reached when it is first connected. */
+export const FIRST_CONNECT_RETRIES = 3;
+const FIRST_CONNECT_BACKOFF_MS = 500;
+/** Automatic reconnections of a dropped server before giving up. */
+export const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BACKOFF_MS = 1000;
+const RECONNECT_BACKOFF_CAP_MS = 30_000;
+
+/** Wait before the next automatic reconnection after `failures` attempts in a row: 1s, 2s, 4s ... capped at 30s. */
+export function reconnectDelayMs(failures: number): number {
+  if (!(failures > 0)) return 0;
+  return Math.min(RECONNECT_BACKOFF_CAP_MS, RECONNECT_BACKOFF_MS * 2 ** Math.min(failures - 1, 30));
+}
+
+/**
+ * Cut an over-long tool description (default cap 4096 characters, or
+ * CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH). The first line says what the tool
+ * is for, so it is never cut, even when it alone is longer than the cap.
+ */
+export function capDescription(description: string, max: number = maxDescriptionLength()): string {
+  if (description.length <= max) return description;
+  const ellipsis = String.fromCodePoint(0x2026);
+  const newline = description.indexOf('\n');
+  const firstLine = newline === -1 ? description : description.slice(0, newline);
+  if (firstLine.length >= max) return firstLine.length === description.length ? description : `${firstLine.trimEnd()}${ellipsis}`;
+  return `${description.slice(0, max - 1)}${ellipsis}`;
+}
+
+function maxDescriptionLength(): number {
+  const n = Number(process.env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_MCP_DESCRIPTION;
+}
+
+function isRemote(config: McpServerConfig): boolean {
+  return 'url' in config;
+}
+
+/**
+ * Whether a failed connection attempt may succeed if repeated. A server that
+ * answered with a refusal (HTTP 4xx, a JSON-RPC error) or used up the whole
+ * connect timeout is not asked again.
+ */
+function worthRetrying(err: unknown): boolean {
+  if (!(err instanceof McpError) || err.code === undefined) return true;
+  if (err.code === MCP_TIMEOUT_CODE) return false;
+  return err.code >= 500 || err.code === 408 || err.code === 429;
+}
+
+function abortError(): Error {
+  const err = new Error('Request cancelled');
+  err.name = 'AbortError';
+  return err;
+}
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted || !(ms > 0)) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** Wait for `promise`, but stop waiting (not the work itself) when `signal` aborts. */
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
 
 export function sanitizeMcpName(part: string): string {
   return part.replace(/[^A-Za-z0-9_-]/g, '_');
@@ -144,36 +245,119 @@ function flattenContent(content: McpContentBlock | McpContentBlock[] | string | 
 export class McpManager {
   private entries: Entry[];
   private readonly opts: McpManagerOptions;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(servers: ScopedMcpServer[], opts: McpManagerOptions = {}) {
     this.opts = opts;
+    this.sleep = opts.sleep ?? defaultSleep;
+    const disabled = new Set(opts.disabled ?? []);
     this.entries = servers.map((server) => ({
       server,
-      status: 'pending',
+      status: disabled.has(server.name) ? 'disabled' : 'pending',
       tools: [],
       prompts: [],
+      resources: false,
       everConnected: false,
+      reconnects: 0,
+      gaveUp: false,
     }));
   }
 
-  /** Connect to every server in parallel. Failures are recorded, never thrown. */
+  /** Connect to every enabled server in parallel. Failures are recorded, never thrown. */
   async connectAll(): Promise<void> {
-    await Promise.all(this.entries.map((entry) => this.connectEntry(entry)));
+    await Promise.all(this.entries.filter((entry) => entry.status !== 'disabled').map((entry) => this.connectEntry(entry, 'first')));
   }
 
-  private connectEntry(entry: Entry): Promise<void> {
+  /**
+   * Start connecting, or join the attempt already in flight.
+   * `first` retries a remote server that cannot be reached, `revive` brings back
+   * a connection that dropped, `once` is a single attempt.
+   */
+  private connectEntry(entry: Entry, mode: ConnectMode): Promise<void> {
     if (entry.connecting) return entry.connecting;
-    const attempt = this.doConnect(entry).finally(() => {
-      entry.connecting = undefined;
-    });
-    entry.connecting = attempt;
-    return attempt;
+    const cancel = new AbortController();
+    const run = this.runConnect(entry, mode, cancel.signal)
+      // doConnect records failures itself; this only shields callers from an injected sleep that throws.
+      .catch(() => {})
+      .finally(() => {
+        if (entry.cancel !== cancel) return;
+        entry.connecting = undefined;
+        entry.cancel = undefined;
+      });
+    entry.cancel = cancel;
+    entry.connecting = run;
+    return run;
   }
 
-  private async doConnect(entry: Entry): Promise<void> {
+  /** Abandon the connect in flight, if any, and wait until it has let go of the entry. */
+  private async stopConnecting(entry: Entry): Promise<void> {
+    const inflight = entry.connecting;
+    const attempt = entry.attempt;
+    entry.cancel?.abort();
+    entry.connecting = undefined;
+    entry.cancel = undefined;
+    entry.attempt = undefined;
+    if (attempt) await attempt.close().catch(() => {});
+    if (inflight) await inflight;
+  }
+
+  private async runConnect(entry: Entry, mode: ConnectMode, signal: AbortSignal): Promise<void> {
+    if (mode === 'revive') {
+      await this.revive(entry, signal);
+      return;
+    }
+    const retries = mode === 'first' && isRemote(entry.server.config) ? FIRST_CONNECT_RETRIES : 0;
+    for (let attempt = 0; ; attempt++) {
+      const retry = await this.doConnect(entry, signal);
+      if (!retry || attempt >= retries || signal.aborted) return;
+      await this.sleep(FIRST_CONNECT_BACKOFF_MS * 2 ** attempt, signal);
+      if (signal.aborted) return;
+    }
+  }
+
+  /**
+   * Bring back a server that worked earlier in the session. A remote server is
+   * retried here with a growing wait; a local one gets one restart per use.
+   * Either way, MAX_RECONNECT_ATTEMPTS attempts without a successful request
+   * in between end automatic reconnection.
+   */
+  private async revive(entry: Entry, signal: AbortSignal): Promise<void> {
+    const remote = isRemote(entry.server.config);
+    for (;;) {
+      if (entry.reconnects >= MAX_RECONNECT_ATTEMPTS) {
+        this.giveUp(entry);
+        return;
+      }
+      if (remote && entry.reconnects > 0) {
+        await this.sleep(reconnectDelayMs(entry.reconnects), signal);
+        if (signal.aborted) return;
+      }
+      entry.reconnects++;
+      await this.doConnect(entry, signal);
+      if (signal.aborted || entry.status !== 'failed') return;
+      if (!remote) {
+        if (entry.reconnects >= MAX_RECONNECT_ATTEMPTS) this.giveUp(entry);
+        return;
+      }
+    }
+  }
+
+  private giveUp(entry: Entry): void {
+    const client = entry.client;
+    entry.client = undefined;
+    if (client) void client.close().catch(() => {});
+    entry.gaveUp = true;
+    entry.status = 'failed';
+    const last = (entry.error ?? 'Connection lost').replace(/[.\s]+$/, '');
+    entry.error = `${last}. Gave up after ${MAX_RECONNECT_ATTEMPTS} reconnection attempts; run /mcp reconnect ${entry.server.name} to try again.`;
+  }
+
+  /** One connection attempt. Resolves true when it failed in a way that may pass, so a retry is worthwhile. */
+  private async doConnect(entry: Entry, signal: AbortSignal): Promise<boolean> {
     const previous = entry.client;
     entry.client = undefined;
     if (previous) await previous.close().catch(() => {});
+    if (signal.aborted) return false;
 
     entry.status = 'pending';
     entry.error = undefined;
@@ -183,6 +367,7 @@ export class McpManager {
       requestTimeoutMs: this.opts.requestTimeoutMs,
       clientVersion: this.opts.clientVersion,
       cwd: this.opts.cwd,
+      roots: this.opts.cwd ? [this.opts.cwd] : undefined,
       onClose: (error) => {
         if (entry.client !== client) return;
         entry.status = 'failed';
@@ -207,30 +392,67 @@ export class McpManager {
         }
       },
     });
+    entry.attempt = client;
 
     try {
       await client.connect();
+      if (signal.aborted) throw abortError();
       entry.client = client;
       entry.tools = await client.listTools();
       entry.prompts = await client.listPrompts().catch(() => []);
+      if (signal.aborted) throw abortError();
       entry.instructions = client.instructions;
+      entry.resources = client.capabilities.resources !== undefined;
       // The connection may have dropped while listing; onClose already recorded why.
       if (client.connected) {
         entry.status = 'connected';
         entry.everConnected = true;
-      } else if ((entry.status as McpServerStatus['status']) !== 'failed') {
+        return false;
+      }
+      if ((entry.status as McpServerStatus['status']) !== 'failed') {
         // onClose (above) normally sets this; the cast undoes TS narrowing from the assignment earlier.
         entry.status = 'failed';
         entry.error = 'Connection closed';
       }
+      return true;
     } catch (err) {
+      if (entry.client === client) entry.client = undefined;
+      await client.close().catch(() => {});
+      // Superseded by close(), setEnabled() or reconnect(): they decide what the entry says now.
+      if (signal.aborted) return false;
       entry.status = 'failed';
       entry.error = (err as Error).message || String(err);
-      entry.tools = [];
-      entry.prompts = [];
-      entry.client = undefined;
-      await client.close().catch(() => {});
+      // A server that worked before keeps its last known lists, so its tools stay on offer while it can be revived.
+      if (!entry.everConnected) {
+        entry.tools = [];
+        entry.prompts = [];
+      }
+      return worthRetrying(err);
+    } finally {
+      if (entry.attempt === client) entry.attempt = undefined;
     }
+  }
+
+  /** A server that connected before and may be reconnected automatically on its next use. */
+  private revivable(entry: Entry): boolean {
+    return entry.everConnected && !entry.gaveUp && entry.status !== 'disabled';
+  }
+
+  /** Whether the server's tools, prompts and resources are on offer: connected, or expected back. */
+  private offered(entry: Entry): boolean {
+    return entry.status === 'connected' || this.revivable(entry);
+  }
+
+  /** The server's client, ready for a request. A connection that worked earlier and dropped is re-established first. */
+  private async ready(entry: Entry, signal?: AbortSignal): Promise<McpClient | undefined> {
+    if (!entry.client?.connected && this.revivable(entry)) await raceAbort(this.connectEntry(entry, 'revive'), signal);
+    return entry.client?.connected ? entry.client : undefined;
+  }
+
+  private unavailable(entry: Entry): string {
+    const name = entry.server.name;
+    if (entry.status === 'disabled') return `MCP server "${name}" is disabled. The user can turn it on with /mcp enable ${name}.`;
+    return `MCP server "${name}" is not connected${entry.error ? `: ${entry.error}` : ''}`;
   }
 
   status(): McpServerStatus[] {
@@ -248,12 +470,16 @@ export class McpManager {
     });
   }
 
-  /** Tools of every connected server, named mcp__<server>__<tool>. */
+  /**
+   * Tools of every connected server, named mcp__<server>__<tool>. A server whose
+   * connection dropped keeps its tools listed until reconnection is given up,
+   * so that the model's next call can bring it back.
+   */
   tools(): Tool[] {
     const tools: Tool[] = [];
     const seen = new Set<string>();
     for (const entry of this.entries) {
-      if (entry.status !== 'connected') continue;
+      if (!this.offered(entry)) continue;
       for (const info of entry.tools) {
         if (!info || typeof info.name !== 'string') continue;
         const name = mcpToolName(entry.server.name, info.name);
@@ -275,7 +501,7 @@ export class McpManager {
 
     return {
       name,
-      description: description.length > MAX_DESCRIPTION ? `${description.slice(0, MAX_DESCRIPTION - 1)}…` : description,
+      description: capDescription(description),
       parameters,
       isReadOnly: () => readOnly,
       permission: () => ({ tool: name, kind: 'mcp', description: `${server}: ${info.name}` }),
@@ -288,20 +514,20 @@ export class McpManager {
     const server = entry.server.name;
     const args = input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
     try {
-      // A server that crashed after working once gets one automatic restart.
-      if (!entry.client?.connected && entry.everConnected) await this.connectEntry(entry);
-      const client = entry.client;
-      if (!client?.connected) {
-        return {
-          content: `MCP server "${server}" is not connected${entry.error ? `: ${entry.error}` : ''}`,
-          isError: true,
-        };
-      }
+      const client = await this.ready(entry, ctx.signal);
+      if (!client) return { content: this.unavailable(entry), isError: true };
       const result = await client.callTool(tool, args, ctx.signal);
+      entry.reconnects = 0;
       return toToolResult(result, ctx.settings.maxToolOutputChars ?? 30_000);
     } catch (err) {
       const error = err as Error;
-      const message = error.name === 'AbortError' ? 'Tool call was cancelled.' : error.message || String(err);
+      let message = error.name === 'AbortError' ? 'Tool call was cancelled.' : error.message || String(err);
+      if (error instanceof McpError && error.code === MCP_TIMEOUT_CODE) {
+        // Without this a model tends to send the identical call again and wait out the same timeout.
+        message = `${message.replace(/[.\s]+$/, '')}. The server did not answer in time. Do not repeat the same call unchanged: change the arguments, ask for less, or take another approach.`;
+      } else if (error.name !== 'AbortError' && !entry.client?.connected && this.revivable(entry)) {
+        message = `${message.replace(/[.\s]+$/, '')}. The connection to this server was lost; the next call to it reconnects first.`;
+      }
       return { content: `MCP tool ${server}/${tool} failed: ${message}`, isError: true };
     }
   }
@@ -309,7 +535,7 @@ export class McpManager {
   prompts(): McpPrompt[] {
     const out: McpPrompt[] = [];
     for (const entry of this.entries) {
-      if (entry.status !== 'connected') continue;
+      if (!this.offered(entry)) continue;
       for (const p of entry.prompts) {
         if (!p || typeof p.name !== 'string') continue;
         const prompt: McpPrompt = { server: entry.server.name, name: p.name };
@@ -321,18 +547,25 @@ export class McpManager {
     return out;
   }
 
-  private connectedClient(server: string): McpClient {
+  private entryFor(server: string): Entry {
     const entry = this.entries.find((e) => e.server.name === server);
     if (!entry) throw new Error(`Unknown MCP server "${server}"`);
-    if (!entry.client?.connected) {
-      throw new Error(`MCP server "${server}" is not connected${entry.error ? `: ${entry.error}` : ''}`);
-    }
-    return entry.client;
+    return entry;
+  }
+
+  /** Run one request against a server, reviving a dropped connection first. Rejects when it is unavailable. */
+  private async withClient<T>(server: string, signal: AbortSignal | undefined, run: (client: McpClient) => Promise<T>): Promise<T> {
+    const entry = this.entryFor(server);
+    const client = await this.ready(entry, signal);
+    if (!client) throw new Error(this.unavailable(entry));
+    const result = await run(client);
+    entry.reconnects = 0;
+    return result;
   }
 
   /** Fetch a prompt and flatten its messages to plain text. */
   async getPrompt(server: string, name: string, args: Record<string, string>): Promise<string> {
-    const result = await this.connectedClient(server).getPrompt(name, args);
+    const result = await this.withClient(server, undefined, (client) => client.getPrompt(name, args));
     const messages = Array.isArray(result?.messages) ? result.messages : [];
     return messages
       .map((m) => flattenContent(m?.content))
@@ -340,12 +573,21 @@ export class McpManager {
       .join('\n\n');
   }
 
-  async listResources(): Promise<McpResource[]> {
+  /** Servers that advertise the resources capability and are connected (or expected back). */
+  resourceServers(): string[] {
+    return this.entries.filter((entry) => entry.resources && this.offered(entry)).map((entry) => entry.server.name);
+  }
+
+  /** Resources of every connected server, or of one server when named. Never rejects: a server that fails contributes nothing. */
+  async listResources(server?: string): Promise<McpResource[]> {
     const lists = await Promise.all(
       this.entries.map(async (entry): Promise<McpResource[]> => {
-        if (entry.status !== 'connected' || !entry.client) return [];
+        if (server !== undefined && entry.server.name !== server) return [];
         try {
-          const resources = await entry.client.listResources();
+          // Naming a server is a use of it, so a dropped connection is revived; a sweep of all servers is not.
+          const client = server !== undefined ? await this.ready(entry) : entry.client?.connected ? entry.client : undefined;
+          if (!client) return [];
+          const resources = await client.listResources();
           return resources
             .filter((r) => r && typeof r.uri === 'string')
             .map((r) => {
@@ -363,8 +605,8 @@ export class McpManager {
     return lists.flat();
   }
 
-  async readResource(server: string, uri: string): Promise<string> {
-    const contents = await this.connectedClient(server).readResource(uri);
+  async readResource(server: string, uri: string, signal?: AbortSignal): Promise<string> {
+    const contents = await this.withClient(server, signal, (client) => client.readResource(uri, signal));
     return contents
       .map((c) => (typeof c.text === 'string' ? c.text : `[binary resource: ${c.uri}${c.mimeType ? ` (${c.mimeType})` : ''}]`))
       .join('\n');
@@ -372,15 +614,47 @@ export class McpManager {
 
   /** Drop and re-establish one server's connection. The outcome is reflected in status(). */
   async reconnect(name: string): Promise<void> {
-    const entry = this.entries.find((e) => e.server.name === name);
-    if (!entry) throw new Error(`Unknown MCP server "${name}"`);
-    if (entry.connecting) await entry.connecting.catch(() => {});
-    await this.connectEntry(entry);
+    const entry = this.entryFor(name);
+    if (entry.status === 'disabled') throw new Error(`MCP server "${name}" is disabled. Turn it on with /mcp enable ${name}.`);
+    await this.stopConnecting(entry);
+    entry.reconnects = 0;
+    entry.gaveUp = false;
+    await this.connectEntry(entry, 'once');
+  }
+
+  /**
+   * Switch a server off (close its connection and withdraw its tools) or back
+   * on (connect it again). The outcome is reflected in status(). Rejects only
+   * for a name that is not configured.
+   */
+  async setEnabled(name: string, enabled: boolean): Promise<void> {
+    const entry = this.entryFor(name);
+    if (!enabled) {
+      entry.status = 'disabled';
+      await this.stopConnecting(entry);
+      const client = entry.client;
+      entry.client = undefined;
+      entry.status = 'disabled';
+      entry.error = undefined;
+      entry.tools = [];
+      entry.prompts = [];
+      entry.instructions = undefined;
+      entry.resources = false;
+      entry.everConnected = false;
+      entry.reconnects = 0;
+      entry.gaveUp = false;
+      if (client) await client.close().catch(() => {});
+      return;
+    }
+    if (entry.status !== 'disabled') return;
+    entry.status = 'pending';
+    await this.connectEntry(entry, 'first');
   }
 
   async close(): Promise<void> {
     await Promise.all(
       this.entries.map(async (entry) => {
+        await this.stopConnecting(entry);
         const client = entry.client;
         entry.client = undefined;
         if (entry.status === 'connected') entry.status = 'pending';

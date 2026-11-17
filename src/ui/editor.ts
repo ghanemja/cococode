@@ -1,7 +1,7 @@
 /**
- * The prompt editor: a multi-line text buffer with a cursor, kill ring,
- * history and collapsed pastes. Pure state, no terminal I/O, so it can be
- * tested by feeding it operations.
+ * The prompt editor: a multi-line text buffer with a cursor, kill ring, undo,
+ * history (with incremental search), a stash and collapsed pastes. Pure
+ * state, no terminal I/O, so it can be tested by feeding it operations.
  */
 import { graphemeWidth, graphemes, stringWidth } from './ansi.ts';
 
@@ -19,6 +19,35 @@ interface Row {
 
 const PASTE_LINES = 6;
 const PASTE_CHARS = 800;
+/** Undo steps kept; the oldest are dropped beyond this. */
+const UNDO_LIMIT = 100;
+/** A pause this long between keystrokes starts a new undo step. */
+const UNDO_PAUSE_MS = 1000;
+
+/** What undo, the stash and a cancelled search put back. */
+interface Snapshot {
+  text: string;
+  cursor: number;
+  historyIndex: number;
+  pastes: Map<string, string>;
+}
+
+/** Edits that merge with the one before: a run of typing or of deleting is one undo step. */
+type EditKind = 'type' | 'backspace' | 'delete';
+
+/** A reverse history search in progress, as the UI shows it. */
+export interface EditorSearch {
+  query: string;
+  /** The history entry found (also previewed in the buffer), or null when nothing contains the query. */
+  match: string | null;
+  /** An older match was asked for and there is none. */
+  exhausted: boolean;
+}
+
+export interface EditorOptions {
+  /** Clock used to group keystrokes into undo steps. Replaceable in tests. */
+  now?: () => number;
+}
 
 export class Editor {
   text = '';
@@ -29,6 +58,16 @@ export class Editor {
   private killed = '';
   private pastes = new Map<string, string>();
   private pasteCount = 0;
+  private readonly now: () => number;
+  private undoStack: Snapshot[] = [];
+  private lastEdit: { kind: EditKind; text: string; cursor: number; at: number } | null = null;
+  private stashed: Snapshot[] = [];
+  private searchState: { query: string; index: number; exhausted: boolean; saved: Snapshot } | null = null;
+  private lastQuery = '';
+
+  constructor(opts: EditorOptions = {}) {
+    this.now = opts.now ?? Date.now;
+  }
 
   setHistory(entries: string[]): void {
     this.history = entries.filter((e) => e.trim() !== '');
@@ -57,35 +96,143 @@ export class Editor {
     return text.replace(/\[Pasted text #\d+ \+\d+ lines\]/g, (token) => this.pastes.get(token) ?? token);
   }
 
+  /** Load text as a new starting point, cursor at the end. Undo does not go back past it. */
   set(text: string): void {
+    this.load(text);
+    this.forgetUndo();
+    this.searchState = null;
+  }
+
+  private load(text: string): void {
     this.text = text;
     this.cursor = text.length;
   }
 
+  /** Start over after a submit: nothing of the old prompt is left, not even for undo. */
   clear(): void {
     this.text = '';
     this.cursor = 0;
     this.historyIndex = -1;
     this.pastes.clear();
+    this.forgetUndo();
+    this.searchState = null;
   }
 
-  insert(s: string): void {
+  /** Empty the prompt as an edit: unlike clear(), undo brings the text back. */
+  discard(): void {
+    this.edit(null, () => {
+      this.text = '';
+      this.cursor = 0;
+      this.historyIndex = -1;
+    });
+  }
+
+  // --------------------------------------------------------------------- undo
+
+  private snapshot(): Snapshot {
+    return { text: this.text, cursor: this.cursor, historyIndex: this.historyIndex, pastes: new Map(this.pastes) };
+  }
+
+  private restore(snap: Snapshot): void {
+    this.text = snap.text;
+    this.cursor = snap.cursor;
+    this.historyIndex = snap.historyIndex;
+    // Pastes are only ever added back: a placeholder that is still in the kill ring must keep its content.
+    for (const [token, content] of snap.pastes) this.pastes.set(token, content);
+  }
+
+  private forgetUndo(): void {
+    this.undoStack = [];
+    this.lastEdit = null;
+  }
+
+  /**
+   * Make one change to the buffer, remembering the state before it for undo().
+   * A change of the same `kind` as the one just before it, continuing where
+   * that one stopped and without a pause, joins its undo step; with no kind
+   * the change is always a step of its own.
+   */
+  private edit(kind: EditKind | null, change: () => void): void {
+    const before = this.snapshot();
+    const last = this.lastEdit;
+    const at = this.now();
+    const joins = kind !== null && last !== null && last.kind === kind && last.cursor === before.cursor && last.text === before.text && at - last.at < UNDO_PAUSE_MS;
+    change();
+    if (this.text === before.text) return; // nothing changed, so there is nothing to undo
+    if (!joins) {
+      this.undoStack.push(before);
+      if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
+    }
+    this.lastEdit = kind ? { kind, text: this.text, cursor: this.cursor, at } : null;
+  }
+
+  /** Whether undo() has a step to go back to. */
+  get canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  /** Go back to before the last edit. Returns false when there is nothing to undo. */
+  undo(): boolean {
+    const snap = this.undoStack.pop();
+    if (!snap) return false;
+    this.restore(snap);
+    this.lastEdit = null;
+    return true;
+  }
+
+  // ------------------------------------------------------------------ editing
+
+  private insertRaw(s: string): void {
     const clean = s.replace(/\r\n?/g, '\n').replace(/\t/g, '  ');
     this.text = this.text.slice(0, this.cursor) + clean + this.text.slice(this.cursor);
     this.cursor += clean.length;
+  }
+
+  /** Typed text. Consecutive calls are one undo step. */
+  insert(s: string): void {
+    this.edit('type', () => this.insertRaw(s));
   }
 
   /** Large pastes are shown as a placeholder so the prompt stays readable. */
   paste(s: string): void {
     const clean = s.replace(/\r\n?/g, '\n');
     const lines = clean.split('\n').length;
-    if (lines > PASTE_LINES || clean.length > PASTE_CHARS) {
-      const token = `[Pasted text #${++this.pasteCount} +${lines} lines]`;
-      this.pastes.set(token, clean);
-      this.insert(token);
-    } else {
-      this.insert(clean);
+    this.edit(null, () => {
+      if (lines > PASTE_LINES || clean.length > PASTE_CHARS) {
+        const token = `[Pasted text #${++this.pasteCount} +${lines} lines]`;
+        this.pastes.set(token, clean);
+        this.insertRaw(token);
+      } else {
+        this.insertRaw(clean);
+      }
+    });
+  }
+
+  /**
+   * Swap the whole buffer for `text` as one edit (what came back from an
+   * external editor). A collapsed paste that is still there word for word
+   * keeps its placeholder.
+   */
+  replaceAll(text: string): void {
+    let next = text.replace(/\r\n?/g, '\n');
+    for (const [token, content] of this.pastes) {
+      if (!this.text.includes(token)) continue;
+      const at = next.indexOf(content);
+      if (at >= 0) next = next.slice(0, at) + token + next.slice(at + content.length);
     }
+    next = next.replace(/\t/g, '  ');
+    this.edit(null, () => {
+      this.load(next);
+      this.historyIndex = -1;
+    });
+  }
+
+  /** The collapsed paste whose placeholder ends (or starts) at `pos`: placeholders are removed whole. */
+  private pasteAt(pos: number, side: 'before' | 'after'): string | undefined {
+    for (const token of this.pastes.keys()) {
+      if (side === 'before' ? this.text.endsWith(token, pos) : this.text.startsWith(token, pos)) return token;
+    }
+    return undefined;
   }
 
   private prevBoundary(pos: number): number {
@@ -102,24 +249,22 @@ export class Editor {
 
   backspace(): void {
     if (this.cursor === 0) return;
-    // A collapsed paste is deleted as a unit.
-    for (const token of this.pastes.keys()) {
-      if (this.text.slice(0, this.cursor).endsWith(token)) {
-        this.text = this.text.slice(0, this.cursor - token.length) + this.text.slice(this.cursor);
-        this.cursor -= token.length;
-        this.pastes.delete(token);
-        return;
-      }
-    }
-    const prev = this.prevBoundary(this.cursor);
-    this.text = this.text.slice(0, prev) + this.text.slice(this.cursor);
-    this.cursor = prev;
+    this.edit('backspace', () => {
+      // A collapsed paste is deleted as a unit.
+      const token = this.pasteAt(this.cursor, 'before');
+      if (token) this.pastes.delete(token);
+      const prev = token ? this.cursor - token.length : this.prevBoundary(this.cursor);
+      this.text = this.text.slice(0, prev) + this.text.slice(this.cursor);
+      this.cursor = prev;
+    });
   }
 
   del(): void {
     if (this.cursor >= this.text.length) return;
-    const next = this.nextBoundary(this.cursor);
-    this.text = this.text.slice(0, this.cursor) + this.text.slice(next);
+    this.edit('delete', () => {
+      const next = this.nextBoundary(this.cursor);
+      this.text = this.text.slice(0, this.cursor) + this.text.slice(next);
+    });
   }
 
   left(): void {
@@ -163,9 +308,11 @@ export class Editor {
   /** Remove [start, end) and remember it for yank. Killing nothing keeps the previous kill. */
   private kill(start: number, end: number): void {
     if (end <= start) return;
-    this.killed = this.text.slice(start, end);
-    this.text = this.text.slice(0, start) + this.text.slice(end);
-    this.cursor = start;
+    this.edit(null, () => {
+      this.killed = this.text.slice(start, end);
+      this.text = this.text.slice(0, start) + this.text.slice(end);
+      this.cursor = start;
+    });
   }
 
   killToEnd(): void {
@@ -181,14 +328,27 @@ export class Editor {
 
   killWordBack(): void {
     const end = this.cursor;
-    this.wordLeft();
-    const start = this.cursor;
-    this.cursor = end;
+    let start = end;
+    while (start > 0 && /\s/.test(this.text[start - 1]!)) start--;
+    // A placeholder has spaces in it but is one word: half of one would be sent as it stands.
+    const token = this.pasteAt(start, 'before');
+    if (token) start -= token.length;
+    else while (start > 0 && !/\s/.test(this.text[start - 1]!)) start--;
     this.kill(start, end);
   }
 
+  /** Kill from the cursor to the end of the next word. */
+  killWordForward(): void {
+    let end = this.cursor;
+    while (end < this.text.length && /\s/.test(this.text[end]!)) end++;
+    const token = this.pasteAt(end, 'after');
+    if (token) end += token.length;
+    else while (end < this.text.length && !/\s/.test(this.text[end]!)) end++;
+    this.kill(this.cursor, end);
+  }
+
   yank(): void {
-    if (this.killed) this.insert(this.killed);
+    if (this.killed) this.edit(null, () => this.insertRaw(this.killed));
   }
 
   /** Split the buffer into visual rows of at most `width` columns. */
@@ -270,27 +430,160 @@ export class Editor {
     return this.moveVertical(width, 1);
   }
 
+  /** Recall the entry before the current one. Each recall is an undo step. */
   historyPrev(): boolean {
-    if (this.history.length === 0) return false;
-    if (this.historyIndex === -1) {
-      this.draft = this.text;
-      this.historyIndex = this.history.length;
-    }
-    if (this.historyIndex === 0) return false;
-    this.historyIndex--;
-    this.set(this.history[this.historyIndex]!);
+    if (this.history.length === 0 || this.historyIndex === 0) return false;
+    this.edit(null, () => {
+      if (this.historyIndex === -1) {
+        this.draft = this.text;
+        this.historyIndex = this.history.length;
+      }
+      this.historyIndex--;
+      this.load(this.history[this.historyIndex]!);
+    });
     return true;
   }
 
   historyNext(): boolean {
     if (this.historyIndex === -1) return false;
-    this.historyIndex++;
-    if (this.historyIndex >= this.history.length) {
-      this.historyIndex = -1;
-      this.set(this.draft);
-    } else {
-      this.set(this.history[this.historyIndex]!);
+    this.edit(null, () => {
+      this.historyIndex++;
+      if (this.historyIndex >= this.history.length) {
+        this.historyIndex = -1;
+        this.load(this.draft);
+      } else {
+        this.load(this.history[this.historyIndex]!);
+      }
+    });
+    return true;
+  }
+
+  // ----------------------------------------------------------- history search
+
+  /** The reverse search in progress, or null. */
+  get search(): EditorSearch | null {
+    const s = this.searchState;
+    if (!s) return null;
+    return { query: s.query, match: s.index >= 0 ? this.history[s.index]! : null, exhausted: s.exhausted };
+  }
+
+  /** Begin a reverse search through history. The prompt is kept aside until the search ends. */
+  searchStart(): void {
+    if (this.searchState) return;
+    this.searchState = { query: '', index: -1, exhausted: false, saved: this.snapshot() };
+  }
+
+  /** Newest entry at or before `start` that contains the query, ignoring case; -1 when there is none. */
+  private searchFrom(start: number, skip?: string): number {
+    const query = this.searchState!.query.toLowerCase();
+    for (let i = Math.min(start, this.history.length - 1); i >= 0; i--) {
+      const entry = this.history[i]!;
+      if (entry !== skip && entry.toLowerCase().includes(query)) return i;
     }
+    return -1;
+  }
+
+  /** Preview the match in the buffer; with none, show the prompt the search started from. */
+  private searchShow(index: number): void {
+    const s = this.searchState!;
+    s.index = index;
+    if (index >= 0) {
+      this.load(this.history[index]!);
+    } else {
+      this.text = s.saved.text;
+      this.cursor = s.saved.cursor;
+    }
+  }
+
+  /** Add typed text to the query. The search continues from the current match, so it only narrows. */
+  searchInput(text: string): void {
+    const s = this.searchState;
+    const added = text.replace(/\s+/g, ' ');
+    if (!s || !added) return;
+    s.query += added;
+    s.exhausted = false;
+    this.searchShow(this.searchFrom(s.index >= 0 ? s.index : this.history.length - 1));
+  }
+
+  /** Remove the last character of the query and search again from the newest entry. */
+  searchBackspace(): void {
+    const s = this.searchState;
+    if (!s || !s.query) return;
+    s.query = graphemes(s.query).slice(0, -1).join('');
+    s.exhausted = false;
+    this.searchShow(s.query ? this.searchFrom(this.history.length - 1) : -1);
+  }
+
+  /** Move to the next older entry containing the query (a different one from what is shown). */
+  searchOlder(): void {
+    const s = this.searchState;
+    if (!s) return;
+    if (!s.query) {
+      // As in readline: asking again with nothing typed repeats the previous search.
+      if (!this.lastQuery) return;
+      s.query = this.lastQuery;
+      this.searchShow(this.searchFrom(this.history.length - 1));
+      return;
+    }
+    if (s.index < 0) return;
+    const older = this.searchFrom(s.index - 1, this.history[s.index]);
+    if (older < 0) s.exhausted = true;
+    else this.searchShow(older);
+  }
+
+  private searchEnd(): void {
+    const s = this.searchState!;
+    this.searchState = null;
+    if (s.query) this.lastQuery = s.query;
+    this.text = s.saved.text;
+    this.cursor = s.saved.cursor;
+  }
+
+  /**
+   * End the search with the match as the prompt, as one undo step back to
+   * what was there before. Like a recalled entry, up and down continue from
+   * it. Returns false, with the old prompt back, when there was no match.
+   */
+  searchAccept(): boolean {
+    const s = this.searchState;
+    if (!s) return false;
+    this.searchEnd();
+    if (s.index < 0) return false;
+    this.edit(null, () => {
+      if (this.historyIndex === -1) this.draft = this.text;
+      this.historyIndex = s.index;
+      this.load(this.history[s.index]!);
+    });
+    return true;
+  }
+
+  /** End the search and put back what was in the prompt. */
+  searchCancel(): void {
+    if (this.searchState) this.searchEnd();
+  }
+
+  // -------------------------------------------------------------------- stash
+
+  /** Number of prompts set aside. */
+  get stashCount(): number {
+    return this.stashed.length;
+  }
+
+  /** Set the prompt aside and empty the buffer. Returns false when there is nothing to set aside. */
+  stash(): boolean {
+    if (this.isEmpty) return false;
+    this.searchCancel();
+    this.stashed.push(this.snapshot());
+    this.clear();
+    return true;
+  }
+
+  /** Bring the most recently stashed prompt back. Only into an empty buffer, so nothing is overwritten. */
+  unstash(): boolean {
+    if (!this.isEmpty || this.stashed.length === 0) return false;
+    this.restore(this.stashed.pop()!);
+    this.historyIndex = -1;
+    this.forgetUndo();
     return true;
   }
 
@@ -305,7 +598,9 @@ export class Editor {
 
   /** Replace the text from `start` to the cursor (used to accept a completion). */
   replaceRange(start: number, replacement: string): void {
-    this.text = this.text.slice(0, start) + replacement + this.text.slice(this.cursor);
-    this.cursor = start + replacement.length;
+    this.edit(null, () => {
+      this.text = this.text.slice(0, start) + replacement + this.text.slice(this.cursor);
+      this.cursor = start + replacement.length;
+    });
   }
 }

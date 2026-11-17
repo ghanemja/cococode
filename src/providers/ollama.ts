@@ -116,7 +116,7 @@ export class OllamaProvider implements Provider {
       const body: Record<string, unknown> = {
         model: req.model,
         messages: toOllamaMessages(req.system, req.messages),
-        stream: true,
+        stream: req.stream !== false,
         options,
       };
       if (req.keepAlive) body.keep_alive = req.keepAlive;

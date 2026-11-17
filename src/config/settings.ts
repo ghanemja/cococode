@@ -32,6 +32,10 @@ export type HookEvent =
   | 'Stop'
   | 'SubagentStop'
   | 'PreCompact'
+  | 'PostCompact'
+  | 'PostToolUseFailure'
+  | 'PermissionRequest'
+  | 'SubagentStart'
   | 'SessionStart'
   | 'SessionEnd';
 
@@ -43,6 +47,10 @@ export const HOOK_EVENTS: HookEvent[] = [
   'Stop',
   'SubagentStop',
   'PreCompact',
+  'PostCompact',
+  'PostToolUseFailure',
+  'PermissionRequest',
+  'SubagentStart',
   'SessionStart',
   'SessionEnd',
 ];
@@ -67,6 +75,8 @@ export interface Settings {
   providers?: Record<string, ProviderConfig>;
   /** Optional lighter model for summaries and other background work. */
   smallModel?: string;
+  /** Models to try, in order, for the rest of a turn when the session model fails. */
+  fallbackModel?: string | string[];
 
   /** Context window in tokens. Detected from the server when unset. */
   contextWindow?: number;
@@ -85,6 +95,8 @@ export interface Settings {
 
   permissions?: PermissionSettings;
   hooks?: HooksConfig;
+  /** Turn every hook off without removing its configuration. */
+  disableAllHooks?: boolean;
   env?: Record<string, string>;
 
   autoCompact?: boolean;
@@ -99,6 +111,10 @@ export interface Settings {
   webSearch?: { provider?: 'duckduckgo' | 'searxng'; url?: string };
   /** Also read CLAUDE.md and .claude/{commands,agents,skills,settings.json}. Default true. */
   claudeCompat?: boolean;
+  /** Glob patterns for instruction files that should not be loaded. */
+  claudeMdExcludes?: string[];
+  /** Let the agent keep its own notes for this project between sessions. Default true. */
+  autoMemoryEnabled?: boolean;
   verbose?: boolean;
   /** Ring the terminal bell when a turn finishes or input is needed. */
   bell?: boolean;
@@ -116,7 +132,7 @@ export const DEFAULTS = {
   maxToolOutputChars: 30000,
   bashTimeoutMs: 120_000,
   bashMaxTimeoutMs: 600_000,
-  maxRetries: 4,
+  maxRetries: 10,
   requestTimeoutMs: 600_000,
   keepAlive: '30m',
   cleanupPeriodDays: 30,

@@ -5,9 +5,13 @@ import { plural } from '../ui/ansi.ts';
 import { stripBom } from '../util/frontmatter.ts';
 import {
   checkFresh,
+  decodeUtf8,
   detectEol,
   editPermission,
+  encodingProblem,
+  examineFile,
   looksBinary,
+  looksUtf16,
   readPermission,
   recordRead,
   resolvePath,
@@ -21,6 +25,8 @@ import { errorResult } from './types.ts';
 
 const DEFAULT_READ_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
+const BOM = String.fromCodePoint(0xfeff);
+const REPLACEMENT = String.fromCodePoint(0xfffd);
 const IMAGE_TYPES: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -81,11 +87,14 @@ export const readTool: Tool<ReadInput> = {
     if (ext === '.pdf') return errorResult('PDF files cannot be read directly. If pdftotext is installed, run it with Bash and read the output.');
 
     const buf = fs.readFileSync(abs);
-    if (looksBinary(buf)) return errorResult(`${shortPath(ctx, abs)} is a binary file (${stat.size} bytes) and cannot be shown as text.`);
+    if (looksBinary(buf)) {
+      const utf16 = looksUtf16(buf) ? ' It looks like UTF-16 text: convert it with Bash, for example iconv -f UTF-16 -t UTF-8, and read the result.' : '';
+      return errorResult(`${shortPath(ctx, abs)} is a binary file (${stat.size} bytes) and cannot be shown as text.${utf16}`);
+    }
     const maxChars = ctx.settings.maxToolOutputChars ?? DEFAULTS.maxToolOutputChars;
 
     if (ext === '.ipynb') {
-      recordRead(ctx, abs);
+      recordRead(ctx, abs, false, buf);
       try {
         return { content: clampOutput(renderNotebook(buf.toString('utf8')), maxChars), summary: 'Read notebook' };
       } catch (err) {
@@ -93,9 +102,15 @@ export const readTool: Tool<ReadInput> = {
       }
     }
 
+    // A file in another encoding is still shown, with the bytes that do not decode replaced,
+    // but the model is told: text read this way cannot be written back without damage.
+    const problem = encodingProblem(buf);
+    const encodingNote = problem
+      ? `\n\n[${shortPath(ctx, abs)} ${problem}. Bytes that do not decode are shown as ${REPLACEMENT}, and Edit will refuse this file: change it with a shell tool such as sed, or convert it to UTF-8 with iconv first.]`
+      : '';
     const text = stripBom(buf.toString('utf8'));
     if (text.length === 0) {
-      recordRead(ctx, abs);
+      recordRead(ctx, abs, false, buf);
       return { content: '(The file exists but is empty.)', summary: 'Read 0 lines' };
     }
     const allLines = text.replace(/\r\n/g, '\n').split('\n');
@@ -120,12 +135,13 @@ export const readTool: Tool<ReadInput> = {
     }
     const end = start + selected.length - 1;
     const partial = start > 1 || end < total;
-    recordRead(ctx, abs, partial);
+    recordRead(ctx, abs, partial, buf);
 
     let content = numberLines(selected, start);
     if (end < total) {
       content += `\n\n[Showing lines ${start}-${end} of ${total}${clipped ? ' (output size limit reached)' : ''}. Call Read with offset=${end + 1} to continue.]`;
     }
+    content += encodingNote;
     return { content, summary: `Read ${plural(selected.length, 'line')}${partial ? ` (${start}-${end} of ${total})` : ''}` };
   },
 };
@@ -387,7 +403,15 @@ type EditPlan =
   | { error: string }
   | { abs: string; before: string | null; after: string; output: string; summary: string; message: string };
 
-/** Work out what an Edit call would do, without touching the file. */
+/**
+ * Work out what an Edit call would do, without touching the file.
+ *
+ * A file that changed on disk after the model read it is not refused outright:
+ * when old_string still matches the current content exactly, in one place (or
+ * anywhere, with replace_all), the edit means the same thing it meant before
+ * the change. Only then; the whitespace-tolerant matching is for files whose
+ * content the model has seen.
+ */
 export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
   const abs = resolvePath(ctx, input.file_path);
   const name = shortPath(ctx, abs);
@@ -398,21 +422,47 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     if (inputOld !== '') return { error: `File does not exist: ${abs}. Use Write to create it, or Glob to find the right path.` };
     return { abs, before: null, after: inputNew, output: inputNew, summary: 'Created file', message: `Created ${name}.` };
   }
-  const stale = checkFresh(ctx, abs);
-  if (stale) return { error: stale };
+  let bytes: Buffer | undefined;
+  let readError = '';
+  try {
+    bytes = fs.readFileSync(abs);
+  } catch (err) {
+    readError = (err as Error).message; // a directory, or unreadable
+  }
+  const check = examineFile(ctx, abs, bytes);
+  if (check.state === 'directory' || check.state === 'unread') return { error: check.message! };
+  if (!bytes) return { error: `Could not read ${abs}: ${readError}` };
+  const changed = check.state === 'changed';
 
-  const raw = fs.readFileSync(abs, 'utf8');
+  const problem = encodingProblem(bytes);
+  if (problem) {
+    return {
+      error:
+        `${name} ${problem}, and Edit only works on UTF-8 text: decoding the file would replace the bytes that do not fit and corrupt it. ` +
+        'Change it with a shell tool such as sed, or convert it to UTF-8 with iconv first.',
+    };
+  }
+  const decoded = decodeUtf8(bytes)!;
+  // A byte-order mark is not text to match against; it is put back when the file is written.
+  const bom = decoded.startsWith(BOM) ? BOM : '';
+  const raw = decoded.slice(bom.length);
   const eol = detectEol(raw);
   const content = raw.replace(/\r\n/g, '\n');
   let oldString = inputOld.replace(/\r\n/g, '\n');
   let newString = inputNew.replace(/\r\n/g, '\n');
+  if (bom) {
+    oldString = stripBom(oldString);
+    newString = stripBom(newString);
+  }
 
   if (oldString === newString) return { error: 'old_string and new_string are identical; nothing to change.' };
   if (oldString === '') {
     if (content.trim() !== '') {
       return { error: 'old_string is empty but the file has content. Provide the text to replace, or use Write to replace the whole file.' };
     }
-    return { abs, before: raw, after: newString, output: newString, summary: 'Wrote file', message: `Wrote ${name}.` };
+    // Filling the file replaces all of it, which like Write needs a current read.
+    if (changed) return { error: check.message! };
+    return { abs, before: raw, after: newString, output: bom + newString, summary: 'Wrote file', message: `Wrote ${name}.` };
   }
 
   let count = countOccurrences(content, oldString);
@@ -420,7 +470,7 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     // The text may have been pasted from Read output, line-number prefixes and all. Only
     // assume so when it does not match as written: a TSV row really can start "12<tab>".
     const bare = stripLineNumbers(oldString);
-    if (bare !== oldString && (countOccurrences(content, bare) > 0 || fuzzyFind(content, bare, '') !== null)) {
+    if (bare !== oldString && (countOccurrences(content, bare) > 0 || (!changed && fuzzyFind(content, bare, '') !== null))) {
       oldString = bare;
       newString = stripLineNumbers(newString);
       if (oldString === newString) return { error: 'old_string and new_string are identical; nothing to change.' };
@@ -428,6 +478,8 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     }
   }
   if (count === 0) {
+    // No exact match in a file the model has not seen in its current state: a looser match could land anywhere.
+    if (changed) return { error: check.message! };
     const fuzzy = fuzzyFind(content, oldString, newString);
     if (!fuzzy) {
       return {
@@ -448,7 +500,7 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     }
     const first = fuzzy.regions[0]!;
     const offset = content.split('\n').slice(0, first.startLine).join('\n').length + (first.startLine > 0 ? 1 : 0);
-    return finishEdit(abs, name, content, lines.join('\n'), eol, fuzzy.count, offset, first.replacement.length, ` (matched ${fuzzy.how})`);
+    return finishEdit({ abs, name, before: content, updated: lines.join('\n'), eol, bom, replaced: fuzzy.count, at: offset, length: first.replacement.length, how: ` (matched ${fuzzy.how})`, changed });
   }
   if (count > 1 && !input.replace_all) {
     const lineNos: number[] = [];
@@ -458,7 +510,8 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     return {
       error:
         `old_string appears ${count} times in ${name} (lines ${lineNos.join(', ')}). ` +
-        'Add surrounding lines to make it unique, or set replace_all to true.',
+        'Add surrounding lines to make it unique, or set replace_all to true.' +
+        (changed ? ' The file also changed on disk since you last read it, so Read it again to see what is there now.' : ''),
     };
   }
 
@@ -466,17 +519,39 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
   const updated = input.replace_all
     ? content.split(oldString).join(newString)
     : content.slice(0, firstIndex) + newString + content.slice(firstIndex + oldString.length);
-  return finishEdit(abs, name, content, updated, eol, input.replace_all ? count : 1, firstIndex, newString.length, '');
+  return finishEdit({ abs, name, before: content, updated, eol, bom, replaced: input.replace_all ? count : 1, at: firstIndex, length: newString.length, how: '', changed });
 }
 
-function finishEdit(abs: string, name: string, before: string, updated: string, eol: string, replaced: number, at: number, length: number, note: string): EditPlan {
+interface EditOutcome {
+  abs: string;
+  name: string;
+  before: string;
+  updated: string;
+  eol: string;
+  /** The file's byte-order mark, or '' when it has none. */
+  bom: string;
+  replaced: number;
+  /** Where the (first) replacement starts in `updated`, and how long it is. */
+  at: number;
+  length: number;
+  /** How a whitespace-tolerant match was made, for the summary. */
+  how: string;
+  /** The file was edited although it had changed since the model read it. */
+  changed: boolean;
+}
+
+function finishEdit(e: EditOutcome): EditPlan {
+  const count = `${plural(e.replaced, 'occurrence')}${e.how}`;
+  const outside = e.changed
+    ? `Note: ${e.name} had changed on disk since you last read it. old_string still matched it exactly, so the edit was applied; Read the file again if you need to see what else is different. `
+    : '';
   return {
-    abs,
-    before,
-    after: updated,
-    output: eol === '\r\n' ? updated.replace(/\n/g, '\r\n') : updated,
-    summary: `Replaced ${plural(replaced, 'occurrence')}${note}`,
-    message: `Edited ${name}: replaced ${plural(replaced, 'occurrence')}${note}. The file now reads:\n` + snippetAround(updated, at, length),
+    abs: e.abs,
+    before: e.before,
+    after: e.updated,
+    output: e.bom + (e.eol === '\r\n' ? e.updated.replace(/\n/g, '\r\n') : e.updated),
+    summary: `Replaced ${count}`,
+    message: `Edited ${e.name}: replaced ${count}. ${outside}The file now reads:\n` + snippetAround(e.updated, e.at, e.length),
   };
 }
 
@@ -520,7 +595,7 @@ export function readForContext(ctx: ToolContext, absPath: string, maxChars: numb
   try {
     const buf = fs.readFileSync(absPath);
     if (looksBinary(buf)) return null;
-    recordRead(ctx, absPath, buf.length > maxChars);
+    recordRead(ctx, absPath, buf.length > maxChars, buf);
     const text = buf.toString('utf8');
     return text.length > maxChars ? `${text.slice(0, maxChars)}\n… [truncated, ${text.length - maxChars} more characters]` : text;
   } catch {

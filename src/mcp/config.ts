@@ -7,6 +7,8 @@ export interface McpStdioConfig {
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
+  /** Tool-call timeout for this server in milliseconds. Values under 1000 are ignored. */
+  timeout?: number;
 }
 
 export interface McpHttpConfig {
@@ -14,6 +16,8 @@ export interface McpHttpConfig {
   type: 'http' | 'sse';
   url: string;
   headers?: Record<string, string>;
+  /** Tool-call timeout for this server in milliseconds. Values under 1000 are ignored. */
+  timeout?: number;
 }
 
 export type McpServerConfig = McpStdioConfig | McpHttpConfig;
@@ -77,6 +81,16 @@ function stringMap(value: unknown, missing: Set<string>): Record<string, string>
   return out;
 }
 
+/** Smallest per-server `timeout` that is honoured; anything lower is almost certainly seconds typed by mistake. */
+export const MIN_SERVER_TIMEOUT_MS = 1000;
+
+/** The per-server tool-call timeout, when it is a usable number of milliseconds. */
+function timeoutField(value: unknown, missing: Set<string>): number | undefined {
+  if (typeof value !== 'number' && typeof value !== 'string') return undefined;
+  const n = typeof value === 'number' ? value : Number(expand(value, missing).trim() || NaN);
+  return Number.isFinite(n) && n >= MIN_SERVER_TIMEOUT_MS ? Math.floor(n) : undefined;
+}
+
 /** Validate one server entry and expand environment references. Returns an error string on failure. */
 export function normalizeMcpConfig(raw: unknown): { config?: McpServerConfig; error?: string; missingEnv: string[] } {
   const missing = new Set<string>();
@@ -98,6 +112,8 @@ export function normalizeMcpConfig(raw: unknown): { config?: McpServerConfig; er
     const config: McpHttpConfig = { type: rawType === 'sse' ? 'sse' : 'http', url };
     const headers = stringMap(raw.headers, missing);
     if (headers && Object.keys(headers).length) config.headers = headers;
+    const timeout = timeoutField(raw.timeout, missing);
+    if (timeout !== undefined) config.timeout = timeout;
     return { config, missingEnv: [...missing] };
   }
 
@@ -112,6 +128,8 @@ export function normalizeMcpConfig(raw: unknown): { config?: McpServerConfig; er
   const env = stringMap(raw.env, missing);
   if (env && Object.keys(env).length) config.env = env;
   if (typeof raw.cwd === 'string' && raw.cwd) config.cwd = expand(raw.cwd, missing);
+  const timeout = timeoutField(raw.timeout, missing);
+  if (timeout !== undefined) config.timeout = timeout;
   return { config, missingEnv: [...missing] };
 }
 
@@ -208,15 +226,44 @@ function readScopeFile(file: string): Record<string, unknown> {
   }
 }
 
-/** Add or replace a server in the given scope's file. Returns the file written. */
-export function addMcpServer(scope: McpScope, projectRoot: string, name: string, config: McpServerConfig): string {
+function writeServer(scope: McpScope, projectRoot: string, name: string, definition: unknown): string {
   const file = mcpConfigPath(scope, projectRoot);
   const data = readScopeFile(file);
   const servers = isPlainObject(data.mcpServers) ? data.mcpServers : {};
-  servers[name] = config;
+  servers[name] = definition;
   data.mcpServers = servers;
   writeJsonFile(file, data);
   return file;
+}
+
+/** Add or replace a server in the given scope's file. Returns the file written. */
+export function addMcpServer(scope: McpScope, projectRoot: string, name: string, config: McpServerConfig): string {
+  return writeServer(scope, projectRoot, name, config);
+}
+
+/**
+ * `mcp add-json`: add or replace a server from a JSON definition such as
+ * `{"type":"http","url":"https://example.com/mcp"}`. The definition is checked
+ * with normalizeMcpConfig but written as given, so `${VAR}` references stay
+ * references instead of being baked into the file. Never throws.
+ */
+export function addMcpServerJson(scope: McpScope, projectRoot: string, name: string, json: string): { file?: string; error?: string } {
+  const serverName = typeof name === 'string' ? name.trim() : '';
+  if (!serverName) return { error: 'A server name is required.' };
+  if (!MCP_SCOPES.includes(scope)) return { error: `Unknown scope "${String(scope)}" (expected user, project or local).` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(String(json));
+  } catch (err) {
+    return { error: `Invalid JSON: ${(err as Error).message}` };
+  }
+  const { config, error } = normalizeMcpConfig(raw);
+  if (!config) return { error: `Invalid MCP server definition: ${error ?? 'unknown problem'}` };
+  try {
+    return { file: writeServer(scope, projectRoot, serverName, raw) };
+  } catch (err) {
+    return { error: `Could not write ${mcpConfigPath(scope, projectRoot)}: ${(err as Error).message}` };
+  }
 }
 
 /**

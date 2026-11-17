@@ -17,6 +17,8 @@ export interface ToolResult {
   summary?: string;
   diff?: FileDiff;
   images?: ImagePart[];
+  /** The call was not run because permission was refused (by a rule, a hook, the user, or for lack of anyone to ask). */
+  denied?: boolean;
 }
 
 export type PermissionKind = 'read' | 'edit' | 'bash' | 'web' | 'mcp' | 'other';
@@ -81,6 +83,8 @@ export interface RuntimeHandle {
   askUser?(questions: AskQuestion[], signal: AbortSignal): Promise<Record<string, string> | null>;
   approvePlan?(plan: string, signal: AbortSignal): Promise<{ approved: boolean; feedback?: string }>;
   todosChanged?(): void;
+  /** Switch the session to plan mode at the model's request. Returns false when that is not possible. */
+  enterPlanMode?(): boolean;
 }
 
 export interface ToolContext {

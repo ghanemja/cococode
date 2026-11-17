@@ -17,6 +17,10 @@ export interface PrintOptions {
   format: OutputFormat;
   verbose: boolean;
   images?: ImagePart[];
+  /** stream-json only: emit text and reasoning as they stream. */
+  includePartial?: boolean;
+  /** Send input starting with "/" to the model as written. */
+  disableSlashCommands?: boolean;
 }
 
 /** Slash commands that only print are routed to stderr in headless mode. */
@@ -45,7 +49,7 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
   let prompt = opts.prompt;
   let display: string | undefined;
 
-  if (prompt.trim().startsWith('/')) {
+  if (prompt.trim().startsWith('/') && !opts.disableSlashCommands) {
     const outcome = await runSlash(prompt, ctl, headlessIO());
     if (!outcome) return 0;
     if (outcome.type === 'compact') {
@@ -79,6 +83,8 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
   let error: string | undefined;
   let reason = 'stop';
   const labels = new Map<string, { name: string; label: string }>();
+  const denials: { tool_name: string; tool_use_id: string; tool_input: unknown }[] = [];
+  const partial = format === 'stream-json' && opts.includePartial;
 
   const onEvent = (ev: AgentEvent): void => {
     switch (ev.type) {
@@ -101,10 +107,31 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
           });
         }
         break;
+      case 'text':
+        if (partial) emit({ type: 'stream_event', session_id: ctl.session.id, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ev.text } } });
+        break;
+      case 'thinking':
+        if (partial) emit({ type: 'stream_event', session_id: ctl.session.id, event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: ev.text } } });
+        break;
+      case 'retry':
+        if (format === 'stream-json') {
+          emit({
+            type: 'system',
+            subtype: 'api_retry',
+            attempt: ev.attempt,
+            max_retries: ev.maxRetries,
+            retry_delay_ms: ev.delayMs,
+            error_status: ev.status ?? null,
+            error: ev.error,
+            session_id: ctl.session.id,
+          });
+        }
+        break;
       case 'tool_start':
         labels.set(ev.call.id, { name: ev.call.name, label: ev.label });
         break;
       case 'tool_end': {
+        if (ev.result.denied) denials.push({ tool_name: ev.call.name, tool_use_id: ev.call.id, tool_input: ev.call.arguments });
         if (format === 'stream-json') {
           emit({
             type: 'user',
@@ -134,7 +161,11 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
     }
   };
 
-  const onSignal = () => ctl.abort();
+  let terminated = false;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (signal === 'SIGTERM') terminated = true;
+    ctl.abort();
+  };
   process.once('SIGINT', onSignal);
   process.once('SIGTERM', onSignal);
   try {
@@ -162,6 +193,8 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
     duration_ms: Date.now() - started,
     model: ctl.client.model,
     usage: { input_tokens: totals.inputTokens, output_tokens: totals.outputTokens, requests: totals.requests, tool_uses: totals.toolUses },
+    total_cost_usd: 0,
+    permission_denials: denials,
   };
 
   if (format === 'text') {
@@ -170,5 +203,7 @@ export async function runPrint(ctl: Controller, opts: PrintOptions): Promise<num
   } else {
     emit(summary);
   }
+  // Like other well-behaved commands, report termination by signal as 128 + 15.
+  if (terminated) return 143;
   return isError ? 1 : 0;
 }

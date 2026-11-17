@@ -158,6 +158,22 @@ export const exitPlanModeTool: Tool<PlanInput> = {
   },
 };
 
+export const enterPlanModeTool: Tool<Record<string, never>> = {
+  name: 'EnterPlanMode',
+  description:
+    'Switch to plan mode before a large or risky change: you then research read-only and present a plan with ExitPlanMode for the user to approve.',
+  parameters: { type: 'object', properties: {} },
+  isReadOnly: () => true,
+  label: () => '',
+  async execute(_input, ctx): Promise<ToolResult> {
+    if (!ctx.runtime?.enterPlanMode?.()) return errorResult('Plan mode is not available in this session. Continue with the task.');
+    return {
+      content: 'Plan mode is on. Investigate with read-only tools; nothing may be changed yet. When you know what to do, call ExitPlanMode with your plan.',
+      summary: 'Entered plan mode',
+    };
+  },
+};
+
 interface AgentInput {
   description: string;
   prompt: string;
@@ -180,6 +196,8 @@ export const agentTool: Tool<AgentInput> = {
     required: ['description', 'prompt'],
   },
   isReadOnly: () => true,
+  // Lets rules such as Agent(explore) deny a particular subagent type.
+  permission: (input) => ({ tool: 'Agent', kind: 'other', target: (input.subagent_type || 'general-purpose').trim(), description: `Run the ${input.subagent_type || 'general-purpose'} subagent` }),
   label: (input) => `${input.subagent_type ? `${input.subagent_type}: ` : ''}${truncate(input.description ?? '', 70)}`,
   async execute(input, ctx): Promise<ToolResult> {
     if (!ctx.runtime) return errorResult('Subagents are not available in this session.');
@@ -222,6 +240,11 @@ export const skillTool: Tool<SkillInput> = {
     required: ['skill'],
   },
   isReadOnly: () => true,
+  // Lets rules such as Skill(deploy) or Skill(deploy *) deny a particular skill.
+  permission: (input) => {
+    const name = String(input.skill ?? '').replace(/^\//, '').trim();
+    return { tool: 'Skill', kind: 'other', target: input.args?.trim() ? `${name} ${input.args.trim()}` : name, description: `Load the ${name} skill` };
+  },
   label: (input) => input.skill,
   async execute(input, ctx): Promise<ToolResult> {
     const name = String(input.skill ?? '').replace(/^\//, '').trim();

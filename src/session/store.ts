@@ -9,7 +9,8 @@ type Entry =
   | { type: 'meta'; sessionId: string; cwd: string; version: string; model?: string; ts: string }
   | { type: 'message'; message: Message; ts: string }
   | { type: 'compact'; messages: Message[]; ts: string }
-  | { type: 'truncate'; length: number; ts: string };
+  | { type: 'truncate'; length: number; ts: string }
+  | { type: 'title'; title: string; ts: string };
 
 /**
  * Append-only JSONL transcript. Compaction and rewinds are recorded as
@@ -50,6 +51,11 @@ export class Transcript implements TranscriptSink {
     this.write({ type: 'compact', messages, ts: new Date().toISOString() });
   }
 
+  /** Give the session a name it can be resumed by. */
+  title(title: string): void {
+    this.write({ type: 'title', title, ts: new Date().toISOString() });
+  }
+
   /** Record that the conversation was cut back to `length` messages (rewind). */
   truncate(length: number): void {
     this.write({ type: 'truncate', length, ts: new Date().toISOString() });
@@ -61,6 +67,7 @@ export interface LoadedSession {
   messages: Message[];
   cwd?: string;
   model?: string;
+  title?: string;
 }
 
 export function loadSession(file: string): LoadedSession {
@@ -68,6 +75,7 @@ export function loadSession(file: string): LoadedSession {
   let messages: Message[] = [];
   let cwd: string | undefined;
   let model: string | undefined;
+  let title: string | undefined;
   const text = fs.readFileSync(file, 'utf8');
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -83,8 +91,9 @@ export function loadSession(file: string): LoadedSession {
     } else if (entry.type === 'message') messages.push(entry.message);
     else if (entry.type === 'compact') messages = [...entry.messages];
     else if (entry.type === 'truncate') messages = messages.slice(0, entry.length);
+    else if (entry.type === 'title') title = entry.title;
   }
-  return { id, messages: repairMessages(messages), cwd, model };
+  return { id, messages: repairMessages(messages), cwd, model, title };
 }
 
 /**
@@ -132,6 +141,8 @@ export interface SessionSummary {
   modifiedAt: Date;
   firstPrompt: string;
   messageCount: number;
+  /** Name given with --name or /rename. */
+  title?: string;
 }
 
 function summarizeFile(file: string): SessionSummary | undefined {
@@ -149,6 +160,7 @@ function summarizeFile(file: string): SessionSummary | undefined {
       modifiedAt: stat.mtime,
       firstPrompt: first.split('\n<attached-files>')[0]!.replace(/\s+/g, ' ').trim().slice(0, 200),
       messageCount: loaded.messages.length,
+      title: loaded.title,
     };
   } catch {
     return undefined;
@@ -187,7 +199,15 @@ export function listSessions(cwd: string, limit = 50): SessionSummary[] {
 /** Look a session up by full id or unique prefix. */
 export function findSession(cwd: string, idOrPrefix: string): SessionSummary | undefined {
   const all = listSessions(cwd, 500);
-  return all.find((s) => s.id === idOrPrefix) ?? (idOrPrefix.length >= 4 ? all.find((s) => s.id.startsWith(idOrPrefix)) : undefined);
+  const byId = all.find((s) => s.id === idOrPrefix) ?? (idOrPrefix.length >= 4 ? all.find((s) => s.id.startsWith(idOrPrefix)) : undefined);
+  if (byId) return byId;
+  // Then by name: exact first, otherwise a prefix that identifies one session.
+  const wanted = idOrPrefix.trim().toLowerCase();
+  if (!wanted) return undefined;
+  const exact = all.find((s) => s.title?.toLowerCase() === wanted);
+  if (exact) return exact;
+  const partial = all.filter((s) => s.title?.toLowerCase().startsWith(wanted));
+  return partial.length === 1 ? partial[0] : undefined;
 }
 
 /** Delete transcripts and file checkpoints older than `days`. */
@@ -203,6 +223,8 @@ export function cleanupOldSessions(days: number): void {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
+      // A project's memory notes are kept for good; only transcripts age out.
+      if (entry.isDirectory() && entry.name === 'memory') continue;
       try {
         const stat = fs.statSync(full);
         if (entry.isDirectory()) {

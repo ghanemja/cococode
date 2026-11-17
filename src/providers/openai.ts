@@ -113,9 +113,9 @@ export class OpenAIProvider implements Provider {
     const body: Record<string, unknown> = {
       model: req.model,
       messages: toOpenAIMessages(req.system, req.messages),
-      stream: true,
+      stream: req.stream !== false,
     };
-    if (!this.rejected.has('stream_options')) body.stream_options = { include_usage: true };
+    if (req.stream !== false && !this.rejected.has('stream_options')) body.stream_options = { include_usage: true };
     if (req.tools.length) {
       body.tools = req.tools.map((t) => ({
         type: 'function',

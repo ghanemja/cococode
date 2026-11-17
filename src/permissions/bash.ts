@@ -553,3 +553,33 @@ export function dangerWarning(command: string): string | undefined {
   }
   return undefined;
 }
+
+/**
+ * Wrapper commands that run another command unchanged. Rules are written for
+ * the command that does the work, so `timeout 60 npm test` should be judged
+ * as `npm test`. `xargs` is included for rule matching only: its real
+ * arguments come from stdin and cannot be checked.
+ */
+const WRAPPERS: RegExp[] = [
+  /^timeout(?:\s+(?:-s\s*\S+|--signal=\S+|-k\s*\S+|--kill-after=\S+|--preserve-status|--foreground|-v|--verbose))*\s+\d+(?:\.\d+)?[smhd]?\s+/,
+  /^time(?:\s+-p)?\s+/,
+  /^nice(?:\s+(?:-n\s*-?\d+|--adjustment=-?\d+|-\d+))?\s+/,
+  /^nohup\s+/,
+  /^stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)=\S+))+\s+/,
+  /^command\s+(?!-)/,
+  /^builtin\s+/,
+  /^noglob\s+/,
+];
+const XARGS = /^xargs\s+(?!-)/;
+
+/** The command with any leading wrapper commands removed. */
+export function stripWrappers(simple: string, opts: { xargs?: boolean } = {}): string {
+  let cmd = simple.trim();
+  for (let i = 0; i < 6; i++) {
+    const before = cmd;
+    for (const re of WRAPPERS) cmd = cmd.replace(re, '');
+    if (opts.xargs) cmd = cmd.replace(XARGS, '');
+    if (cmd === before) break;
+  }
+  return cmd;
+}

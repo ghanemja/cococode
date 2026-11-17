@@ -7,6 +7,8 @@ import { TextStreamParser, toTextProtocol } from './textTools.ts';
 import type { ChatRequest, ModelInfo, Provider, StreamEvent } from './types.ts';
 import { ProviderError, fetchWithTimeout } from './types.ts';
 
+import { debug, debugEnabled } from '../util/debug.ts';
+
 export * from './types.ts';
 
 /** Built-in endpoints, in the order they are probed during auto-detection. */
@@ -273,21 +275,53 @@ export class ModelClient {
       }, timeoutMs);
     };
     base.signal = req.signal ? AbortSignal.any([req.signal, watchdog.signal]) : watchdog.signal;
+    const logging = debugEnabled();
+    const started = Date.now();
+    if (logging) {
+      debug('api', `request ${this.provider.name} ${this.model}`, {
+        messages: base.messages.length,
+        tools: base.tools.length,
+        toolMode: this.profile.toolMode,
+        contextWindow: base.contextWindow,
+        maxTokens: base.maxTokens,
+        systemChars: base.system.length,
+        lastMessage: base.messages.at(-1),
+      });
+    }
+    let text = '';
+    let thinkingChars = 0;
+    const calls: unknown[] = [];
     try {
-      yield* this.attempt(base, arm, () => stalled, timeoutMs);
+      for await (const event of this.attempt(base, arm, () => stalled, timeoutMs)) {
+        if (logging) {
+          if (event.type === 'text') text += event.text;
+          else if (event.type === 'thinking') thinkingChars += event.text.length;
+          else if (event.type === 'tool_call') calls.push({ name: event.call.name, arguments: event.call.arguments, parseError: event.call.parseError });
+          else if (event.type === 'usage') debug('api', 'usage', event.usage);
+          else if (event.type === 'done') debug('api', `response ${Date.now() - started}ms stop=${event.stopReason} thinking=${thinkingChars}`, { text, calls });
+        }
+        yield event;
+      }
+    } catch (err) {
+      debug('api', `error after ${Date.now() - started}ms`, err instanceof Error ? `${err.name}: ${err.message}` : String(err));
+      throw err;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  private async *attempt(base: ChatRequest, arm: () => void, isStalled: () => boolean, timeoutMs: number): AsyncGenerator<StreamEvent> {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  private async *attempt(initial: ChatRequest, arm: () => void, isStalled: () => boolean, timeoutMs: number): AsyncGenerator<StreamEvent> {
+    let base = initial;
+    // Each recovery (text tool protocol, non-streaming) gets one extra pass.
+    for (let attempt = 0; attempt < 3; attempt++) {
       arm();
       const wire = this.profile.toolMode === 'prompt' ? toTextProtocol(base) : base;
       const parser = new TextStreamParser(base.tools.map((t) => t.name));
       let emitted = false;
       let calls = 0;
       let finished = false;
+      // Usage and the end marker are held back until we know the reply was not empty.
+      const tail: StreamEvent[] = [];
       // Some servers put a call in the structured field and also leave its
       // text in the content. The same call from both sources is one call.
       const seen = new Map<string, 'native' | 'text'>();
@@ -316,24 +350,42 @@ export class ModelClient {
               yield parsed;
             }
           } else if (event.type === 'done') {
-            yield* fromParser(parser.flush());
+            for (const parsed of fromParser(parser.flush())) {
+              emitted = true;
+              yield parsed;
+            }
             finished = true;
-            yield { type: 'done', stopReason: calls > 0 ? 'tool_calls' : event.stopReason };
+            tail.push({ type: 'done', stopReason: calls > 0 ? 'tool_calls' : event.stopReason });
           } else if (event.type === 'tool_call') {
             if (isRepeat(event.call, 'native')) continue;
             calls++;
             emitted = true;
             yield event;
+          } else if (event.type === 'usage') {
+            tail.push(event);
           } else {
-            if (event.type !== 'usage') emitted = true;
+            emitted = true;
             yield event;
           }
         }
         if (!finished) {
           // A stream that ends without saying so still has text held in the parser.
-          yield* fromParser(parser.flush());
-          yield { type: 'done', stopReason: calls > 0 ? 'tool_calls' : 'stop' };
+          for (const parsed of fromParser(parser.flush())) {
+            emitted = true;
+            yield parsed;
+          }
+          tail.push({ type: 'done', stopReason: calls > 0 ? 'tool_calls' : 'stop' });
         }
+        // A stream that carried nothing at all is more often a streaming problem (a proxy
+        // buffering events, a server that streams badly) than a model with nothing to say:
+        // ask once more for the whole reply in one piece.
+        const cutShort = tail.some((e) => e.type === 'done' && e.stopReason === 'length');
+        if (!emitted && base.stream !== false && !cutShort) {
+          debug('api', 'stream ended with no content; retrying without streaming');
+          base = { ...base, stream: false };
+          continue;
+        }
+        yield* tail;
         return;
       } catch (err) {
         if (isStalled()) {

@@ -1,7 +1,7 @@
 import type { ToolSpec } from '../types.ts';
 import { bashOutputTool, bashTool, killShellTool } from './bash.ts';
 import { editTool, readTool, writeTool } from './files.ts';
-import { agentTool, askUserTool, exitPlanModeTool, skillTool, todoWriteTool } from './meta.ts';
+import { agentTool, askUserTool, enterPlanModeTool, exitPlanModeTool, skillTool, todoWriteTool } from './meta.ts';
 import { notebookEditTool } from './notebook.ts';
 import { globTool, grepTool } from './searchTools.ts';
 import type { Tool } from './types.ts';
@@ -25,6 +25,7 @@ export function builtinTools(): Tool[] {
     killShellTool,
     notebookEditTool,
     askUserTool,
+    enterPlanModeTool,
     exitPlanModeTool,
     skillTool,
   ];

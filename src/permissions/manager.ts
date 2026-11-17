@@ -7,6 +7,7 @@ import { settingsPath, updateSettingsFile } from '../config/settings.ts';
 import type { SessionState } from '../session/state.ts';
 import { isInside, realpathSafe } from '../session/state.ts';
 import type { PermissionRequest, Tool, ToolContext } from '../tools/types.ts';
+import { isAutoMemoryPath } from '../memory/autoMemory.ts';
 import type { PermissionMode } from '../types.ts';
 import type { BashAnalysis } from './bash.ts';
 import {
@@ -18,6 +19,7 @@ import {
   isReadOnlyCommand,
   pathCandidates,
   suggestBashRule,
+  stripWrappers,
 } from './bash.ts';
 import type { MatchContext, Rule } from './rules.ts';
 import { family, matchAbsoluteGlob, matchBashSpec, parseRule, parseRules, resolvePathSpec, ruleMatches } from './rules.ts';
@@ -47,7 +49,7 @@ export interface PermissionInit {
 }
 
 /** Tools that stay usable in plan mode even though they are not read-only. */
-const PLAN_MODE_TOOLS = new Set(['ExitPlanMode', 'TodoWrite', 'AskUserQuestion', 'Agent', 'Skill', 'BashOutput', 'KillShell']);
+const PLAN_MODE_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TodoWrite', 'AskUserQuestion', 'Agent', 'Skill', 'BashOutput', 'KillShell']);
 
 const DENIED = 'Do not retry; choose a different approach or ask the user.';
 
@@ -95,6 +97,8 @@ function looksLikeBareRepository(dir: string): boolean {
 
 export class PermissionManager {
   mode: PermissionMode;
+  /** Whether the project's auto memory directory may be read and written without asking. */
+  autoMemory = false;
   private allow: Rule[];
   private ask: Rule[];
   private deny: Rule[];
@@ -266,9 +270,14 @@ export class PermissionManager {
         if (!req.target || this.session.inWorkingDirs(req.target)) return { behavior: 'allow' };
         // Output this session saved because it was too large for the context.
         if (isInside(realpathSafe(req.target), realpathSafe(toolResultsDir(this.session.id)))) return { behavior: 'allow' };
+        if (this.autoMemory && isAutoMemoryPath(this.session.projectRoot, req.target)) return { behavior: 'allow' };
         return this.askOutcome(req);
       case 'edit':
         if (isProtected) return this.askOutcome(req, 'This file controls how coco, git or your shell behaves.');
+        // The agent's own notes for this project.
+        if (this.autoMemory && req.target && this.mode !== 'plan' && isAutoMemoryPath(this.session.projectRoot, req.target)) {
+          return { behavior: 'allow', reason: 'auto memory' };
+        }
         if (this.mode === 'acceptEdits' && req.target && this.session.inWorkingDirs(req.target)) {
           return { behavior: 'allow', reason: 'acceptEdits mode' };
         }
@@ -349,10 +358,14 @@ export class PermissionManager {
   }
 
   private simpleCommandAllowed(simple: string, rules: Rule[], hasWriteRedirect: boolean, where: Location): boolean {
-    if (rules.some((r) => r.spec !== undefined && matchBashSpec(r.spec, simple))) return true;
+    // Rules are written for the command doing the work: `timeout 60 npm test` is `npm test`.
+    const unwrapped = stripWrappers(simple, { xargs: true });
+    if (rules.some((r) => r.spec !== undefined && (matchBashSpec(r.spec, simple) || matchBashSpec(r.spec, unwrapped)))) return true;
     if (hasWriteRedirect) return false;
-    if (isReadOnlyCommand(simple)) return this.pathsAllowed(simple, where, false);
-    if (this.mode === 'acceptEdits' && isFileSystemCommand(simple)) return this.pathsAllowed(simple, where, true);
+    // For the built-in read-only set, xargs is not looked through: what it runs on comes from stdin.
+    const inner = stripWrappers(simple);
+    if (isReadOnlyCommand(inner)) return this.pathsAllowed(inner, where, false);
+    if (this.mode === 'acceptEdits' && isFileSystemCommand(inner)) return this.pathsAllowed(inner, where, true);
     return false;
   }
 
@@ -395,7 +408,9 @@ export class PermissionManager {
     if (bashRules.length === 0 && fileRules.length === 0) return undefined;
     const ctx = this.matchCtx();
     for (const simple of analyzeCommand(command).commands) {
-      const hit = bashRules.find((r) => matchBashSpec(r.spec!, simple));
+      // A wrapper must not hide a command from a deny or ask rule.
+      const unwrapped = stripWrappers(simple, { xargs: true });
+      const hit = bashRules.find((r) => matchBashSpec(r.spec!, simple) || matchBashSpec(r.spec!, unwrapped));
       if (hit) return hit.raw;
       if (fileRules.length === 0) continue;
       for (const candidate of pathCandidates(simple).paths) {

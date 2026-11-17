@@ -1,6 +1,10 @@
 /** Built-in slash commands. They talk to the UI only through CommandIO, so they are testable without a terminal. */
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fitTranscript } from '../agent/compact.ts';
+import { renderTranscript } from '../providers/textTools.ts';
+import { highlight } from '../ui/highlight.ts';
 import type { Controller } from '../core/controller.ts';
 import { expandCommand } from '../config/extensions.ts';
 import { MEMORY_FILE, displayPath } from '../config/paths.ts';
@@ -67,6 +71,32 @@ const INIT_PROMPT = `Analyze this codebase and create a ${MEMORY_FILE} file in t
 Read the README and any existing agent instruction files (AGENTS.md, CLAUDE.md, .cursorrules, .github/copilot-instructions.md) and carry over what matters. If ${MEMORY_FILE} already exists, improve it instead of replacing it.
 
 Keep it short and specific. Do not list every file, repeat generic advice, or invent sections for things you did not find.`;
+
+const SECURITY_REVIEW_PROMPT = `Review the changes on this branch for security problems, as a security engineer would before a merge.
+
+1. Find what changed: use git (status, diff against the default branch, log) and read the changed code and enough of its surroundings to follow the data flow.
+2. Look for real, exploitable issues introduced by these changes: injection (SQL, shell, template, path traversal), broken authentication or authorization, secrets or credentials in code or logs, unsafe deserialization, missing input validation at trust boundaries, unsafe use of cryptography, and data exposure.
+3. Ignore style, hypothetical issues with no path to exploitation, and problems that existed before these changes.
+
+For each finding give: file:line, what an attacker could do, how confident you are, and a concrete fix. If you find nothing significant, say so plainly. Do not modify any files.`;
+
+function copyToClipboard(text: string): boolean {
+  const candidates: [string, string[]][] =
+    process.platform === 'darwin'
+      ? [['pbcopy', []]]
+      : process.platform === 'win32'
+        ? [['clip', []]]
+        : [['wl-copy', []], ['xclip', ['-selection', 'clipboard']], ['xsel', ['--clipboard', '--input']], ['clip.exe', []]];
+  for (const [cmd, cmdArgs] of candidates) {
+    try {
+      const res = spawnSync(cmd, cmdArgs, { input: text, stdio: ['pipe', 'ignore', 'ignore'], timeout: 3000 });
+      if (res.status === 0) return true;
+    } catch {
+      // not installed: try the next one
+    }
+  }
+  return false;
+}
 
 const REVIEW_PROMPT = `Review the code changes described below as a careful senior engineer would.
 
@@ -229,7 +259,7 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   },
   {
     name: 'usage',
-    aliases: ['cost'],
+    aliases: ['cost', 'stats'],
     description: 'Show token usage and speed for this session',
     run(_args, ctl, io) {
       io.print(usageReport(ctl).join('\n'));
@@ -559,7 +589,183 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
     },
   },
   {
+    name: 'rename',
+    description: 'Name this session so it can be resumed by name',
+    argumentHint: '<name>',
+    run(args, ctl, io) {
+      const name = args.trim();
+      if (!name) {
+        io.print(ctl.sessionName ? `This session is named ${c.bold(ctl.sessionName)}.` : c.dim('This session has no name. Usage: /rename <name>'));
+        return;
+      }
+      ctl.rename(name);
+      io.print(`Session named ${c.bold(name)}. Resume it later with: ${APP_NAME} --resume=${JSON.stringify(name)}`);
+    },
+  },
+  {
+    name: 'branch',
+    aliases: ['fork'],
+    description: 'Continue this conversation as a new session, keeping the original',
+    argumentHint: '[name]',
+    run(args, ctl, io) {
+      if (ctl.agent.messages.length === 0) {
+        io.print(c.dim('Nothing to branch from yet.'));
+        return;
+      }
+      const previous = ctl.branch(args.trim() || undefined);
+      io.print(`Branched. This is now session ${ctl.session.id.slice(0, 8)}; the original is still available with: ${APP_NAME} --resume ${previous}`);
+    },
+  },
+  {
+    name: 'cd',
+    description: 'Change the working directory for the session',
+    argumentHint: '<path>',
+    run(args, ctl, io) {
+      const target = args.trim();
+      if (!target) {
+        io.print(`Working directory: ${c.bold(ctl.session.cwd)}`);
+        return;
+      }
+      const abs = path.resolve(ctl.session.cwd, target.replace(/^~(?=\/|$)/, process.env.HOME ?? '~'));
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+        io.print(c.red(`${abs} is not a directory.`));
+        return;
+      }
+      // Moving outside the project also makes that directory one coco may work in.
+      if (!ctl.session.inWorkingDirs(abs)) ctl.session.addDir(abs);
+      ctl.session.cwd = abs;
+      io.print(`Working directory: ${c.bold(abs)}`);
+    },
+  },
+  {
+    name: 'copy',
+    description: 'Copy the last reply to the clipboard, or save it to a file',
+    argumentHint: '[file]',
+    run(args, ctl, io) {
+      const text = ctl.agent.lastAssistantText();
+      if (!text) {
+        io.print(c.dim('There is no reply to copy yet.'));
+        return;
+      }
+      const file = args.trim();
+      if (file) {
+        const target = path.resolve(ctl.session.cwd, file);
+        fs.writeFileSync(target, text.endsWith('\n') ? text : `${text}\n`);
+        io.print(`Saved the last reply to ${c.bold(displayPath(target, ctl.session.cwd))}`);
+        return;
+      }
+      io.print(copyToClipboard(text) ? c.dim(`Copied the last reply (${plural(text.length, 'character')}).`) : c.yellow('No clipboard tool found (pbcopy, wl-copy, xclip, xsel or clip). Use /copy <file> to save it instead.'));
+    },
+  },
+  {
+    name: 'diff',
+    description: 'Show uncommitted changes in the working tree',
+    run(_args, ctl, io) {
+      const run = (gitArgs: string[]) => spawnSync('git', gitArgs, { cwd: ctl.session.cwd, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+      if (run(['rev-parse', '--is-inside-work-tree']).stdout?.trim() !== 'true') {
+        io.print(c.dim('Not a git repository. Use /rewind to see or undo changes coco made.'));
+        return;
+      }
+      const base = run(['rev-parse', '--verify', 'HEAD']).status === 0 ? ['HEAD'] : [];
+      const stat = run(['diff', '--stat', ...base]).stdout?.trimEnd() ?? '';
+      const untracked = (run(['ls-files', '--others', '--exclude-standard']).stdout ?? '').split('\n').filter(Boolean);
+      if (!stat && untracked.length === 0) {
+        io.print(c.dim('No uncommitted changes.'));
+        return;
+      }
+      const diff = (run(['diff', ...base]).stdout ?? '').trimEnd().split('\n');
+      const shown = diff.slice(0, 400);
+      const lines = [heading('Uncommitted changes'), stat, ''];
+      if (untracked.length) lines.push(heading('New files'), ...untracked.slice(0, 40).map((f) => `  ${f}`), '');
+      if (diff[0]) lines.push(highlight(shown.join('\n'), 'diff'));
+      if (diff.length > shown.length) lines.push(c.dim(`… ${plural(diff.length - shown.length, 'more line')}; run git diff to see everything.`));
+      io.print(lines.join('\n'));
+    },
+  },
+  {
+    name: 'btw',
+    description: 'Ask a side question without adding it to the conversation',
+    argumentHint: '<question>',
+    async run(args, ctl, io) {
+      const question = args.trim();
+      if (!question) {
+        io.print(c.red('Usage: /btw <question>'));
+        return;
+      }
+      const window = ctl.client.profile.contextWindow;
+      const context = fitTranscript(renderTranscript(ctl.agent.messages, 800), Math.floor(window * 0.6));
+      try {
+        const answer = await ctl.client.complete(
+          'You are answering a brief side question about an ongoing coding session. Use the session transcript for context. Answer directly and concisely; you cannot use tools here.',
+          `<session>\n${context || '(nothing yet)'}\n</session>\n\nSide question: ${question}`,
+          { maxTokens: Math.min(ctl.client.profile.maxOutputTokens, 1500) },
+        );
+        io.print(answer || c.dim('(no answer)'));
+      } catch (err) {
+        io.print(c.red(`Could not answer: ${(err as Error).message}`));
+      }
+    },
+  },
+  {
+    name: 'recap',
+    description: 'Summarize what has happened in this session so far',
+    async run(_args, ctl, io) {
+      if (ctl.agent.messages.length === 0) {
+        io.print(c.dim('Nothing has happened yet.'));
+        return;
+      }
+      const window = ctl.client.profile.contextWindow;
+      const context = fitTranscript(renderTranscript(ctl.agent.messages, 600), Math.floor(window * 0.6));
+      try {
+        const recap = await ctl.client.complete(
+          'You write short recaps of coding sessions for the person who was in them. Be accurate and specific; do not invent anything.',
+          `<session>\n${context}\n</session>\n\nIn at most six short bullet points: what was asked, what has been done (name the files), and what is still open.`,
+          { maxTokens: Math.min(ctl.client.profile.maxOutputTokens, 800) },
+        );
+        io.print(recap || c.dim('(no recap)'));
+      } catch (err) {
+        io.print(c.red(`Could not produce a recap: ${(err as Error).message}`));
+      }
+    },
+  },
+  {
+    name: 'autocompact',
+    description: 'Turn automatic compaction on or off, or set when it triggers',
+    argumentHint: '[on|off|<percent>]',
+    run(args, ctl, io) {
+      const arg = args.trim().toLowerCase();
+      if (arg === 'on' || arg === 'off') ctl.settings.autoCompact = arg === 'on';
+      else if (/^\d{1,3}%?$/.test(arg)) {
+        const pct = Math.min(95, Math.max(20, Number(arg.replace('%', ''))));
+        ctl.settings.autoCompact = true;
+        ctl.settings.compactThreshold = pct / 100;
+      } else if (arg) {
+        io.print(c.red('Usage: /autocompact [on|off|<percent of the context window>]'));
+        return;
+      }
+      const on = ctl.settings.autoCompact ?? true;
+      io.print(`Automatic compaction is ${c.bold(on ? 'on' : 'off')}${on ? ` (at ${Math.round((ctl.settings.compactThreshold ?? 0.8) * 100)}% of the usable context)` : ''}.`);
+    },
+  },
+  {
+    name: 'reload-skills',
+    aliases: ['reload'],
+    description: 'Re-read skills, commands, agents and memory files from disk',
+    run(_args, ctl, io) {
+      ctl.reloadExtensions();
+      io.print(c.dim(`Reloaded: ${plural(ctl.skillDefs.length, 'skill')}, ${plural(ctl.commands.length, 'command')}, ${plural(ctl.agentDefs.length, 'agent')}, ${plural(ctl.memory.length, 'memory file')}.`));
+    },
+  },
+  {
+    name: 'security-review',
+    description: 'Review the pending changes for security problems',
+    run() {
+      return { type: 'prompt', prompt: SECURITY_REVIEW_PROMPT, display: '/security-review' };
+    },
+  },
+  {
     name: 'think',
+    aliases: ['effort'],
     description: 'Turn model reasoning on or off, or set its level',
     argumentHint: '[on|off|low|medium|high]',
     run(args, ctl, io) {

@@ -17,6 +17,14 @@ export interface ReadRecord {
   mtimeMs: number;
   /** True when only part of the file was read (offset/limit). */
   partial: boolean;
+  /**
+   * SHA-256 of the file's bytes when it was read. A later change is detected by
+   * comparing content, not timestamps. Absent for files too large to hash, and
+   * for records made without one; the modification time decides for those.
+   */
+  hash?: string;
+  /** Size in bytes when the file was read. */
+  size?: number;
 }
 
 export interface SessionInit {
@@ -67,6 +75,16 @@ export class SessionState {
   inWorkingDirs(absPath: string): boolean {
     const target = realpathSafe(absPath);
     return this.workingDirs().some((dir) => isInside(target, realpathSafe(dir)));
+  }
+
+  /**
+   * Move the foreground Bash commands that are running right now to the
+   * background, for a UI key such as Ctrl+B. Each affected Bash call returns at
+   * once and tells the model which background shell carries on, so the turn
+   * continues while the command keeps running. Returns how many were moved.
+   */
+  detachForeground(): number {
+    return this.shells.detachForeground().length;
   }
 }
 

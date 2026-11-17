@@ -305,13 +305,24 @@ describe('agent loop: tool calls from weaker models', () => {
     assert.equal(done(events)?.reason, 'stop');
   });
 
-  test('an empty reply is retried once with a nudge, then reported', async () => {
-    const h = harness([{ text: '' }, { text: '' }]);
+  test('an empty reply is asked for again without streaming, then nudged, then reported', async () => {
+    const h = harness(() => ({ text: '' }));
     const events = await h.run('x');
-    assert.equal(h.provider.requests.length, 2);
-    const nudge = h.provider.requests[1]!.messages.at(-1) as UserMessage;
+    // Each empty stream is retried once as a plain (non-streaming) request before it counts as empty.
+    assert.deepEqual(h.provider.requests.map((r) => r.stream !== false), [true, false, true, false]);
+    const nudge = h.provider.requests[2]!.messages.at(-1) as UserMessage;
     assert.match(String(nudge.content), /last reply was empty/);
     assert.equal(done(events)?.reason, 'error');
+  });
+
+  test('a server whose stream comes back empty is served by the non-streaming retry', async () => {
+    const h = harness((req) => (req.stream === false ? { text: 'The whole answer in one piece.' } : { text: '' }));
+    const events = await h.run('x');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.agent.lastAssistantText(), 'The whole answer in one piece.');
+    assert.equal(h.provider.requests.length, 2);
+    // No nudge was needed, so the conversation holds just the question and the answer.
+    assert.deepEqual(h.agent.messages.map((m) => m.role), ['user', 'assistant']);
   });
 
   test('a reply cut off before any answer is retried with a larger budget', async () => {
@@ -537,8 +548,8 @@ describe('agent loop: resilience to server trouble', () => {
     assert.equal(h.agent.lastAssistantText(), 'Back online.');
     assert.deepEqual(h.delays, [500, 1000]);
     const notices = events.filter((e) => e.type === 'notice').map((e) => (e as { text: string }).text);
-    assert.match(notices[0]!, /Could not reach http:\/\/x[\s\S]*Retrying in 500ms \(attempt 1 of 4\)/);
-    assert.match(notices[1]!, /model is loading Retrying in 1s \(attempt 2 of 4\)/);
+    assert.match(notices[0]!, /Could not reach http:\/\/x[\s\S]*Retrying in 500ms \(attempt 1 of 10\)/);
+    assert.match(notices[1]!, /model is loading Retrying in 1s \(attempt 2 of 10\)/);
     // The failed attempts leave nothing behind in the conversation.
     assert.deepEqual(h.agent.messages.map((m) => m.role), ['user', 'assistant']);
   });
@@ -623,6 +634,88 @@ describe('agent loop: resilience to server trouble', () => {
   });
 });
 
+describe('agent loop: giving up sensibly', () => {
+  test('three rounds of unusable tool calls in a row end the turn with advice', async () => {
+    const h = harness((_req, i) => ({ calls: [{ name: i % 2 ? 'no_such_tool' : 'Read', args: i % 2 ? {} : { wrong: i } }] }));
+    const events = await h.run('x');
+    assert.equal(h.provider.requests.length, 3);
+    assert.equal(done(events)?.reason, 'error');
+    assert.match(done(events)!.error!, /could not be run 3 times in a row[\s\S]*--tool-mode prompt/);
+    // Each failed call still got a result, so the history is valid.
+    assert.equal(h.toolResults().length, 3);
+  });
+
+  test('one usable call resets that count', async () => {
+    const h = harness((_req, i) => {
+      if (i === 5) return { text: 'finished' };
+      return i === 2 ? { calls: [{ name: 'Read', args: { file_path: 'a.txt' } }] } : { calls: [{ name: 'nope', args: { n: i } }] };
+    });
+    const events = await h.run('x');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.agent.lastAssistantText(), 'finished');
+  });
+
+  test('tool calls that arrived before the connection dropped are still run', async () => {
+    const provider = {
+      name: 'fake',
+      type: 'openai' as const,
+      baseUrl: 'fake://',
+      n: 0,
+      async *chat(): AsyncGenerator<StreamEvent> {
+        if (this.n++ === 0) {
+          yield { type: 'text', text: 'Reading the file.' };
+          yield { type: 'tool_call', call: { id: 'c1', name: 'Read', arguments: { file_path: 'a.txt' } } };
+          throw new ProviderError('connection', 'The connection to the model server was lost.');
+        }
+        yield { type: 'text', text: 'It has three lines.' };
+        yield { type: 'done', stopReason: 'stop' };
+      },
+      async listModels() {
+        return [{ id: 'fake-model' }];
+      },
+      async modelInfo() {
+        return { id: 'fake-model' };
+      },
+    };
+    const h = harness([]);
+    h.agent.setClient(new ModelClient(provider, 'fake-model', { contextWindow: 32768, maxOutputTokens: 4096, toolMode: 'native', vision: false, notes: [] }, {}));
+    const events = await h.run('read a.txt');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.match(h.toolResults()[0]!.content, /alpha/);
+    assert.ok(events.some((e) => e.type === 'notice' && /connection dropped after the model had requested tools/.test(e.text)));
+    assert.deepEqual(h.delays, [], 'nothing was retried: the work already done was used');
+  });
+
+  test('a failing model falls back to the next configured model for the rest of the turn', async () => {
+    const h = harness([{ throw: new ProviderError('http', 'model requires more system memory than is available', 400) }]);
+    const backup = new FakeProvider([{ calls: [{ name: 'Read', args: { file_path: 'a.txt' } }] }, { text: 'Answered by the backup.' }]);
+    const asked: number[] = [];
+    (h.agent as unknown as { deps: { fallback: (i: number) => Promise<ModelClient | undefined> } }).deps.fallback = async (i) => {
+      asked.push(i);
+      return i === 0 ? new ModelClient(backup, 'backup-model', { contextWindow: 32768, maxOutputTokens: 4096, toolMode: 'native', vision: false, notes: [] }, {}) : undefined;
+    };
+    const events = await h.run('hi');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.agent.lastAssistantText(), 'Answered by the backup.');
+    assert.deepEqual(asked, [0]);
+    assert.equal(backup.requests.length, 2, 'the backup model is used for every remaining request of the turn');
+    assert.ok(events.some((e) => e.type === 'notice' && /Switching to the fallback model backup-model/.test(e.text)));
+    assert.equal((h.agent.messages.at(-1) as { model?: string }).model, 'backup-model');
+  });
+
+  test('no fallback is tried for a server that cannot be reached', async () => {
+    const h = harness(() => ({ throw: new ProviderError('connection', 'Could not reach http://x.') }), { settings: { maxRetries: 1 } });
+    let asked = 0;
+    (h.agent as unknown as { deps: { fallback: () => Promise<undefined> } }).deps.fallback = async () => {
+      asked++;
+      return undefined;
+    };
+    const events = await h.run('hi');
+    assert.equal(done(events)?.reason, 'error');
+    assert.equal(asked, 0);
+  });
+});
+
 describe('agent loop: hooks', () => {
   test('a PreToolUse hook can block a call', async () => {
     const h = harness([{ calls: [{ name: 'Bash', args: { command: 'touch hooked.txt' } }] }, { text: 'ok' }], {
@@ -648,6 +741,55 @@ describe('agent loop: hooks', () => {
     });
     await h.run('x');
     assert.match(h.toolResults()[0]!.content, /alpha[\s\S]*PostToolUse hook feedback: lint: 2 warnings/);
+  });
+
+  test('PostToolUse runs after success and PostToolUseFailure after failure, each with the call id', async () => {
+    const dir = tempProject();
+    const log = path.join(dir, 'events.jsonl');
+    const record = `cat >> ${log}; echo >> ${log}`;
+    const h = harness([{ calls: [{ name: 'Read', args: { file_path: 'a.txt' } }, { name: 'Read', args: { file_path: 'missing.txt' } }] }, { text: 'ok' }], {
+      hooks: {
+        PostToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: record }] }],
+        PostToolUseFailure: [{ matcher: 'Read', hooks: [{ type: 'command', command: record }] }],
+      },
+    });
+    await h.run('x');
+    const seen = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const success = seen.find((e) => e.hook_event_name === 'PostToolUse')!;
+    const failure = seen.find((e) => e.hook_event_name === 'PostToolUseFailure')!;
+    assert.equal(seen.length, 2);
+    assert.match(String(success.tool_response), /alpha/);
+    assert.equal(success.tool_use_id, 'call_0_0');
+    assert.equal(typeof success.duration_ms, 'number');
+    assert.match(String(failure.error), /does not exist/);
+    assert.equal(failure.tool_use_id, 'call_0_1');
+    assert.equal(failure.tool_response, undefined);
+  });
+
+  test('a PermissionRequest hook answers the approval prompt, even with no user present', async () => {
+    const allow = `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'`;
+    const h = harness([{ calls: [{ name: 'Bash', args: { command: 'touch approved.txt' } }] }, { text: 'ok' }], {
+      hooks: { PermissionRequest: [{ matcher: 'Bash', hooks: [{ type: 'command', command: allow }] }] },
+    });
+    await h.run('x');
+    assert.ok(fs.existsSync(path.join(h.dir, 'approved.txt')));
+
+    const deny = `echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"not on Fridays"}}}'`;
+    const refused = harness([{ calls: [{ name: 'Bash', args: { command: 'touch refused.txt' } }] }, { text: 'ok' }], {
+      hooks: { PermissionRequest: [{ hooks: [{ type: 'command', command: deny }] }] },
+      answer: () => ({ allow: true }),
+    });
+    await refused.run('x');
+    assert.ok(!fs.existsSync(path.join(refused.dir, 'refused.txt')));
+    assert.match(refused.toolResults()[0]!.content, /Denied by a PermissionRequest hook: not on Fridays/);
+    assert.equal(refused.prompts.length, 0, 'the user is not asked once a hook has refused');
+  });
+
+  test('a Stop hook that never relents is cut off after eight rounds', async () => {
+    const h = harness(() => ({ text: 'Done, I think.' }), { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo "keep going" >&2; exit 2' }] }] } });
+    const events = await h.run('x');
+    assert.equal(h.provider.requests.length, 9);
+    assert.equal(done(events)?.reason, 'stop');
   });
 
   test('a Stop hook can send the agent back to work', async () => {
@@ -801,7 +943,81 @@ describe('context management', () => {
     const summary = String((h.agent.messages[0] as UserMessage).content);
     assert.match(summary, /SUMMARY: working on the parser\./);
     assert.match(summary, /Your task list at this point:\n\[~\] Fix the parser\n\[ \] Add tests/);
-    assert.match(summary, /Files you had open[^\n]*: a\.txt/);
+    // A small, recently read file comes back in full, and stays editable without another Read.
+    assert.match(summary, /<file path="a\.txt" note="current content, re-attached after compaction">\nalpha\nbeta\ngamma\n\n<\/file>/);
+    assert.ok(h.session.readFiles.has(path.join(h.dir, 'a.txt')));
+  });
+
+  test('after compaction, large files are named rather than re-attached and must be read again', async () => {
+    // 40k characters: over the per-file budget (6% of the window) but small enough that
+    // reading it does not itself trigger a compaction in a 64k window.
+    const big = `${'x'.repeat(200)}\n`.repeat(200);
+    const h = harness(
+      (req, i) => {
+        if (req.tools.length === 0) return { text: 'SUMMARY' };
+        if (i === 0) return { calls: [{ name: 'Read', args: { file_path: 'big.txt' } }, { name: 'Read', args: { file_path: 'b.txt' } }] };
+        return { text: 'ok' };
+      },
+      { files: { 'big.txt': big }, contextWindow: 64_000 },
+    );
+    await h.run('start');
+    for await (const _ of h.agent.compact(new AbortController().signal, { auto: false, force: true })) void _;
+    const summary = String((h.agent.messages[0] as UserMessage).content);
+    assert.match(summary, /Other files you had open[^\n]*: big\.txt/);
+    assert.ok(!summary.includes('xxxxxxxxxx'));
+    assert.match(summary, /<file path="b\.txt"/);
+    assert.ok(!h.session.readFiles.has(path.join(h.dir, 'big.txt')), 'its content is gone, so it must be Read again before editing');
+    assert.ok(h.session.readFiles.has(path.join(h.dir, 'b.txt')));
+  });
+
+  test('compaction restates invoked skills and the approved plan, within a budget', async () => {
+    const h = harness((req) => (req.tools.length === 0 ? { text: 'SUMMARY' } : { text: 'ok' }), { contextWindow: 16_000 });
+    (h.agent as unknown as { deps: { carryOver: () => unknown } }).deps.carryOver = () => ({
+      plan: '1. Rename the module\n2. Update imports',
+      skills: [
+        { name: 'old', content: 'OLD '.repeat(4000) },
+        { name: 'deploy', content: 'Run make deploy, then check the logs.' },
+      ],
+    });
+    await h.run('start');
+    for await (const _ of h.agent.compact(new AbortController().signal, { auto: false, force: true })) void _;
+    const summary = String((h.agent.messages[0] as UserMessage).content);
+    assert.match(summary, /The plan the user approved:\n1\. Rename the module\n2\. Update imports/);
+    assert.match(summary, /Skill "deploy" \(loaded earlier, still in effect\):\nRun make deploy, then check the logs\./);
+    // The newest skill is kept whole; the oldest is cut to the per-skill budget or dropped.
+    assert.ok(summary.length < 16_000 * 3.5 * 0.3, `carry-over must stay a fraction of the window, got ${summary.length} chars`);
+  });
+
+  test('a summary that comes back empty is requested once more', async () => {
+    let summaries = 0;
+    const h = harness((req) => {
+      if (req.tools.length > 0) return { text: 'ok' };
+      return ++summaries === 1 ? { text: '   ' } : { text: 'SUMMARY on the second try' };
+    });
+    await h.run('start');
+    for await (const _ of h.agent.compact(new AbortController().signal, { auto: false, force: true })) void _;
+    assert.equal(summaries, 2);
+    assert.match(String((h.agent.messages[0] as UserMessage).content), /SUMMARY on the second try/);
+  });
+
+  test('compaction that cannot get under the limit stops after three tries instead of looping', async () => {
+    let summaries = 0;
+    // Every "summary" is itself enormous, so compaction never frees anything.
+    const huge = 'summary word '.repeat(3000);
+    const h = harness(
+      (req, i) => {
+        if (req.tools.length === 0) {
+          summaries++;
+          return { text: huge };
+        }
+        return i < 50 ? { calls: [{ name: 'Bash', args: { command: `cat big.txt; echo ${i}` } }] } : { text: 'done' };
+      },
+      { mode: 'bypassPermissions', contextWindow: 6000, maxOutputTokens: 500, files: { 'big.txt': `${'lorem ipsum dolor sit amet '.repeat(150)}\n` } },
+    );
+    const events = await h.run('go');
+    assert.equal(done(events)?.reason, 'error');
+    assert.match(done(events)!.error!, /Compaction is thrashing/);
+    assert.equal(summaries, 3);
   });
 
   test('manual compaction replaces history with a summary', async () => {
