@@ -234,7 +234,7 @@ export class App implements CommandIO {
     fs.rmSync(dir, { recursive: true, force: true });
     if (this.exiting) return;
     if (status !== 0 || after === null) {
-      this.setNotice(`The editor ${status === 0 ? 'left no file' : status === null ? 'could not be run' : `exited with status ${status}`}: prompt left as it was`, 4000);
+      this.setNotice(`The editor ${status === 0 ? 'left no file' : status === null ? 'did not exit normally' : `exited with status ${status}`}: prompt left as it was`, 4000);
       return;
     }
     if (after === written) return;

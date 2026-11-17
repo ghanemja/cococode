@@ -185,7 +185,11 @@ test('ToolSearch: ranks the exact name, then name substrings, then all words, th
   const anyWord = await search(MCP).run({ query: 'documentation comment' });
   assert.deepEqual(resultNames(anyWord.content), ['mcp__docs__find', 'mcp__github__create_issue_comment']);
 
-  // A tool with every word outranks tools with only one of them.
+  // A tool with every word outranks one with only some of them, whatever their names.
+  const pairOfTools = [fake('mcp__a__alpha', 'Send an email'), fake('mcp__z__zulu', 'Send a calendar invite by email')];
+  const everyWord = await search(pairOfTools).run({ query: 'calendar email' });
+  assert.deepEqual(resultNames(everyWord.content), ['mcp__z__zulu', 'mcp__a__alpha']);
+
   const mixed = await search(MCP).run({ query: 'issue comment' });
   assert.deepEqual(resultNames(mixed.content), [
     'mcp__github__create_issue_comment', // name contains "issue_comment"
@@ -275,6 +279,14 @@ test('ToolSearch: no match is a normal result that lists up to 20 available name
   const none = await search([]).run({ query: 'anything' });
   assert.equal(none.isError, undefined);
   assert.match(none.content, /No tools are waiting to be loaded/);
+
+  // A lookup that fails is an error result, not an exception in the agent loop.
+  const broken = toolSearchTool(() => {
+    throw new Error('registry unavailable');
+  }, freshState());
+  const failed = await broken.execute({ query: 'anything' }, ctx());
+  assert.equal(failed.isError, true);
+  assert.match(failed.content, /Could not look up the tools: registry unavailable/);
 });
 
 test('ToolSearch: each result is the name and a description cut to about 200 characters', async () => {

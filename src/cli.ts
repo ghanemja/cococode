@@ -75,7 +75,7 @@ Options:
 
 Commands:
   ${APP_NAME} models                    List models on running local servers
-  ${APP_NAME} doctor                    Check the setup
+  ${APP_NAME} doctor [--probe]          Check the setup; --probe also tests the model with live tool calls
   ${APP_NAME} sessions                  List saved conversations for this directory
   ${APP_NAME} config [get|set|list]     Read or change settings
   ${APP_NAME} mcp [add|list|get|remove] Manage MCP servers
@@ -532,8 +532,16 @@ export async function main(argv: string[]): Promise<number> {
       return 1;
     }
     process.stdout.write(`${(await doctorReport(ctl)).join('\n')}\n`);
+    let healthy = true;
+    if (flags.probe) {
+      process.stdout.write(`\n${c.bold('Model check')} ${c.dim('(three small requests)')}\n`);
+      const { probeModel } = await import('./commands/probe.ts');
+      const result = await probeModel(ctl);
+      process.stdout.write(`${result.lines.join('\n')}\n`);
+      healthy = result.ok;
+    }
     await ctl.shutdown();
-    return 0;
+    return healthy ? 0 : 1;
   }
 
   const promptArg = positional.join(' ').trim();

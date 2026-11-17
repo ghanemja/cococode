@@ -523,6 +523,23 @@ test('stdio: close() ends the process and rejects in-flight requests', async () 
   await client.close(); // idempotent
 });
 
+test('timeouts: MCP_TIMEOUT still bounds startup, and the option still overrides it', async (t) => {
+  const saved = process.env.MCP_TIMEOUT;
+  t.after(() => {
+    if (saved === undefined) delete process.env.MCP_TIMEOUT;
+    else process.env.MCP_TIMEOUT = saved;
+  });
+  const silent: McpServerConfig = { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 30000)'] };
+
+  process.env.MCP_TIMEOUT = '200';
+  const fromEnv = new McpClient('silent', silent);
+  await assert.rejects(fromEnv.connect(), /Request timed out after 200ms: initialize/);
+
+  process.env.MCP_TIMEOUT = '60000';
+  const fromOption = new McpClient('silent', silent, { connectTimeoutMs: 150 });
+  await assert.rejects(fromOption.connect(), /Request timed out after 150ms: initialize/);
+});
+
 // ---------------------------------------------------------------------------
 // manager
 
@@ -1570,7 +1587,8 @@ test('manager: a local server that cannot be restarted is given up on after 5 us
   for (let use = 1; use <= MAX_RECONNECT_ATTEMPTS; use++) {
     const res = await findTool(tools, 'mcp__m__echo').execute({ text: 'x' }, ctx);
     assert.equal(res.isError, true, `use ${use}`);
-    assert.match(res.content, /MCP server "m" is not connected: /, `use ${use}`);
+    // The call never reached the server, so it is not reported as a failure of the tool.
+    assert.ok(res.content.startsWith('MCP server "m" is not connected: '), `use ${use}: ${res.content}`);
     assert.equal(manager.tools().length, use < MAX_RECONNECT_ATTEMPTS ? TOOL_COUNT : 0, `use ${use}`);
   }
   assert.match(manager.status()[0]!.error ?? '', /Gave up after 5 reconnection attempts; run \/mcp reconnect m to try again\./);

@@ -561,3 +561,56 @@ describe('headless structured output and streamed input', () => {
     assert.match((await cli(tempProject(), server, ['-p', 'go', '--agent', 'ghost'])).stderr, /No agent named "ghost"/);
   });
 });
+
+describe('doctor --probe: a live check of the model', () => {
+  const toolNames = (req: { body: Record<string, any> }): string[] => ((req.body.tools as { function: { name: string } }[] | undefined) ?? []).map((t) => t.function.name);
+  const lastUser = (req: { body: Record<string, any> }): string => String((req.body.messages as { role: string; content: string }[]).filter((m) => m.role === 'user').at(-1)?.content ?? '');
+
+  test('a model that calls tools, reads results and fills in arguments passes', async () => {
+    const { ctl, server } = await setup((req) => {
+      if (/What is the magic number/.test(lastUser(req))) return { text: '7412' };
+      if (toolNames(req).includes('add_numbers')) return { toolCalls: [{ name: 'add_numbers', arguments: { a: '17', b: 25 } }] };
+      return { toolCalls: [{ name: 'get_magic_number', arguments: {} }], usage: { prompt: 140, completion: 12 } };
+    });
+    const { probeModel } = await import('../src/commands/probe.ts');
+    const result = await probeModel(ctl);
+    const text = stripAnsi(result.lines.join('\n'));
+    assert.equal(result.ok, true, text);
+    assert.match(text, /✓ Tool call \(native\)[\s\S]*✓ Reads tool results[\s\S]*✓ Tool arguments[\s\S]*server counted 140[\s\S]*mock-model passed/);
+    // The tool result is sent back in the conversation the model sees.
+    assert.match(lastMessage(server.requests[1]!, 'tool').content, /magic number is 7412/);
+    // Nothing from the probe leaks into the session.
+    assert.equal(ctl.agent.messages.length, 0);
+  });
+
+  test('when native tool calls fail but the text protocol works, it says how to switch', async () => {
+    const { ctl } = await setup((req) => {
+      const native = Array.isArray(req.body.tools) && req.body.tools.length > 0;
+      if (native) return { text: 'Sure, I will call the tool.' };
+      if (/What is the magic number/.test(lastUser(req))) return { text: 'It is 7412.' };
+      if (/add_numbers tool with/.test(lastUser(req))) return { text: '<tool_call>{"name": "add_numbers", "arguments": {"a": 17, "b": 25}}</tool_call>' };
+      return { text: '<tool_call>{"name": "get_magic_number", "arguments": {}}</tool_call>' };
+    });
+    const { probeModel } = await import('../src/commands/probe.ts');
+    const result = await probeModel(ctl);
+    const text = stripAnsi(result.lines.join('\n'));
+    assert.equal(result.suggestToolMode, 'prompt');
+    assert.equal(result.ok, true, text);
+    assert.match(text, /Native tool calling did not produce a tool call[\s\S]*coco config set toolMode prompt[\s\S]*✓ Tool call \(text protocol\)/);
+  });
+
+  test('a model that only talks fails, with an exit code scripts can check', async () => {
+    const server = await startMockServer(() => ({ text: 'I would call the tool if I could.' }));
+    servers.push(server);
+    const dir = tempProject();
+    const env = { ...process.env, COCO_CONFIG_DIR: path.join(dir, '.coco-home'), CLAUDE_CONFIG_DIR: path.join(dir, '.claude-home'), NO_COLOR: '1' };
+    const res = await new Promise<{ code: number; stdout: string }>((resolve) => {
+      const child = spawn('node', [path.join(import.meta.dirname, '..', 'bin', 'coco.js'), 'doctor', '--probe', '--base-url', server.url, '--model', 'mock-model'], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      child.stdout!.on('data', (d) => (stdout += d));
+      child.on('close', (code) => resolve({ code: code ?? -1, stdout }));
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stdout, /Model check[\s\S]*did not call a tool when told to \(it replied: "I would call the tool if I could\."\)/);
+  });
+});

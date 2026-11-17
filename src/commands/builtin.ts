@@ -16,6 +16,7 @@ import { exportMarkdown, findSession, listSessions } from '../session/store.ts';
 import { findRipgrep } from '../tools/search.ts';
 import { parseRule } from '../permissions/rules.ts';
 import { inlineBashRunner } from './inline.ts';
+import { probeModel } from './probe.ts';
 import { PERMISSION_MODES, type PermissionMode } from '../types.ts';
 import { c, formatBytes, formatContext, formatCount, formatDuration, padEnd, plural } from '../ui/ansi.ts';
 import { contextBar, renderTodos } from '../ui/render.ts';
@@ -291,9 +292,14 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   },
   {
     name: 'doctor',
-    description: 'Check the model server, tools and configuration',
-    async run(_args, ctl, io) {
+    description: 'Check the setup; "probe" also tests the model with live tool calls',
+    argumentHint: '[probe]',
+    async run(args, ctl, io) {
       io.print((await doctorReport(ctl)).join('\n'));
+      if (args.trim() !== 'probe') return;
+      io.print(c.dim('Testing the model with three small requests…'));
+      const result = await probeModel(ctl);
+      io.print(['', heading('Model check'), ...result.lines].join('\n'));
     },
   },
   {

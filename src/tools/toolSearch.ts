@@ -175,7 +175,12 @@ export function toolSearchTool(getDeferred: () => Tool[], state: DeferralState):
     async execute(input): Promise<ToolResult> {
       const query = typeof input.query === 'string' ? input.query.trim() : '';
       if (!query) return errorResult('Give a query: keywords describing the tool, or "select:<name>" for an exact name.');
-      const deferred = getDeferred();
+      let deferred: Tool[];
+      try {
+        deferred = getDeferred();
+      } catch (err) {
+        return errorResult(`Could not look up the tools: ${(err as Error).message || String(err)}`);
+      }
       if (deferred.length === 0) return { content: 'No tools are waiting to be loaded: every tool is already available to call.', summary: 'Nothing to load' };
 
       const chosen: Tool[] = [];
