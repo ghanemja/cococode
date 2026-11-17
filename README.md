@@ -182,6 +182,10 @@ Type a request and press enter. While the model works you can keep typing; messa
 | `EnterPlanMode`, `ExitPlanMode` | Switch to planning; present a plan for approval |
 | `Skill` | Load a skill's instructions |
 | `mcp__server__tool` | Tools from MCP servers |
+| `ListMcpResources`, `ReadMcpResource` | Resources offered by MCP servers |
+| `ToolSearch` | Load MCP tools that are not in the prompt yet (see MCP servers) |
+
+Before a file can be edited it has to be read, with `Read` or by showing it in the shell (`cat`, `head`, `tail`, `sed -n`). If the file changed after that, the edit is applied only when the text to replace still matches exactly once; otherwise the model is told to read it again. Change is judged by content, not by timestamp. Files that are not UTF-8 are refused, not rewritten. A shell command that outlives its timeout is not killed: it carries on in the background and the model gets the id to follow it.
 
 ## Permissions
 
@@ -333,7 +337,13 @@ coco mcp add files -- npx -y @modelcontextprotocol/server-filesystem ~/Documents
 coco mcp add --transport http docs https://example.com/mcp
 ```
 
-Project servers go in `.mcp.json`. Each tool definition costs context, so connect only what you use.
+```bash
+coco mcp add-json docs '{"type":"http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer ${DOCS_TOKEN}"}}'
+```
+
+Project servers go in `.mcp.json`. `/mcp` lists servers and their tools; `/mcp disable <name>` and `/mcp enable <name>` switch one off and on, and `/mcp reconnect <name>` restarts it. A server that drops is reconnected the next time it is used.
+
+Every tool definition costs context on every request, and a few MCP servers can bring dozens. When the definitions would take more than a tenth of the context window, coco leaves them out and lists only their names; the model loads the ones it needs with `ToolSearch`. Set `toolSearch` to `true` (always), `false` (never) or `"auto:25"` (another percentage); `ENABLE_TOOL_SEARCH` works too. A server entry can set `"timeout"` in milliseconds for its tool calls; `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` set the defaults for connecting and for calls.
 
 **Status line.** Set `statusLine` to a command; it receives session JSON on stdin and its first line of output is shown under the prompt.
 
@@ -422,6 +432,9 @@ coco config set permissions.defaultMode acceptEdits --scope project
 | `requestTimeoutMs` | 600000 | How long a request may go without any output |
 | `fallbackModel` | | Models to try, in order, when the main one fails |
 | `agent` | | Run the main conversation as this agent |
+| `toolSearch` | `auto` | When MCP tool definitions are deferred (see MCP servers) |
+| `disabledMcpServers` | | Servers that start switched off |
+| `nudgeAnnouncedActions` | `true` | Tell the model once when it announces a step without calling a tool |
 | `autoMemoryEnabled`, `claudeMdExcludes` | `true`, | See Memory |
 | `disableAllHooks` | `false` | |
 | `webSearch` | DuckDuckGo | `{ "provider": "searxng", "url": "http://localhost:8888" }` |
@@ -440,6 +453,7 @@ Local models fail in ways hosted ones mostly do not. coco is built around them:
 - **Edits that miss by whitespace.** `Edit` falls back to matching while ignoring indentation or trailing spaces when that identifies exactly one place, and re-indents the replacement.
 - **Loops.** The third identical tool call in a row is refused with a message telling the model to change approach.
 - **Reasoning that eats the output budget.** An empty reply cut off at the token limit is retried with a larger budget.
+- **Announcing instead of acting.** A reply that ends with "Let me read the file." and no tool call would end the turn with nothing done. The model is told so, once, and can carry on.
 - **Claiming work that was not done.** Tool results state what changed (the edited lines, the exit code), so the model can check itself and so can you.
 
 ### Check your model first

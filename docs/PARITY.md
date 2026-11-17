@@ -36,14 +36,15 @@ These are the mechanisms Claude Code documents for keeping a turn alive. All are
 | Auto-compaction, with a stop after repeated failures | Same: old tool output is cleared first, then the conversation is summarized. After three compactions in a row that do not help, it stops and says so |
 | After compaction: project instructions, the plan, recent files and invoked skills are restored | Same: memory files, the approved plan, the task list, up to five recently read files and the skills in use, within a budget scaled to the context window. `SessionStart` hooks run again with source `compact` |
 | Tool output above 30,000 characters is saved to a file with a preview | Same. The limit shrinks on small context windows so one result cannot fill the window |
-| A file must be read before it is edited; a file changed since is re-read | Same, see "File safety" below |
-| A command that exceeds its timeout keeps running in the background | Same, see "File safety" below |
+| A file must be read before it is edited, and a file that changed since must be read again | Same. Showing a file with `cat`, `head`, `tail` or `sed -n` in the shell counts as reading it. Change is judged by content, not by timestamp, so a formatter or a `git checkout` that leaves the file identical does not force a re-read. An edit to a changed file still goes through when the text to replace matches exactly once; otherwise the model is told to read the file again |
+| Files that are not UTF-8 are not rewritten | Same: `Edit` and `NotebookEdit` refuse Latin-1, UTF-16 and binary files instead of corrupting them, and say what to use instead |
+| A command that exceeds its timeout keeps running in the background | Same: the output so far is returned with the id to follow or stop it |
 | Hook timeouts: 600 s, 30 s for prompt hooks, 1.5 s shared at session end; output capped at 10,000 characters | Same |
 | A `Stop` hook cannot block for ever | Same: overridden after eight rounds |
-| MCP servers that fail or disconnect do not end the session; reconnection with backoff | Same, see "MCP" below |
+| MCP servers that fail or disconnect do not end the session; reconnection with backoff | Same: a remote server that cannot be reached at start is tried three more times, a dropped server is reconnected on its next use (waits of 1 to 8 s), and after five failures it is marked failed with the command to retry |
 | Exit code 143 on SIGTERM in headless mode | Same |
 
-Beyond Claude Code, for failures specific to local models: the context window is set explicitly on every Ollama request; tool calls written as text (`<tool_call>`, Qwen XML, `<function=…>`, `[TOOL_CALLS]`, bare JSON) are recognized; arguments of nearly the right type are coerced; misnamed tools are mapped; the third identical tool call in a row is refused; an empty reply that used its whole budget on reasoning is retried with a larger one.
+Beyond Claude Code, for failures specific to local models: the context window is set explicitly on every Ollama request; tool calls written as text (`<tool_call>`, Qwen XML, `<function=…>`, `[TOOL_CALLS]`, bare JSON) are recognized; arguments of nearly the right type are coerced; misnamed tools are mapped; the third identical tool call in a row is refused; an empty reply that used its whole budget on reasoning is retried with a larger one; and a reply that ends by announcing a step ("Let me read the file.") without calling a tool is pointed out to the model once, instead of ending the turn with nothing done.
 
 ## Area by area
 
@@ -118,7 +119,7 @@ Without a sandbox, permission rules are a guard against accidents, not a securit
 
 | | |
 | --- | --- |
-| Matched | stdio, streamable HTTP and SSE servers; user, project (`.mcp.json`) and flag scopes; `${VAR}` expansion; tools, prompts (as slash commands) and resources; paginated listings; tool-list change notifications; output limits; reconnection after a crash; enabling and disabling a server in `/mcp`; tool search, which keeps rarely used tool definitions out of the prompt until they are needed; project servers held back until the workspace is trusted |
+| Matched | stdio, streamable HTTP and SSE servers; user, project (`.mcp.json`) and flag scopes; `${VAR}` expansion; tools, prompts (as slash commands) and resources; roots; paginated listings; tool-list change notifications; output limits; `MCP_TIMEOUT`, `MCP_TOOL_TIMEOUT` and a per-server `timeout`; reconnection after a crash; enabling and disabling a server in `/mcp`; tool search (`ENABLE_TOOL_SEARCH`), which keeps tool definitions out of the prompt until they are needed; project servers held back until the workspace is trusted |
 | Missing | OAuth sign-in for remote servers (static headers work), elicitation, sampling, `@server:resource` mentions in the prompt, serving coco itself as an MCP server |
 
 ### Interactive terminal
