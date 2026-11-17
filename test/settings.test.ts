@@ -14,6 +14,7 @@ import {
   settingsPath,
   updateSettingsFile,
 } from '../src/config/settings.ts';
+import type { HookCommand } from '../src/config/settings.ts';
 import { tempProject, writeFiles } from './helpers.ts';
 
 const COCO_ENV = [
@@ -114,8 +115,8 @@ describe('mergeSettings', () => {
         },
       },
     );
-    assert.deepEqual(merged.hooks?.PreToolUse?.map((m) => m.hooks[0]!.command), ['one', 'two']);
-    assert.deepEqual(merged.hooks?.Stop?.map((m) => m.hooks[0]!.command), ['three']);
+    assert.deepEqual(merged.hooks?.PreToolUse?.map((m) => (m.hooks[0] as HookCommand).command), ['one', 'two']);
+    assert.deepEqual(merged.hooks?.Stop?.map((m) => (m.hooks[0] as HookCommand).command), ['three']);
   });
 
   test('a hook event that is not a list is ignored', () => {
@@ -134,7 +135,7 @@ describe('mergeSettings', () => {
     const merged = mergeSettings(user);
     merged.env!.B = '2';
     merged.permissions!.allow!.push('Edit');
-    merged.hooks!.Stop![0]!.hooks[0]!.command = 'changed';
+    (merged.hooks!.Stop![0]!.hooks[0] as HookCommand).command = 'changed';
     merged.providers!.p!.baseUrl = 'http://changed';
     assert.deepEqual(user, before);
   });

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
 import * as path from 'node:path';
 import { beforeEach, describe, test } from 'node:test';
 import type { HookEvent, HooksConfig } from '../src/config/settings.ts';
@@ -463,5 +464,118 @@ describe('HookRunner output', { skip }, () => {
     // Deny wins when hooks disagree, whatever the order.
     assert.equal((await runner(on('PermissionRequest', allow, deny)).run('PermissionRequest', {}, 'Bash')).permissionDecision, 'deny');
     assert.equal((await runner(on('PermissionRequest', deny, allow)).run('PermissionRequest', {}, 'Bash')).permissionDecision, 'deny');
+  });
+});
+
+describe('http hooks, prompt hooks and the if condition', () => {
+  async function httpServer(reply: (body: Record<string, unknown>, headers: http.IncomingHttpHeaders) => { status?: number; body?: string }) {
+    const seen: { body: Record<string, unknown>; headers: http.IncomingHttpHeaders }[] = [];
+    const server = http.createServer((req, res) => {
+      let data = '';
+      req.on('data', (d) => (data += d));
+      req.on('end', () => {
+        const body = JSON.parse(data) as Record<string, unknown>;
+        seen.push({ body, headers: req.headers });
+        const out = reply(body, req.headers);
+        res.writeHead(out.status ?? 200, { 'content-type': 'application/json' });
+        res.end(out.body ?? '');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/hook`;
+    return { url, seen, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+  }
+
+  test('an http hook receives the event and its reply is read like command output', async () => {
+    const srv = await httpServer(() => ({ body: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'not on Fridays' } }) }));
+    process.env.COCO_TEST_HOOK_TOKEN = 'secret';
+    process.env.COCO_TEST_HOOK_OTHER = 'leak';
+    try {
+      const hooks = runner({
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'http', url: srv.url, headers: { Authorization: 'Bearer $COCO_TEST_HOOK_TOKEN', 'X-Other': '${COCO_TEST_HOOK_OTHER}' }, allowedEnvVars: ['COCO_TEST_HOOK_TOKEN'] }] }],
+      });
+      const out = await hooks.run('PreToolUse', { tool_name: 'Bash', tool_input: { command: 'git push' } }, 'Bash');
+      assert.deepEqual([out.blocked, out.permissionDecision, out.reason], [true, 'deny', 'not on Fridays']);
+      assert.equal(srv.seen[0]!.body.hook_event_name, 'PreToolUse');
+      assert.deepEqual(srv.seen[0]!.body.tool_input, { command: 'git push' });
+      // Only variables the settings list are filled in.
+      assert.equal(srv.seen[0]!.headers.authorization, 'Bearer secret');
+      assert.equal(srv.seen[0]!.headers['x-other'], '');
+      assert.deepEqual(hooks.list(), [{ event: 'PreToolUse', matcher: 'Bash', command: `POST ${srv.url}` }]);
+    } finally {
+      delete process.env.COCO_TEST_HOOK_TOKEN;
+      delete process.env.COCO_TEST_HOOK_OTHER;
+      await srv.close();
+    }
+  });
+
+  test('an http hook that fails or cannot be reached does not block', async () => {
+    const srv = await httpServer(() => ({ status: 500, body: 'boom' }));
+    try {
+      const failing = await runner({ Stop: [{ hooks: [{ type: 'http', url: srv.url }] }] }).run('Stop', {});
+      assert.equal(failing.blocked, false);
+      assert.match(failing.messages.join('\n'), /Stop hook failed[\s\S]*HTTP 500: boom/);
+    } finally {
+      await srv.close();
+    }
+    const unreachable = await runner({ Stop: [{ hooks: [{ type: 'http', url: 'http://127.0.0.1:1/hook' }] }] }).run('Stop', {});
+    assert.equal(unreachable.blocked, false);
+    assert.match(unreachable.messages.join('\n'), /Stop hook failed/);
+    // Anything that is not an http(s) URL is ignored as misconfigured.
+    assert.equal(runner({ Stop: [{ hooks: [{ type: 'http', url: 'file:///etc/passwd' }] }] }).has('Stop'), false);
+  });
+
+  test('a prompt hook lets the model allow or block', async () => {
+    const asked: { system: string; prompt: string; model?: string }[] = [];
+    const withModel = (reply: string, config: HooksConfig) =>
+      new HookRunner(() => config, {
+        sessionId: 's',
+        projectRoot: root,
+        cwd: () => root,
+        complete: async (system, prompt, opts) => {
+          asked.push({ system, prompt, model: opts.model });
+          return reply;
+        },
+      });
+    const config: HooksConfig = { Stop: [{ hooks: [{ type: 'prompt', prompt: 'Are all tests passing? $ARGUMENTS', model: 'judge' }] }] };
+    const blocked = await withModel('Sure: {"ok": false, "reason": "tests were never run"}', config).run('Stop', { stop_hook_active: false });
+    assert.deepEqual([blocked.blocked, blocked.reason], [true, 'tests were never run']);
+    assert.match(asked[0]!.prompt, /^Are all tests passing\? \{"session_id":"s"[\s\S]*"hook_event_name":"Stop"/);
+    assert.equal(asked[0]!.model, 'judge');
+    assert.equal((await withModel('{"ok": true}', config).run('Stop', {})).blocked, false);
+    // An answer that is not a verdict is an error, not a block.
+    const vague = await withModel('I think it is fine.', config).run('Stop', {});
+    assert.equal(vague.blocked, false);
+    assert.match(vague.messages.join('\n'), /did not answer with \{"ok"/);
+    // Without a model the hook reports that instead of blocking.
+    const none = await runner(config).run('Stop', {});
+    assert.match(none.messages.join('\n'), /no model is connected/);
+  });
+
+  test('if narrows a tool hook with permission-rule syntax', { skip }, async () => {
+    const hooks = runner({
+      PreToolUse: [
+        {
+          hooks: [
+            { type: 'command', command: 'echo push >> log', if: 'Bash(git push *)' },
+            { type: 'command', command: 'echo ts >> log', if: 'Edit(src/**/*.ts)' },
+            { type: 'command', command: 'echo anyread >> log', if: 'Read' },
+            { type: 'command', command: 'echo typo >> log', if: 'Bash(unclosed' },
+          ],
+        },
+      ],
+    });
+    const fire = async (tool_name: string, tool_input: Record<string, unknown>) => {
+      fs.rmSync(path.join(root, 'log'), { force: true });
+      await hooks.run('PreToolUse', { tool_name, tool_input }, tool_name);
+      return lines('log');
+    };
+    assert.deepEqual(await fire('Bash', { command: 'git push origin main' }), ['push']);
+    assert.deepEqual(await fire('Bash', { command: 'git status' }), []);
+    // Every part of a compound command has to match.
+    assert.deepEqual(await fire('Bash', { command: 'git push origin main && rm -rf x' }), []);
+    assert.deepEqual(await fire('Write', { file_path: 'src/app/main.ts', content: '' }), ['ts']);
+    assert.deepEqual(await fire('Edit', { file_path: 'docs/readme.md' }), []);
+    assert.deepEqual(await fire('Read', { file_path: 'anything' }), ['anyread']);
   });
 });

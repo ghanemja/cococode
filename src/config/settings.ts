@@ -11,17 +11,42 @@ export interface ProviderConfig {
   headers?: Record<string, string>;
 }
 
-export interface HookCommand {
-  type: 'command';
-  command: string;
+interface HookCommon {
   /** Seconds. */
   timeout?: number;
+  /** Tool events only: run just for calls this permission rule would match, e.g. "Bash(git push *)". */
+  if?: string;
 }
+
+/** A shell command that receives the event as JSON on stdin. */
+export interface HookCommand extends HookCommon {
+  type: 'command';
+  command: string;
+}
+
+/** The event is POSTed as JSON; a 2xx reply's body is read like a command's stdout. */
+export interface HookHttp extends HookCommon {
+  type: 'http';
+  url: string;
+  /** Header values may use $NAME for the variables listed in allowedEnvVars. */
+  headers?: Record<string, string>;
+  allowedEnvVars?: string[];
+}
+
+/** The model judges the event: it answers {"ok": true} or {"ok": false, "reason": "..."}. */
+export interface HookPrompt extends HookCommon {
+  type: 'prompt';
+  /** $ARGUMENTS stands for the event JSON (appended when absent). */
+  prompt: string;
+  model?: string;
+}
+
+export type HookHandler = HookCommand | HookHttp | HookPrompt;
 
 export interface HookMatcher {
   /** Regex matched against the tool name (tool events only). Empty or "*" matches everything. */
   matcher?: string;
-  hooks: HookCommand[];
+  hooks: HookHandler[];
 }
 
 export type HookEvent =

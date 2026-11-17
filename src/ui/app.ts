@@ -492,7 +492,11 @@ export class App implements CommandIO {
       // The keys that mean "close this" only close it; any other key also does its usual job.
       if (key.name === 'escape' || (key.name === 'char' && key.text === '?')) return;
     }
-    if (this.editor.search && this.searchKey(key)) return;
+    if (this.editor.search && this.searchKey(key)) {
+      // A search that was called off leaves the prompt as it was, completion menu included.
+      if (!this.editor.search) this.updateCompletion();
+      return;
+    }
 
     if (key.ctrl && key.name === 'c') {
       if (this.running) {

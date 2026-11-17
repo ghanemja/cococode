@@ -450,13 +450,17 @@ describe('moving a running command to the background', () => {
   /** Scratch files in which runCommand records the working directory of this process's commands. */
   const cwdFiles = () => fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`coco-cwd-${process.pid}-`)).sort();
   const pidIn = (text: string, name: string) => Number(new RegExp(`${name}=(\\d+)`).exec(text)?.[1]);
+  /** Shell code that waits until the test lets the command go on, so nothing depends on how long a step takes. */
+  const GATE = 'while [ ! -e go ]; do sleep 0.05; done';
+  const openGate = () => fs.writeFileSync(path.join(dir, 'go'), '');
 
   test('runCommand hands the process over at the timeout and returns with the output so far', async () => {
-    const command = 'echo early; echo "pid=$$"; sleep 0.6; echo late; sleep 30 & echo "child=$!"; wait';
+    const command = `echo early; echo "pid=$$"; ${GATE}; echo late; sleep 30 & echo "child=$!"; wait`;
     const started = Date.now();
-    const res = await runCommand(command, { cwd: dir, timeoutMs: 150, shells, onTimeout: 'background' });
+    const streamed: string[] = [];
+    const res = await runCommand(command, { cwd: dir, timeoutMs: 250, shells, onTimeout: 'background', onData: (chunk) => streamed.push(chunk) });
     const took = Date.now() - started;
-    assert.ok(took >= 140 && took < 550, `took ${took}ms`);
+    assert.ok(took >= 240 && took < 2000, `took ${took}ms`);
     assert.match(res.output, /^early\npid=\d+\n$/);
     assert.equal(res.backgroundId, 'bash_1');
     assert.equal(res.timedOut, true);
@@ -469,16 +473,20 @@ describe('moving a running command to the background', () => {
     // It is a background shell like any other, under the command as it was typed and its real start time.
     const [listed] = shells.list();
     assert.deepEqual([listed!.id, listed!.status, listed!.command, listed!.exitCode], ['bash_1', 'running', command, null]);
-    assert.ok(listed!.startedAt >= started && listed!.startedAt < started + 140, 'startedAt is when the command began');
+    assert.ok(listed!.startedAt >= started && listed!.startedAt < started + 240, 'startedAt is when the command began');
     assert.equal(shells.running(), 1);
     assert.equal(shells.foregroundCount(), 0);
 
     // The caller already has the output so far; reading returns what comes after it.
+    assert.equal(shells.read('bash_1')!.output, '');
+    openGate();
     let later = '';
     assert.equal(await waitFor(() => /child=\d+/.test((later += shells.read('bash_1')!.output))), true);
     assert.match(later, /^late\nchild=\d+\n$/);
     const child = pidIn(later, 'child');
     assert.equal(alive(child), true);
+    // The call that returned hears no more of it.
+    assert.equal(streamed.join(''), res.output);
 
     assert.equal(shells.kill('bash_1'), true);
     assert.equal(shells.list()[0]!.status, 'killed');
@@ -488,9 +496,11 @@ describe('moving a running command to the background', () => {
 
   test('a command moved to the background runs to its end and reports its exit code', async () => {
     const before = cwdFiles();
-    const res = await runCommand('echo one; sleep 0.4; echo two; exit 3', { cwd: dir, timeoutMs: 150, shells, onTimeout: 'background' });
+    const res = await runCommand(`echo one; ${GATE}; echo two; exit 3`, { cwd: dir, timeoutMs: 250, shells, onTimeout: 'background' });
     assert.equal(res.backgroundId, 'bash_1');
     assert.equal(res.output, 'one\n');
+    assert.equal(shells.list()[0]!.status, 'running');
+    openGate();
     assert.equal(await waitFor(() => shells.list()[0]!.status === 'failed'), true);
     assert.deepEqual(shells.read('bash_1'), { output: 'two\n', status: 'failed', exitCode: 3 });
     // The scratch file recording its working directory is not left behind.
@@ -556,7 +566,7 @@ describe('moving a running command to the background', () => {
   });
 
   test('adopt takes over a running process, keeps its earlier output and collects the rest', async () => {
-    const proc = spawn('bash', ['-c', 'echo one; sleep 0.4; echo two; sleep 30 & echo "child=$!"; wait'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const proc = spawn('bash', ['-c', `echo one; ${GATE}; echo two; sleep 30 & echo "child=$!"; wait`], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let early = '';
     const collect = (chunk: Buffer) => (early += chunk.toString());
     proc.stdout!.on('data', collect);
@@ -571,6 +581,7 @@ describe('moving a running command to the background', () => {
     assert.ok(shells.list()[0]!.startedAt >= before);
     assert.equal(shells.running(), 1);
     // Nobody has been given the earlier output yet, so the first read returns it too.
+    openGate();
     let text = '';
     assert.equal(await waitFor(() => /child=\d+/.test((text += shells.read('bash_1')!.output))), true);
     assert.match(text, /^one\ntwo\nchild=\d+\n$/);
@@ -583,7 +594,7 @@ describe('moving a running command to the background', () => {
   });
 
   test('adopt: output already passed on is not returned again, and a process that has ended is reported as ended', async () => {
-    const proc = spawn('bash', ['-c', 'echo one; sleep 0.3; echo two'], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const proc = spawn('bash', ['-c', `echo one; ${GATE}; echo two`], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let early = '';
     const collect = (chunk: Buffer) => (early += chunk.toString());
     proc.stdout!.on('data', collect);
@@ -591,6 +602,8 @@ describe('moving a running command to the background', () => {
     proc.stdout!.off('data', collect);
     shells.adopt(proc, 'two steps', early, { delivered: true, startedAt: 1234 });
     assert.equal(shells.list()[0]!.startedAt, 1234);
+    assert.deepEqual(shells.read('bash_1'), { output: '', status: 'running', exitCode: null });
+    openGate();
     assert.equal(await waitFor(() => shells.list()[0]!.status === 'completed'), true);
     assert.deepEqual(shells.read('bash_1'), { output: 'two\n', status: 'completed', exitCode: 0 });
 
@@ -608,9 +621,9 @@ describe('moving a running command to the background', () => {
     ctx.session.shells.killGraceMs = 100;
     managers.push(ctx.session.shells);
     const started = Date.now();
-    const res = await sh('echo begin; echo "pid=$$"; sleep 1; echo later; sleep 30 & echo "child=$!"; wait');
+    const res = await sh(`echo begin; echo "pid=$$"; ${GATE}; echo later; sleep 30 & echo "child=$!"; wait`);
     const took = Date.now() - started;
-    assert.ok(took >= 550 && took < 950, `took ${took}ms`);
+    assert.ok(took >= 590 && took < 2500, `took ${took}ms`);
     const pid = pidIn(res.content, 'pid');
     assert.equal(res.isError, false);
     assert.equal(
@@ -622,6 +635,8 @@ describe('moving a running command to the background', () => {
     assert.equal(alive(pid), true, 'the command was killed');
 
     // More output arrives and is read with BashOutput; what the Bash result showed is not repeated.
+    assert.equal((await bashOutputTool.execute({ bash_id: 'bash_1' }, ctx)).content, 'Status: running\n(no new output)');
+    openGate();
     let followed = '';
     for (const end = Date.now() + 3000; !/child=\d+/.test(followed) && Date.now() < end; await sleep(20)) {
       const next = await bashOutputTool.execute({ bash_id: 'bash_1' }, ctx);
@@ -680,8 +695,8 @@ describe('detachForeground', () => {
   test('two running commands are both moved, each to its own shell', async () => {
     const session = ctx.session;
     // Starting with `sleep` only matters at the timeout: the user may move any command.
-    const first = sh('sleep 0.3; echo "a=$$"; sleep 30');
-    const second = sh('sleep 0.3; echo "b=$$"; sleep 30');
+    const first = sh('sleep 0.2; echo "a=$$"; sleep 30');
+    const second = sh('sleep 0.2; echo "b=$$"; sleep 30');
     assert.equal(session.shells.foregroundCount(), 2);
     assert.equal(session.detachForeground(), 2);
     const results = await Promise.all([first, second]);

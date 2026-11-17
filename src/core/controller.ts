@@ -188,6 +188,14 @@ export class Controller implements RuntimeHandle {
       projectRoot: this.session.projectRoot,
       cwd: () => this.session.cwd,
       permissionMode: () => this.permissions.mode,
+      complete: async (system, prompt, opts) => {
+        if (!this.client) throw new Error('no model is connected yet');
+        let client = this.client;
+        if (opts.model && opts.model !== client.model) {
+          client = new ModelClient(this.provider, opts.model, await profileModel(this.provider, opts.model, this.settings), this.settings);
+        }
+        return client.complete(system, prompt, { signal: opts.signal, maxTokens: 300 });
+      },
     });
   }
 
