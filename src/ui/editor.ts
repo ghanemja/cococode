@@ -36,7 +36,8 @@ export class Editor {
   }
 
   addHistory(entry: string): void {
-    const e = entry.trim();
+    // Store what was actually sent: a recalled placeholder would have lost its paste.
+    const e = this.expand(entry).trim();
     if (!e || this.history[this.history.length - 1] === e) return;
     this.history.push(e);
   }
@@ -47,9 +48,13 @@ export class Editor {
 
   /** The text to submit, with collapsed pastes expanded. */
   value(): string {
-    let out = this.text;
-    for (const [token, content] of this.pastes) out = out.split(token).join(content);
-    return out;
+    return this.expand(this.text);
+  }
+
+  /** Replace paste placeholders by their content, in one pass so pasted text is never re-scanned. */
+  private expand(text: string): string {
+    if (this.pastes.size === 0) return text;
+    return text.replace(/\[Pasted text #\d+ \+\d+ lines\]/g, (token) => this.pastes.get(token) ?? token);
   }
 
   set(text: string): void {
@@ -139,9 +144,15 @@ export class Editor {
     this.cursor = i;
   }
 
+  /** Index where the logical line containing the cursor starts. */
+  private lineStart(): number {
+    // lastIndexOf clamps a negative start to 0, which would find a newline at index 0.
+    return this.cursor === 0 ? 0 : this.text.lastIndexOf('\n', this.cursor - 1) + 1;
+  }
+
   /** Start of the current logical line. */
   home(): void {
-    this.cursor = this.text.lastIndexOf('\n', this.cursor - 1) + 1;
+    this.cursor = this.lineStart();
   }
 
   end(): void {
@@ -149,25 +160,31 @@ export class Editor {
     this.cursor = nl < 0 ? this.text.length : nl;
   }
 
+  /** Remove [start, end) and remember it for yank. Killing nothing keeps the previous kill. */
+  private kill(start: number, end: number): void {
+    if (end <= start) return;
+    this.killed = this.text.slice(start, end);
+    this.text = this.text.slice(0, start) + this.text.slice(end);
+    this.cursor = start;
+  }
+
   killToEnd(): void {
     const nl = this.text.indexOf('\n', this.cursor);
+    // At the end of a line, kill the line break itself (joining the lines).
     const end = nl < 0 ? this.text.length : nl === this.cursor ? nl + 1 : nl;
-    this.killed = this.text.slice(this.cursor, end);
-    this.text = this.text.slice(0, this.cursor) + this.text.slice(end);
+    this.kill(this.cursor, end);
   }
 
   killToStart(): void {
-    const start = this.text.lastIndexOf('\n', this.cursor - 1) + 1;
-    this.killed = this.text.slice(start, this.cursor);
-    this.text = this.text.slice(0, start) + this.text.slice(this.cursor);
-    this.cursor = start;
+    this.kill(this.lineStart(), this.cursor);
   }
 
   killWordBack(): void {
     const end = this.cursor;
     this.wordLeft();
-    this.killed = this.text.slice(this.cursor, end);
-    this.text = this.text.slice(0, this.cursor) + this.text.slice(end);
+    const start = this.cursor;
+    this.cursor = end;
+    this.kill(start, end);
   }
 
   yank(): void {
@@ -227,13 +244,18 @@ export class Editor {
     if (target < 0 || target >= rows.length) return false;
     const col = stringWidth(this.text.slice(rows[current]!.start, this.cursor));
     const row = rows[target]!;
+    // On a soft-wrapped row the position after its last character is the start
+    // of the next row, so the cursor may go no further than before that character.
+    const softWrapped = target + 1 < rows.length && rows[target + 1]!.start === row.end;
+    const parts = graphemes(this.text.slice(row.start, row.end));
+    const limit = softWrapped ? parts.length - 1 : parts.length;
     let pos = row.start;
     let w = 0;
-    for (const g of graphemes(this.text.slice(row.start, row.end))) {
-      const gw = graphemeWidth(g);
+    for (let i = 0; i < limit; i++) {
+      const gw = graphemeWidth(parts[i]!);
       if (w + gw > col) break;
       w += gw;
-      pos += g.length;
+      pos += parts[i]!.length;
     }
     this.cursor = pos;
     return true;

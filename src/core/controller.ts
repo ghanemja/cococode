@@ -537,7 +537,11 @@ export class Controller implements RuntimeHandle {
     this.session = new SessionState({ id: loaded.id, cwd: this.session.projectRoot, settings: this.settings });
     this.session.additionalDirs = additionalDirs;
     this.session.vision = this.client?.profile.vision ?? false;
-    this.session.turn = Math.max(0, ...loaded.messages.map((m) => (m.role === 'user' ? (m.turn ?? 0) : 0)));
+    // New turns must be numbered above every existing one. After a compaction or a
+    // rewind the messages alone can understate that, so the file checkpoints are consulted too.
+    let lastTurn = this.session.checkpoints.lastTurn();
+    for (const m of loaded.messages) if (m.role === 'user' && (m.turn ?? 0) > lastTurn) lastTurn = m.turn!;
+    this.session.turn = lastTurn;
     // Restore the task list from the last TodoWrite call.
     for (let i = loaded.messages.length - 1; i >= 0; i--) {
       const m = loaded.messages[i]!;

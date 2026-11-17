@@ -220,13 +220,73 @@ function leadingWhitespace(line: string): string {
   return /^[ \t]*/.exec(line)![0];
 }
 
-export interface FuzzyMatch {
+export interface FuzzyRegion {
+  /** Index of the first matched line in the file. */
+  startLine: number;
+  lineCount: number;
   /** Exact text in the file that corresponds to old_string. */
   actual: string;
-  /** new_string adjusted to the file's indentation. */
+  /** new_string adjusted to the file's indentation at this place. */
   replacement: string;
+}
+
+export interface FuzzyMatch extends Omit<FuzzyRegion, 'startLine' | 'lineCount'> {
+  /** Every place that matched; `actual` and `replacement` describe the first. */
+  regions: FuzzyRegion[];
   count: number;
   how: string;
+}
+
+const onlyTabs = (s: string) => s !== '' && /^\t+$/.test(s);
+const onlySpaces = (s: string) => s !== '' && /^ +$/.test(s);
+
+/**
+ * Work out how the model's indentation maps onto the file's from the lines
+ * that matched, then apply the same mapping to the replacement text. Returns
+ * null when the mapping is contradictory (the same indentation in old_string
+ * stands for different indentation in the file): then there is no telling how
+ * the new lines should be indented, and guessing would corrupt the code.
+ */
+function reindent(oldLines: string[], fileLines: string[], replacement: string[]): string[] | null {
+  const map = new Map<string, string>();
+  for (let j = 0; j < oldLines.length; j++) {
+    if (oldLines[j]!.trim() === '') continue;
+    const from = leadingWhitespace(oldLines[j]!);
+    const to = leadingWhitespace(fileLines[j]!);
+    if (map.has(from) && map.get(from) !== to) return null;
+    map.set(from, to);
+  }
+  if ([...map].every(([from, to]) => from === to)) return replacement;
+
+  // Spaces in old_string standing for tabs in the file (or the reverse): learn the width.
+  let spacesPerTab = 0;
+  let tabsToSpaces = 0;
+  for (const [from, to] of map) {
+    if (onlySpaces(from) && onlyTabs(to) && from.length % to.length === 0) spacesPerTab = from.length / to.length;
+    if (onlyTabs(from) && onlySpaces(to) && to.length % from.length === 0) tabsToSpaces = to.length / from.length;
+  }
+  const convert = (extra: string): string => {
+    if (spacesPerTab && onlySpaces(extra)) return '\t'.repeat(Math.floor(extra.length / spacesPerTab)) + ' '.repeat(extra.length % spacesPerTab);
+    if (tabsToSpaces && onlyTabs(extra)) return ' '.repeat(extra.length * tabsToSpaces);
+    return extra;
+  };
+  const known = [...map.keys()].sort((x, y) => y.length - x.length);
+
+  return replacement.map((line) => {
+    if (line.trim() === '') return line;
+    const indent = leadingWhitespace(line);
+    const body = line.slice(indent.length);
+    const exact = map.get(indent);
+    if (exact !== undefined) return exact + body;
+    // Deeper than a known level: that level's indentation plus the extra.
+    const base = known.find((k) => indent.startsWith(k));
+    if (base !== undefined) return map.get(base)! + convert(indent.slice(base.length)) + body;
+    // Shallower than every known level: remove the same amount from the shallowest.
+    const shallowest = known[known.length - 1]!;
+    const target = map.get(shallowest)!;
+    const removed = convert(shallowest.slice(indent.length));
+    return (target.endsWith(removed) ? target.slice(0, target.length - removed.length) : '') + body;
+  });
 }
 
 /**
@@ -238,6 +298,9 @@ export function fuzzyFind(content: string, oldString: string, newString: string)
   const fileLines = content.split('\n');
   const oldLines = oldString.replace(/^\n+|\n+$/g, '').split('\n');
   if (oldLines.length === 0 || oldLines.every((l) => l.trim() === '')) return null;
+  const trimmedNew = newString.replace(/^\n+|\n+$/g, '');
+  // An empty replacement removes the lines rather than leaving a blank one.
+  const newLines = trimmedNew === '' ? [] : trimmedNew.split('\n');
 
   const strategies: { how: string; norm: (s: string) => string }[] = [
     { how: 'ignoring trailing whitespace', norm: (s) => s.replace(/[ \t]+$/, '') },
@@ -247,7 +310,8 @@ export function fuzzyFind(content: string, oldString: string, newString: string)
 
   for (const { how, norm } of strategies) {
     const want = oldLines.map(norm);
-    const starts: number[] = [];
+    const regions: FuzzyRegion[] = [];
+    let contradictory = false;
     for (let i = 0; i + want.length <= fileLines.length; i++) {
       let ok = true;
       for (let j = 0; j < want.length; j++) {
@@ -256,27 +320,17 @@ export function fuzzyFind(content: string, oldString: string, newString: string)
           break;
         }
       }
-      if (ok) starts.push(i);
+      if (!ok) continue;
+      const matched = fileLines.slice(i, i + want.length);
+      const lines = reindent(oldLines, matched, newLines);
+      if (lines === null) contradictory = true;
+      else regions.push({ startLine: i, lineCount: want.length, actual: matched.join('\n'), replacement: lines.join('\n') });
+      i += want.length - 1; // matches do not overlap
     }
-    if (starts.length === 0) continue;
-    const start = starts[0]!;
-    const actual = fileLines.slice(start, start + want.length).join('\n');
-
-    // Shift the replacement by the difference between the file's indent and the model's.
-    const fileIndent = leadingWhitespace(fileLines[start + oldLines.findIndex((l) => l.trim() !== '')] ?? '');
-    const modelIndent = leadingWhitespace(oldLines.find((l) => l.trim() !== '') ?? '');
-    let replacement = newString.replace(/^\n+|\n+$/g, '');
-    if (fileIndent !== modelIndent) {
-      replacement = replacement
-        .split('\n')
-        .map((line) => {
-          if (line.trim() === '') return line;
-          if (line.startsWith(modelIndent)) return fileIndent + line.slice(modelIndent.length);
-          return fileIndent + line.trimStart();
-        })
-        .join('\n');
-    }
-    return { actual, replacement, count: starts.length, how };
+    // A place that matched but cannot be re-indented safely makes the whole attempt unsafe.
+    if (contradictory) return null;
+    if (regions.length === 0) continue;
+    return { actual: regions[0]!.actual, replacement: regions[0]!.replacement, regions, count: regions.length, how };
   }
   return null;
 }
@@ -350,7 +404,6 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     return { abs, before: raw, after: newString, output: newString, summary: 'Wrote file', message: `Wrote ${name}.` };
   }
 
-  let note = '';
   let count = countOccurrences(content, oldString);
   if (count === 0) {
     // The text may have been pasted from Read output, line-number prefixes and all. Only
@@ -376,10 +429,15 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
     if (fuzzy.count > 1 && !input.replace_all) {
       return { error: `old_string matches ${fuzzy.count} places in ${name} (${fuzzy.how}). Include more surrounding lines so it matches exactly one.` };
     }
-    oldString = fuzzy.actual;
-    newString = fuzzy.replacement;
-    count = countOccurrences(content, oldString);
-    note = ` (matched ${fuzzy.how})`;
+    // Whole lines matched, so splice lines; each place gets its own re-indented replacement.
+    const lines = content.split('\n');
+    for (const region of [...fuzzy.regions].reverse()) {
+      const replacement = newString.replace(/^\n+|\n+$/g, '') === '' ? [] : region.replacement.split('\n');
+      lines.splice(region.startLine, region.lineCount, ...replacement);
+    }
+    const first = fuzzy.regions[0]!;
+    const offset = content.split('\n').slice(0, first.startLine).join('\n').length + (first.startLine > 0 ? 1 : 0);
+    return finishEdit(abs, name, content, lines.join('\n'), eol, fuzzy.count, offset, first.replacement.length, ` (matched ${fuzzy.how})`);
   }
   if (count > 1 && !input.replace_all) {
     const lineNos: number[] = [];
@@ -397,16 +455,17 @@ export function planEdit(input: EditInput, ctx: ToolContext): EditPlan {
   const updated = input.replace_all
     ? content.split(oldString).join(newString)
     : content.slice(0, firstIndex) + newString + content.slice(firstIndex + oldString.length);
-  const replaced = input.replace_all ? count : 1;
+  return finishEdit(abs, name, content, updated, eol, input.replace_all ? count : 1, firstIndex, newString.length, '');
+}
+
+function finishEdit(abs: string, name: string, before: string, updated: string, eol: string, replaced: number, at: number, length: number, note: string): EditPlan {
   return {
     abs,
-    before: content,
+    before,
     after: updated,
     output: eol === '\r\n' ? updated.replace(/\n/g, '\r\n') : updated,
     summary: `Replaced ${plural(replaced, 'occurrence')}${note}`,
-    message:
-      `Edited ${name}: replaced ${plural(replaced, 'occurrence')}${note}. The file now reads:\n` +
-      snippetAround(updated, firstIndex, newString.length),
+    message: `Edited ${name}: replaced ${plural(replaced, 'occurrence')}${note}. The file now reads:\n` + snippetAround(updated, at, length),
   };
 }
 

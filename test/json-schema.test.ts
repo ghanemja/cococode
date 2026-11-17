@@ -186,6 +186,12 @@ describe('validateInput: coercion', () => {
     assert.deepEqual(res, { ok: true, value: { list: ['a', 'b'], obj: { n: 3 } } });
   });
 
+  test('a JSON-encoded value that is cut short is rejected, not half-accepted', () => {
+    const res = validateInput(todoWriteTool.parameters, { todos: '[{"content":"a","status":"pending"},{"content":"b","sta' });
+    assert.equal(res.ok, false);
+    if (!res.ok) assert.match(res.error, /todos must be array \(got string\)/);
+  });
+
   test('a single string becomes a one-element list of strings', () => {
     const schema: JsonSchema = { type: 'object', properties: { domains: { type: 'array', items: { type: 'string' } } } };
     assert.deepEqual(validateInput(schema, { domains: 'example.com' }), { ok: true, value: { domains: ['example.com'] } });

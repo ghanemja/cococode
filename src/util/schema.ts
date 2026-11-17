@@ -50,7 +50,8 @@ function coerce(value: unknown, schema: JsonSchema, path: string, errors: string
       if (types.includes('boolean') && /^(true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === 'true';
       if ((types.includes('array') || types.includes('object')) && /^[[{]/.test(trimmed)) {
         const parsed = parseJsonLoose(trimmed);
-        if (parsed.ok && types.some((t) => t === typeOf(parsed.value))) return coerce(parsed.value, schema, path, errors);
+        // A value that had to be closed artificially is incomplete: reject it rather than drop items silently.
+        if (parsed.ok && !parsed.truncated && types.some((t) => t === typeOf(parsed.value))) return coerce(parsed.value, schema, path, errors);
       }
       // A single string where a list of strings is expected.
       if (types.includes('array') && allowedTypes(schema.items ?? {}).includes('string')) return [value];
