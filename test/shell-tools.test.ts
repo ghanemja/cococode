@@ -448,7 +448,7 @@ describe('moving a running command to the background', () => {
   });
 
   /** Scratch files in which runCommand records the working directory of this process's commands. */
-  const cwdFiles = () => fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`coco-cwd-${process.pid}-`)).sort();
+  const cwdFiles = () => fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`coco-cwd-${process.pid}-`));
   const pidIn = (text: string, name: string) => Number(new RegExp(`${name}=(\\d+)`).exec(text)?.[1]);
   /** Shell code that waits until the test lets the command go on, so nothing depends on how long a step takes. */
   const GATE = 'while [ ! -e go ]; do sleep 0.05; done';
@@ -504,7 +504,7 @@ describe('moving a running command to the background', () => {
     assert.equal(await waitFor(() => shells.list()[0]!.status === 'failed'), true);
     assert.deepEqual(shells.read('bash_1'), { output: 'two\n', status: 'failed', exitCode: 3 });
     // The scratch file recording its working directory is not left behind.
-    assert.deepEqual(cwdFiles(), before);
+    assert.deepEqual(cwdFiles().filter((f) => !before.includes(f)), []);
   });
 
   test('the timeout still kills when there is no manager to take the command, and by default', async () => {

@@ -146,14 +146,22 @@ Type a request and press enter. While the model works you can keep typing; messa
 | `/memory` | Edit memory files |
 | `/review [target]` | Review uncommitted changes or a branch |
 | `/usage` | Tokens, speed and duration for the session |
-| `/status`, `/doctor` | What is configured, and whether it is healthy |
+| `/status`, `/doctor [probe]` | What is configured, and whether it is healthy; `probe` tests the model with live tool calls |
 | `/config [get\|set]` | View or change settings |
 | `/think [on\|off\|level]` | Model reasoning |
 | `/output-style [name]` | default, explanatory, learning, or your own |
 | `/agents`, `/skills`, `/hooks`, `/mcp` | List what is installed |
 | `/todos`, `/bashes` | The task list and background shells |
 | `/add-dir <path>` | Allow work in another directory |
-| `/export [file]` | Save the conversation as Markdown |
+| `/export [file]`, `/copy` | Save the conversation as Markdown; copy the last reply |
+| `/rename <name>`, `/branch [name]` | Name the session; continue in a copy of it |
+| `/diff` | Uncommitted changes in the project |
+| `/btw <question>` | A side question that stays out of the conversation |
+| `/recap` | Summarize the session so far |
+| `/cd <dir>` | Change the working directory |
+| `/autocompact [on\|off]` | Automatic summarizing |
+| `/security-review` | Review pending changes for security problems |
+| `/reload-skills` | Re-read commands, skills, agents and memory from disk |
 | `/verbose`, `/exit` | |
 
 ## Tools
@@ -171,7 +179,7 @@ Type a request and press enter. While the model works you can keep typing; messa
 | `TodoWrite` | Keep a task list for multi-step work |
 | `Agent` | Delegate a task to a subagent with its own context |
 | `AskUserQuestion` | Ask you to choose between options |
-| `ExitPlanMode` | Present a plan for approval |
+| `EnterPlanMode`, `ExitPlanMode` | Switch to planning; present a plan for approval |
 | `Skill` | Load a skill's instructions |
 | `mcp__server__tool` | Tools from MCP servers |
 
@@ -219,7 +227,22 @@ coco loads instruction files into every session:
 - `COCO.md` (or `AGENTS.md`) in the project, and in each directory down to where you started
 - `COCO.local.md` for notes you keep out of git
 
-Files can pull in others with `@path/to/file`. Run `/init` to have the model write a first `COCO.md`, `/memory` to edit, or start a line with `#` to add a note.
+Files can pull in others with `@path/to/file` (up to five levels deep). Run `/init` to have the model write a first `COCO.md`, `/memory` to edit, or start a line with `#` to add a note.
+
+**Rules.** Every Markdown file under `.coco/rules/` (and `~/.coco/rules/`) is loaded too. A rule with `paths` in its front matter is held back until the model works on a matching file:
+
+```markdown
+---
+paths: src/api/**/*.ts
+---
+Handlers validate their input with zod before touching the database.
+```
+
+**Nested instructions.** A `COCO.md` in a subdirectory is not loaded at start. It is delivered the first time the model reads or edits a file below that directory, so a large repository does not pay for instructions it never needs. `claudeMdExcludes` (a list of globs) skips files; `node_modules` is skipped by default.
+
+**Auto memory.** The model keeps its own notes for each repository in `~/.coco/projects/<project>/memory/`. The first 200 lines (or 25 KB) of `MEMORY.md` there are loaded at the start of every session, and the model can read and write that directory without asking. Turn it off with `"autoMemoryEnabled": false`.
+
+After the conversation is summarized, the project's memory files, the approved plan, the task list, up to five recently read files and the skills in use are put back, so a long session does not forget its instructions.
 
 ## Extending it
 
@@ -234,7 +257,7 @@ allowed-tools: Bash(gh issue view:*)
 Fix issue #$1. Current branch: !`git branch --show-current`
 ```
 
-`$ARGUMENTS` and `$1`…`$9` are filled in; `` !`cmd` `` is replaced by the command's output when `allowed-tools` permits it.
+`$ARGUMENTS` and `$1`…`$9` are filled in; `` !`cmd` `` (or a fenced block opened with three backticks and `!`) is replaced by the command's output when `allowed-tools` permits it.
 
 **Subagents.** `.coco/agents/reviewer.md` defines an agent the model can delegate to. Built in: `general-purpose`, `explore` (read-only search) and `plan`.
 
@@ -243,15 +266,42 @@ Fix issue #$1. Current branch: !`git branch --show-current`
 name: reviewer
 description: Reviews a change for bugs. Use after writing code.
 tools: Read, Grep, Glob, Bash
+disallowedTools: Write
+maxTurns: 30
+skills: house-style
 ---
 You are a meticulous code reviewer...
 ```
 
+`tools` and `disallowedTools` limit what the agent can use, `model` picks another model for it, `maxTurns` bounds it, `skills` loads those skills into it from the start, and `omitClaudeMd: true` leaves the project memory out. Names are matched without regard to case. `--agents '<json>'` defines agents for one run, and `--agent <name>` (or the `agent` setting) runs the main conversation as that agent, with its prompt, tools and model. A subagent cannot start further subagents.
+
 **Skills.** `.coco/skills/<name>/SKILL.md` holds instructions the model loads when a task matches the skill's description. Skills are also available as `/name`.
+
+```markdown
+---
+description: Cut a release. Use when asked to publish a new version.
+argument-hint: <version>
+allowed-tools: Bash(git tag *), Bash(npm version *)
+disable-model-invocation: true
+---
+Release $0. Notes template: ${COCO_SKILL_DIR}/notes.md
+Current tags: !`git tag --list`
+```
+
+| Field | Meaning |
+| --- | --- |
+| `description`, `when_to_use` | What the model reads when deciding whether to load the skill |
+| `argument-hint`, `arguments` | Shown in completion; `arguments: [issue, branch]` names them for `$issue`, `$branch` |
+| `allowed-tools` | Rules approved for the rest of the session once the skill is used; also what its inline `!` commands may run |
+| `disable-model-invocation: true` | Only you can run it, as `/name` |
+| `user-invocable: false` | Only the model can load it; hidden from `/` completion |
+| `context: fork`, `agent` | Run the skill in a subagent (of the named type) and return its report |
+
+In a skill, `$ARGUMENTS` is everything typed after the name, `$0`, `$1`… and `$ARGUMENTS[0]`… are single arguments counted from zero, and `${COCO_SKILL_DIR}`, `${COCO_SESSION_ID}` and `${COCO_PROJECT_DIR}` are filled in (the `CLAUDE_` spellings work as well). Write `\$1` for a literal `$1`.
 
 **Output styles.** `.coco/output-styles/<name>.md` adds to the system prompt; select with `/output-style`.
 
-**Hooks.** Shell commands that run at points in the agent's work, configured in settings:
+**Hooks.** Commands that run at points in the agent's work, configured in settings:
 
 ```json
 {
@@ -263,7 +313,15 @@ You are a meticulous code reviewer...
 }
 ```
 
-Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PreCompact`, `SessionStart`, `SessionEnd`, `Notification`. A hook receives JSON on stdin. Exit code 2 blocks the action and feeds stderr back to the model; JSON on stdout can allow, deny or rewrite a tool call.
+Events: `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact`, `SessionStart`, `SessionEnd`, `Notification`. A hook receives JSON on stdin. Exit code 2 blocks the action and feeds stderr back to the model; JSON on stdout can allow, deny or rewrite a tool call (`hookSpecificOutput.permissionDecision`, `updatedInput`), answer a permission prompt, add context, or stop the turn (`"continue": false`).
+
+| Handler | What it does |
+| --- | --- |
+| `{ "type": "command", "command": "..." }` | Runs a shell command |
+| `{ "type": "http", "url": "...", "headers": {...}, "allowedEnvVars": [...] }` | POSTs the event; a 2xx reply's body is read like a command's output. Headers may use `$NAME` for the listed variables only |
+| `{ "type": "prompt", "prompt": "...", "model": "..." }` | Asks the model to judge the event; it answers `{"ok": true}` or `{"ok": false, "reason": "..."}` |
+
+Any handler can carry `"if": "Bash(git push *)"` to run only for matching tool calls, and `"timeout"` in seconds. Defaults follow Claude Code: 600 seconds for a hook, 30 for `UserPromptSubmit` and prompt hooks, and a shared 1.5 seconds at `SessionEnd`. A matcher made of names (`Edit|Write`) matches exactly; anything else is a regular expression. Hook output added to the conversation is capped at 10,000 characters. A `Stop` hook that keeps blocking is overridden after eight rounds, so it cannot hold a turn open forever. `"disableAllHooks": true` switches hooks off.
 
 **MCP servers.** Connect tools over the Model Context Protocol (stdio, streamable HTTP or SSE):
 
@@ -310,14 +368,23 @@ coco -p "run the tests and fix what fails" --permission-mode acceptEdits --allow
 | Flag | Purpose |
 | --- | --- |
 | `--output-format text\|json\|stream-json` | Final text, one JSON result, or a JSON event per line |
+| `--input-format stream-json` | Read one JSON user message per line from stdin and run a turn for each, in one session |
+| `--json-schema <schema\|file>` | The final answer must be JSON matching the schema; a reply of the wrong shape is sent back up to two times. The value is in `structured_output` |
+| `--include-partial-messages` | With `stream-json`: also emit text as it streams |
 | `--max-turns <n>` | Stop after n model turns |
+| `--fallback-model <names>` | Models to try, in order, when the main one fails |
+| `--agents <json>`, `--agent <name>` | Define subagents for the run; run as one |
+| `--name <name>`, `--session-id <uuid>`, `--fork-session` | Name the session, fix its id, or continue in a copy |
+| `--bare` | Ignore memory files, hooks, MCP servers, skills, commands and custom agents |
+| `--setting-sources user,project,local` | Which settings files to read |
+| `--debug [api,tools]`, `--debug-file <path>` | Log requests, responses and tool calls |
 | `--allowedTools`, `--disallowedTools` | Permission rules for this run |
 | `--tools <names>` | Limit the tool set |
 | `--system-prompt`, `--append-system-prompt` | Replace or extend the system prompt |
 | `--image <files>` | Attach images, for models that accept them |
 | `--no-session-persistence` | Do not save a transcript |
 
-Run `coco --help` for the full list.
+Run `coco --help` for the full list. The JSON result carries `is_error`, `num_turns`, `usage`, `permission_denials` and `session_id`; `stream-json` also reports retries (`api_retry`) and compaction. A run ended by SIGTERM exits with 143.
 
 ## Configuration
 
@@ -350,12 +417,18 @@ coco config set permissions.defaultMode acceptEdits --scope project
 | `permissions` | | `allow`, `ask`, `deny`, `defaultMode`, `additionalDirectories` |
 | `hooks`, `env`, `statusLine`, `outputStyle` | | See above |
 | `autoCompact`, `compactThreshold` | `true`, `0.8` | When to summarize |
-| `maxToolOutputChars` | 30000 | Cap on a single tool result |
+| `maxToolOutputChars` | 30000, less on small context windows | Largest tool result kept in the conversation; longer output is saved to a file the model can read |
+| `maxRetries` | 10 | Retries for a failed model request |
+| `requestTimeoutMs` | 600000 | How long a request may go without any output |
+| `fallbackModel` | | Models to try, in order, when the main one fails |
+| `agent` | | Run the main conversation as this agent |
+| `autoMemoryEnabled`, `claudeMdExcludes` | `true`, | See Memory |
+| `disableAllHooks` | `false` | |
 | `webSearch` | DuckDuckGo | `{ "provider": "searxng", "url": "http://localhost:8888" }` |
 | `claudeCompat` | `true` | Read `.claude/` and `CLAUDE.md` |
 | `bell` | `false` | Ring when a turn ends or approval is needed |
 
-Environment: `COCO_MODEL`, `COCO_PROVIDER`, `COCO_BASE_URL`, `COCO_API_KEY`, `COCO_CONTEXT_WINDOW`, `COCO_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`, `OLLAMA_HOST`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. To use the web tools behind a proxy, set `NODE_USE_ENV_PROXY=1`.
+Environment: `COCO_MODEL`, `COCO_PROVIDER`, `COCO_BASE_URL`, `COCO_API_KEY`, `COCO_CONTEXT_WINDOW`, `COCO_MAX_RETRIES`, `COCO_REQUEST_TIMEOUT_MS`, `COCO_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`, `OLLAMA_HOST`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. To use the web tools behind a proxy, set `NODE_USE_ENV_PROXY=1`.
 
 ## Built for local models
 
@@ -368,6 +441,31 @@ Local models fail in ways hosted ones mostly do not. coco is built around them:
 - **Loops.** The third identical tool call in a row is refused with a message telling the model to change approach.
 - **Reasoning that eats the output budget.** An empty reply cut off at the token limit is retried with a larger budget.
 - **Claiming work that was not done.** Tool results state what changed (the edited lines, the exit code), so the model can check itself and so can you.
+
+### Check your model first
+
+```bash
+coco doctor --probe
+```
+
+This sends three small requests and reports whether the model calls a tool when told to, uses the result, and fills in typed arguments, along with its speed and the context window in effect. When native tool calling fails but the text protocol works, it says so and gives the setting to change. A model that fails here will not do well on real tasks, whatever the agent around it does.
+
+### Recovering instead of stopping
+
+A turn should survive the ordinary failures of a long session. These follow what Claude Code documents, with the numbers it uses:
+
+| Failure | What coco does |
+| --- | --- |
+| Connection refused or reset, timeout, HTTP 408/425/429/5xx, "model is loading" | Retries up to 10 times, waiting 0.5 s and doubling up to 32 s (`maxRetries`) |
+| A request produces no output for 10 minutes | Aborts it and tries once more (`requestTimeoutMs`) |
+| A stream ends having produced nothing | Asks again without streaming |
+| The connection drops mid-reply | Keeps the text received, runs tool calls that arrived complete, and tells the model to continue from where it stopped |
+| A reply is cut off by the output limit | Continues it automatically, up to twice. A tool call cut off mid-arguments is never run: the model is told to write in smaller pieces |
+| The model keeps failing for another reason | Switches to the next `fallbackModel` for the rest of the turn |
+| A tool result is too large | Saves it to a file and shows the model the start, with the path |
+| The context fills up | Clears old tool output, then summarizes and re-attaches memory, plan, tasks, recent files and skills. If summarizing stops helping three times in a row, it stops trying and says so |
+| The same tool call three times in a row | Refuses it and tells the model to change approach |
+| A `Stop` hook that never lets go | Overridden after eight rounds |
 
 ## What is not here
 
