@@ -3,6 +3,10 @@ import { DEFAULTS } from '../config/settings.ts';
 import { analyzeCommand, isReadOnlyCommand } from '../permissions/bash.ts';
 import { formatDuration, truncate } from '../ui/ansi.ts';
 import { runCommand } from './shell.ts';
+import { spillOutput } from './spill.ts';
+
+/** Most output captured from one command. Beyond this the middle is dropped for good. */
+const CAPTURE_LIMIT = 2_000_000;
 import type { Tool, ToolResult } from './types.ts';
 import { errorResult } from './types.ts';
 
@@ -59,7 +63,8 @@ export const bashTool: Tool<BashInput> = {
       env,
       timeoutMs,
       signal: ctx.signal,
-      maxOutput,
+      // Capture far more than the model will be shown: the rest is saved to a file it can search.
+      maxOutput: Math.max(maxOutput, CAPTURE_LIMIT),
       onData: (chunk) => {
         tail = (tail + chunk).slice(-2000);
         ctx.onProgress?.(tail);
@@ -71,7 +76,8 @@ export const bashTool: Tool<BashInput> = {
       ctx.session.cwd = res.cwd;
       notes.push(`Working directory is now ${res.cwd}`);
     }
-    let output = res.output.replace(/\s+$/, '');
+    const full = res.output.replace(/\s+$/, '');
+    let output = spillOutput(ctx.session.id, ctx.toolCallId, full, maxOutput);
     if (res.interrupted) notes.push('Command was interrupted by the user.');
     else if (res.timedOut) {
       notes.push(`Command timed out after ${formatDuration(timeoutMs)} and was killed. For long-running processes use run_in_background.`);

@@ -27,6 +27,8 @@ interface Turn {
   usage?: { input: number; output: number };
   /** Wait before finishing, so aborts can land mid-stream. */
   hangMs?: number;
+  /** Fail with this error after half of the text has been sent. */
+  dropWith?: Error;
 }
 
 class FakeProvider implements Provider {
@@ -50,6 +52,7 @@ class FakeProvider implements Provider {
     if (turn.text) {
       const half = Math.ceil(turn.text.length / 2);
       yield { type: 'text', text: turn.text.slice(0, half) };
+      if (turn.dropWith) throw turn.dropWith;
       if (turn.hangMs) {
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(resolve, turn.hangMs);
@@ -87,6 +90,8 @@ interface Harness {
   permissions: PermissionManager;
   dir: string;
   prompts: PermissionPrompt[];
+  /** Backoff delays the agent asked for (the harness does not actually wait). */
+  delays: number[];
   run(text: string, signal?: AbortSignal): Promise<AgentEvent[]>;
   toolResults(): Extract<Message, { role: 'tool' }>[];
 }
@@ -122,6 +127,7 @@ function harness(script: Turn[] | ((req: ChatRequest, i: number) => Turn), opts:
   };
   const client = new ModelClient(provider, 'fake-model', profile, settings);
   const prompts: PermissionPrompt[] = [];
+  const delays: number[] = [];
   const queued = [...(opts.queued ?? [])];
   const runtime: RuntimeHandle = {
     runSubagent: async () => ({ text: 'sub done', toolUses: 0, tokens: 0 }),
@@ -149,6 +155,7 @@ function harness(script: Turn[] | ((req: ChatRequest, i: number) => Turn), opts:
         }
       : undefined,
     drainQueued: () => queued.splice(0),
+    sleep: async (ms) => void delays.push(ms),
   });
   return {
     agent,
@@ -157,6 +164,7 @@ function harness(script: Turn[] | ((req: ChatRequest, i: number) => Turn), opts:
     permissions,
     dir,
     prompts,
+    delays,
     async run(text, signal = new AbortController().signal) {
       const events: AgentEvent[] = [];
       for await (const ev of agent.run(text, signal)) events.push(ev);
@@ -209,11 +217,13 @@ describe('agent loop: basics', () => {
     assert.equal(h.provider.requests.length, 3);
   });
 
-  test('provider errors end the turn with the message', async () => {
-    const h = harness([{ throw: new ProviderError('http', 'model exploded', 500) }]);
+  test('an error that retrying cannot fix ends the turn at once', async () => {
+    const h = harness([{ throw: new ProviderError('http', 'invalid request: bad schema', 400) }, { text: 'never' }]);
     const events = await h.run('hi');
     assert.equal(done(events)?.reason, 'error');
-    assert.equal(done(events)?.error, 'model exploded');
+    assert.equal(done(events)?.error, 'invalid request: bad schema');
+    assert.equal(h.provider.requests.length, 1);
+    assert.deepEqual(h.delays, []);
   });
 });
 
@@ -312,11 +322,33 @@ describe('agent loop: tool calls from weaker models', () => {
     assert.ok(events.some((e) => e.type === 'notice' && /output budget/.test(e.text)));
   });
 
-  test('a truncated answer is kept and flagged', async () => {
-    const h = harness([{ text: 'partial answ', stop: 'length' }]);
+  test('a reply cut off at the output limit is continued automatically', async () => {
+    const h = harness([{ text: 'The first half of the ans', stop: 'length' }, { text: 'wer, now complete.' }]);
     const events = await h.run('x');
-    assert.equal(h.agent.lastAssistantText(), 'partial answ');
-    assert.ok(events.some((e) => e.type === 'notice' && /cut off/.test(e.text)));
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.provider.requests.length, 2);
+    const second = h.provider.requests[1]!.messages;
+    assert.equal((second.at(-2) as { content: string }).content, 'The first half of the ans');
+    assert.match(String((second.at(-1) as UserMessage).content), /cut off at the output limit\. Continue exactly where it stopped/);
+    assert.equal(h.agent.lastAssistantText(), 'wer, now complete.');
+  });
+
+  test('continuation stops after two tries and says so', async () => {
+    const h = harness(() => ({ text: 'more text ', stop: 'length' }));
+    const events = await h.run('x');
+    assert.equal(h.provider.requests.length, 3);
+    assert.equal(done(events)?.reason, 'stop');
+    assert.ok(events.some((e) => e.type === 'notice' && e.level === 'warn' && /cut off at the output token limit again/.test(e.text)));
+  });
+
+  test('a tool call cut off mid-arguments is not run, and the model is told how to recover', async () => {
+    const h = harness([
+      { calls: [{ name: 'Write', args: { file_path: 'big.txt', content: 'half a fi' }, parseError: 'the arguments were cut off before they were complete (the reply probably hit the output token limit)' }] },
+      { text: 'ok' },
+    ]);
+    await h.run('x');
+    assert.ok(!fs.existsSync(path.join(h.dir, 'big.txt')), 'a half-written file must not appear');
+    assert.match(h.toolResults()[0]!.content, /cut off before its arguments were complete[\s\S]*Write the first part and add the rest with Edit/);
   });
 });
 
@@ -493,6 +525,104 @@ describe('agent loop: concurrency and control', () => {
   });
 });
 
+describe('agent loop: resilience to server trouble', () => {
+  test('a transient failure is retried with growing delays, then the turn completes', async () => {
+    const h = harness([
+      { throw: new ProviderError('connection', 'Could not reach http://x (ECONNREFUSED). Is the model server running?') },
+      { throw: new ProviderError('http', 'model is loading', 503) },
+      { text: 'Back online.' },
+    ]);
+    const events = await h.run('hi');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.equal(h.agent.lastAssistantText(), 'Back online.');
+    assert.deepEqual(h.delays, [500, 1000]);
+    const notices = events.filter((e) => e.type === 'notice').map((e) => (e as { text: string }).text);
+    assert.match(notices[0]!, /Could not reach http:\/\/x[\s\S]*Retrying in 500ms \(attempt 1 of 4\)/);
+    assert.match(notices[1]!, /model is loading Retrying in 1s \(attempt 2 of 4\)/);
+    // The failed attempts leave nothing behind in the conversation.
+    assert.deepEqual(h.agent.messages.map((m) => m.role), ['user', 'assistant']);
+  });
+
+  test('retries stop at the limit and report the last error', async () => {
+    const h = harness(() => ({ throw: new ProviderError('http', 'upstream overloaded', 529) }), { settings: { maxRetries: 2 } });
+    const events = await h.run('hi');
+    assert.equal(h.provider.requests.length, 3);
+    assert.deepEqual(h.delays, [500, 1000]);
+    assert.equal(done(events)?.reason, 'error');
+    assert.equal(done(events)?.error, 'upstream overloaded');
+  });
+
+  test('maxRetries 0 turns retrying off', async () => {
+    const h = harness([{ throw: new ProviderError('http', 'boom', 500) }, { text: 'never' }], { settings: { maxRetries: 0 } });
+    const events = await h.run('hi');
+    assert.equal(h.provider.requests.length, 1);
+    assert.equal(done(events)?.error, 'boom');
+  });
+
+  test('the retry count starts again after a request succeeds', async () => {
+    const fail = () => ({ throw: new ProviderError('http', 'busy', 503) });
+    const h = harness([fail(), fail(), { calls: [{ name: 'Read', args: { file_path: 'a.txt' } }] }, fail(), fail(), { text: 'done' }], { settings: { maxRetries: 2 } });
+    const events = await h.run('hi');
+    assert.equal(done(events)?.reason, 'stop');
+    assert.deepEqual(h.delays, [500, 1000, 500, 1000]);
+  });
+
+  test('a connection that drops mid-reply keeps what was shown and asks the model to carry on', async () => {
+    const h = harness([{ text: 'Here is the first part and', dropWith: new ProviderError('connection', 'The connection to the model server was lost.') }, { text: ' here is the rest.' }]);
+    const events = await h.run('hi');
+    assert.equal(done(events)?.reason, 'stop');
+    const second = h.provider.requests[1]!.messages;
+    // The fake sends half of the text before failing; exactly that half is kept.
+    assert.equal((second.at(-2) as { content: string }).content, 'Here is the f');
+    assert.match(String((second.at(-1) as UserMessage).content), /connection dropped while you were replying[\s\S]*Continue exactly where it stopped/);
+    assert.equal(h.agent.lastAssistantText(), ' here is the rest.');
+  });
+
+  test('a server that goes silent is abandoned after the timeout and retried once', async () => {
+    const h = harness([{ text: 'this never finishes', hangMs: 60_000 }, { text: 'this never finishes', hangMs: 60_000 }, { text: 'never' }], {
+      settings: { requestTimeoutMs: 80 },
+    });
+    const started = Date.now();
+    const events = await h.run('hi');
+    assert.ok(Date.now() - started < 3000, 'must not wait for the hung request');
+    assert.equal(h.provider.requests.length, 2, 'one retry for a stall, not the full retry budget');
+    assert.equal(done(events)?.reason, 'error');
+    assert.match(done(events)!.error!, /sent nothing for [\d.]+ minutes?[\s\S]*raise requestTimeoutMs/);
+  });
+
+  test('interrupting during a retry wait stops cleanly', async () => {
+    const controller = new AbortController();
+    const h = harness(() => ({ throw: new ProviderError('http', 'busy', 503) }));
+    // Abort as soon as the agent starts waiting.
+    (h.agent as unknown as { deps: { sleep: (ms: number) => Promise<void> } }).deps.sleep = async () => controller.abort();
+    const events = await h.run('hi', controller.signal);
+    assert.equal(done(events)?.reason, 'aborted');
+    assert.equal(h.provider.requests.length, 1);
+  });
+
+  test('output too large for the context is saved in full and can be read back without asking', async () => {
+    const h = harness(
+      (_req, i) => {
+        if (i === 0) return { calls: [{ name: 'Bash', args: { command: 'seq 1 20000' } }] };
+        if (i === 1) {
+          const saved = /All of it is saved at (\S+)\. Use Grep/.exec(h.toolResults()[0]!.content)![1]!;
+          return { calls: [{ name: 'Grep', args: { pattern: '^12345$', path: saved, output_mode: 'content' } }] };
+        }
+        return { text: 'found it' };
+      },
+      { settings: { maxToolOutputChars: 2000 }, answer: () => ({ allow: false }) },
+    );
+    await h.run('count');
+    const [bash, grep] = h.toolResults();
+    assert.ok(bash!.content.length < 3000, 'the model sees a trimmed result');
+    assert.ok(bash!.content.startsWith('1\n2\n3\n'));
+    assert.match(bash!.content, /19999\n20000\n\n\[The output was \d+ characters/);
+    // The middle, absent from context, is still reachable; and reading it needed no approval.
+    assert.match(grep!.content, /12345/);
+    assert.equal(h.prompts.length, 0);
+  });
+});
+
 describe('agent loop: hooks', () => {
   test('a PreToolUse hook can block a call', async () => {
     const h = harness([{ calls: [{ name: 'Bash', args: { command: 'touch hooked.txt' } }] }, { text: 'ok' }], {
@@ -658,6 +788,20 @@ describe('context management', () => {
     assert.equal(done(events)?.reason, 'stop');
     assert.equal(h.agent.lastAssistantText(), 'Recovered.');
     assert.ok(events.some((e) => e.type === 'compact'));
+  });
+
+  test('compaction restates the task list and the files in play', async () => {
+    const h = harness((req, i) => {
+      if (req.tools.length === 0) return { text: 'SUMMARY: working on the parser.' };
+      if (i === 0) return { calls: [{ name: 'Read', args: { file_path: 'a.txt' } }, { name: 'TodoWrite', args: { todos: [{ content: 'Fix the parser', status: 'in_progress' }, { content: 'Add tests', status: 'pending' }] } }] };
+      return { text: 'ok' };
+    });
+    await h.run('start');
+    for await (const _ of h.agent.compact(new AbortController().signal, { auto: false, force: true })) void _;
+    const summary = String((h.agent.messages[0] as UserMessage).content);
+    assert.match(summary, /SUMMARY: working on the parser\./);
+    assert.match(summary, /Your task list at this point:\n\[~\] Fix the parser\n\[ \] Add tests/);
+    assert.match(summary, /Files you had open[^\n]*: a\.txt/);
   });
 
   test('manual compaction replaces history with a summary', async () => {

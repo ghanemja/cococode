@@ -234,8 +234,10 @@ export class OpenAIProvider implements Provider {
             const entry = calls.get(slot!)!;
             if (id && !entry.id) entry.id = id;
             if (typeof fn.name === 'string' && fn.name) entry.name = fn.name;
-            if (typeof fn.arguments === 'string') entry.args += fn.arguments;
-            else if (isRecord(fn.arguments)) entry.args = JSON.stringify(fn.arguments);
+            if (typeof fn.arguments === 'string') {
+              entry.args += fn.arguments;
+              if (fn.arguments) yield { type: 'progress', chars: fn.arguments.length };
+            } else if (isRecord(fn.arguments)) entry.args = JSON.stringify(fn.arguments);
           }
         }
       }

@@ -259,7 +259,30 @@ export class ModelClient {
       keepAlive: this.settings.keepAlive ?? DEFAULTS.keepAlive,
     };
 
+    // A hung server would otherwise hang the session: give up when nothing at all arrives for too long.
+    const timeoutMs = this.settings.requestTimeoutMs ?? DEFAULTS.requestTimeoutMs;
+    const watchdog = new AbortController();
+    let stalled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const arm = () => {
+      if (!(timeoutMs > 0)) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        stalled = true;
+        watchdog.abort();
+      }, timeoutMs);
+    };
+    base.signal = req.signal ? AbortSignal.any([req.signal, watchdog.signal]) : watchdog.signal;
+    try {
+      yield* this.attempt(base, arm, () => stalled, timeoutMs);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async *attempt(base: ChatRequest, arm: () => void, isStalled: () => boolean, timeoutMs: number): AsyncGenerator<StreamEvent> {
     for (let attempt = 0; attempt < 2; attempt++) {
+      arm();
       const wire = this.profile.toolMode === 'prompt' ? toTextProtocol(base) : base;
       const parser = new TextStreamParser(base.tools.map((t) => t.name));
       let emitted = false;
@@ -286,6 +309,7 @@ export class ModelClient {
       };
       try {
         for await (const event of this.provider.chat(wire)) {
+          arm();
           if (event.type === 'text') {
             for (const parsed of fromParser(parser.push(event.text))) {
               emitted = true;
@@ -312,6 +336,14 @@ export class ModelClient {
         }
         return;
       } catch (err) {
+        if (isStalled()) {
+          const minutes = Math.round(timeoutMs / 6000) / 10;
+          throw new ProviderError(
+            'timeout',
+            `The model server sent nothing for ${minutes} minute${minutes === 1 ? '' : 's'}. It may be overloaded, still loading the model, or stuck. ` +
+              'If your hardware simply needs longer, raise requestTimeoutMs.',
+          );
+        }
         const canFallBack =
           err instanceof ProviderError &&
           err.kind === 'tools_unsupported' &&

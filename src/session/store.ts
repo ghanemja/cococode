@@ -218,6 +218,7 @@ export function cleanupOldSessions(days: number): void {
   };
   sweep(path.join(configDir(), 'projects'), 1);
   sweep(path.join(configDir(), 'file-history'), 0);
+  sweep(path.join(configDir(), 'tool-results'), 0);
 }
 
 /** Markdown export of a conversation, for /export. */

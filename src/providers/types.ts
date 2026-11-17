@@ -19,6 +19,8 @@ export type StreamEvent =
   | { type: 'thinking'; text: string }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'usage'; usage: Usage }
+  /** Output is arriving that is not shown yet (tool-call arguments). Keeps stall detection and progress honest. */
+  | { type: 'progress'; chars: number }
   | { type: 'done'; stopReason: StopReason };
 
 export interface ModelInfo {
@@ -44,6 +46,7 @@ export type ProviderErrorKind =
   | 'tools_unsupported'
   | 'context_overflow'
   | 'aborted'
+  | 'timeout'
   | 'http'
   | 'other';
 
@@ -169,4 +172,18 @@ export function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numb
   const signals = [AbortSignal.timeout(timeoutMs)];
   if (signal) signals.push(signal);
   return fetch(url, { ...init, signal: AbortSignal.any(signals) });
+}
+
+const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+
+/**
+ * Failures worth retrying: the server was unreachable, stalled, overloaded or
+ * still loading the model. Bad requests and missing models are not.
+ */
+export function isTransientError(err: unknown): boolean {
+  if (!(err instanceof ProviderError)) return false;
+  if (err.kind === 'connection' || err.kind === 'timeout') return true;
+  if (err.kind !== 'http') return false;
+  if (err.status !== undefined && TRANSIENT_STATUS.has(err.status)) return true;
+  return /loading model|model is loading|server busy|overloaded|try again|temporarily unavailable/i.test(err.message);
 }

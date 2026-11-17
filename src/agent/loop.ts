@@ -2,9 +2,12 @@ import { DEFAULTS, type Settings } from '../config/settings.ts';
 import type { HookRunner } from '../hooks/hooks.ts';
 import type { PermissionManager, Suggestion } from '../permissions/manager.ts';
 import type { ModelClient } from '../providers/index.ts';
-import { ProviderError } from '../providers/types.ts';
+import { TRUNCATED_ARGS } from '../providers/textTools.ts';
+import { ProviderError, isTransientError } from '../providers/types.ts';
 import type { SessionState } from '../session/state.ts';
-import { clampOutput } from '../tools/shell.ts';
+import { displayPath } from '../config/paths.ts';
+import { renderTodos } from '../tools/meta.ts';
+import { spillOutput } from '../tools/spill.ts';
 import { toolSpecs } from '../tools/registry.ts';
 import type { FileDiff, PermissionRequest, RuntimeHandle, Tool, ToolContext, ToolResult } from '../tools/types.ts';
 import type { AssistantMessage, ContentPart, Message, ToolCall, ToolResultMessage, Usage, UserMessage } from '../types.ts';
@@ -25,6 +28,8 @@ export type AgentEvent =
   | { type: 'tool_progress'; id: string; text: string }
   | { type: 'tool_end'; call: ToolCall; result: ToolResult; durationMs: number }
   | { type: 'usage'; usage: Usage }
+  /** Output is being generated that is not displayed yet (tool-call arguments). */
+  | { type: 'progress'; chars: number }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string }
   | { type: 'compact'; phase: 'start' | 'end'; before?: number; after?: number; auto: boolean }
   | { type: 'done'; reason: DoneReason; error?: string };
@@ -68,6 +73,21 @@ export interface AgentDeps {
   maxTurns?: number;
   /** Messages the user typed while the agent was busy. */
   drainQueued?: () => UserMessage[];
+  /** Wait between retries. Replaceable so tests do not actually wait. */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 /** A push/pull bridge so concurrent tool runs can emit events through one generator. */
@@ -141,6 +161,12 @@ function stableStringify(value: unknown): string {
 }
 
 const INTERRUPT_NOTE = '[Request interrupted by user]';
+const CUT_OFF_NOTE =
+  'Your reply was cut off at the output limit. Continue exactly where it stopped, without repeating anything. If you were about to call a tool, call it now.';
+const DROPPED_NOTE =
+  'The connection dropped while you were replying, so your last message is incomplete. Continue exactly where it stopped, without repeating what you already wrote. If you were about to call a tool, call it now.';
+/** How many times a reply cut off at the output limit is continued automatically. */
+const MAX_CONTINUATIONS = 2;
 const REPEAT_LIMIT = 3;
 /** Polling tools legitimately repeat with identical arguments. */
 const REPEAT_EXEMPT = new Set(['BashOutput']);
@@ -238,6 +264,9 @@ export class Agent {
     let overflowRetried = false;
     let stopHookBlocks = 0;
     let maxTokens: number | undefined;
+    let transientRetries = 0;
+    let continuations = 0;
+    const maxRetries = deps.settings.maxRetries ?? DEFAULTS.maxRetries;
 
     for (;;) {
       if (signal.aborted) {
@@ -303,10 +332,14 @@ export class Agent {
             calls.push(ev.call);
           } else if (ev.type === 'usage') {
             usage = ev.usage;
+          } else if (ev.type === 'progress') {
+            firstTokenAt ||= Date.now();
+            yield { type: 'progress', chars: ev.chars };
           } else if (ev.type === 'done') {
             stopReason = ev.stopReason;
           }
         }
+        transientRetries = 0;
       } catch (err) {
         const aborted = signal.aborted || (err instanceof ProviderError && err.kind === 'aborted');
         if (aborted) {
@@ -323,6 +356,33 @@ export class Agent {
           continue;
         }
         const message = err instanceof Error ? err.message : String(err);
+        // Transient failures (server restarting, model loading, a dropped connection, a stall)
+        // are retried with backoff. A stall already cost a long wait, so it gets one more try.
+        const allowed = err instanceof ProviderError && err.kind === 'timeout' ? Math.min(1, maxRetries) : maxRetries;
+        if (isTransientError(err) && transientRetries < allowed) {
+          transientRetries++;
+          if (text.trim()) {
+            // What was already shown is kept, and the model is asked to carry on from it.
+            const partial: AssistantMessage = { role: 'assistant', content: text, model: deps.client.model, stopReason: 'error' };
+            this.push(partial);
+            yield { type: 'assistant', message: partial };
+            this.push({ role: 'user', isMeta: true, content: DROPPED_NOTE });
+          }
+          const delay = Math.min(30_000, 500 * 2 ** (transientRetries - 1));
+          yield {
+            type: 'notice',
+            level: 'warn',
+            text: `${message.split('\n')[0]} Retrying in ${delay < 1000 ? `${delay}ms` : `${Math.round(delay / 1000)}s`} (attempt ${transientRetries} of ${allowed}).`,
+          };
+          await (deps.sleep ?? sleep)(delay, signal);
+          if (signal.aborted) {
+            this.push({ role: 'user', content: INTERRUPT_NOTE, isMeta: true });
+            yield { type: 'done', reason: 'aborted' };
+            return;
+          }
+          turns--;
+          continue;
+        }
         yield { type: 'done', reason: 'error', error: message };
         return;
       }
@@ -382,7 +442,13 @@ export class Agent {
         recordUsage();
         yield { type: 'assistant', message: assistant };
         if (stopReason === 'length') {
-          yield { type: 'notice', level: 'warn', text: 'The reply was cut off at the output token limit. Say "continue" to carry on.' };
+          if (continuations < MAX_CONTINUATIONS) {
+            continuations++;
+            this.push({ role: 'user', isMeta: true, content: CUT_OFF_NOTE });
+            yield { type: 'notice', level: 'info', text: 'The reply hit the output limit; continuing it.' };
+            continue;
+          }
+          yield { type: 'notice', level: 'warn', text: 'The reply was cut off at the output token limit again. Say "continue" to carry on, or raise maxOutputTokens.' };
         }
 
         const hookEvent = deps.depth > 0 ? 'SubagentStop' : 'Stop';
@@ -462,6 +528,16 @@ export class Agent {
     const prepared = calls.map((call) => {
       const tool = this.resolveTool(call.name, tools);
       if (!tool) return { call, tool: undefined, input: undefined, error: `Unknown tool "${call.name}". Available tools: ${tools.map((t) => t.name).join(', ')}.` };
+      if (call.parseError === TRUNCATED_ARGS) {
+        return {
+          call,
+          tool,
+          input: undefined,
+          error:
+            `Your ${tool.name} call was cut off before its arguments were complete (the reply hit the output limit), so it was not run. ` +
+            'Send it again with less content in one call: for a large file, Write the first part and add the rest with Edit.',
+        };
+      }
       if (call.parseError) {
         return { call, tool, input: undefined, error: `The arguments for ${tool.name} were not valid JSON (${call.parseError}). Call the tool again with a valid JSON object.` };
       }
@@ -634,7 +710,8 @@ export class Agent {
       result = { content: `${tool.name} failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
     }
     const max = deps.settings.maxToolOutputChars ?? DEFAULTS.maxToolOutputChars;
-    if (result.content.length > max * 1.2) result = { ...result, content: clampOutput(result.content, max) };
+    // Anything still too large for the context is saved in full and shown trimmed.
+    if (result.content.length > max * 1.2) result = { ...result, content: spillOutput(session.id, call.id, result.content, max) };
 
     if (deps.hooks.has('PostToolUse')) {
       const post = await deps.hooks.run('PostToolUse', { tool_name: tool.name, tool_input: input, tool_response: result.content, tool_is_error: Boolean(result.isError) }, tool.name, signal);
@@ -725,7 +802,10 @@ export class Agent {
       return;
     }
     const tail = recentTail(this.messages, Math.floor(deps.client.profile.contextWindow * 0.2));
-    this.messages = [summaryMessage(summary, tail.length > 0), ...tail];
+    // The plan and working set are carried over verbatim rather than trusted to the summary.
+    const todos = deps.depth === 0 && deps.session.todos.some((t) => t.status !== 'completed') ? renderTodos(deps.session.todos) : undefined;
+    const files = deps.depth === 0 ? [...deps.session.readFiles.keys()].slice(-12).map((f) => displayPath(f, deps.session.cwd)) : [];
+    this.messages = [summaryMessage(summary, tail.length > 0, { todos, files }), ...tail];
     deps.transcript?.compacted(this.messages);
     this.lastUsage = undefined;
     this.usageIndex = 0;

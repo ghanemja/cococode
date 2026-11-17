@@ -71,6 +71,10 @@ export interface Settings {
   /** Context window in tokens. Detected from the server when unset. */
   contextWindow?: number;
   maxOutputTokens?: number;
+  /** How many times a request that failed for a transient reason is retried. */
+  maxRetries?: number;
+  /** Abort a request when the server sends nothing for this long (ms). 0 disables the check. */
+  requestTimeoutMs?: number;
   temperature?: number;
   /** true/false, or a level such as "low" | "medium" | "high" for models that take one. */
   thinking?: boolean | string;
@@ -112,6 +116,8 @@ export const DEFAULTS = {
   maxToolOutputChars: 30000,
   bashTimeoutMs: 120_000,
   bashMaxTimeoutMs: 600_000,
+  maxRetries: 4,
+  requestTimeoutMs: 600_000,
   keepAlive: '30m',
   cleanupPeriodDays: 30,
 } as const;
@@ -209,6 +215,10 @@ function envSettings(env: NodeJS.ProcessEnv): Settings {
   if (env.COCO_TOOL_MODE === 'native' || env.COCO_TOOL_MODE === 'prompt' || env.COCO_TOOL_MODE === 'auto') {
     s.toolMode = env.COCO_TOOL_MODE;
   }
+  const retries = Number(env.COCO_MAX_RETRIES);
+  if (env.COCO_MAX_RETRIES !== undefined && Number.isInteger(retries) && retries >= 0) s.maxRetries = retries;
+  const timeout = Number(env.COCO_REQUEST_TIMEOUT_MS);
+  if (env.COCO_REQUEST_TIMEOUT_MS !== undefined && Number.isFinite(timeout) && timeout >= 0) s.requestTimeoutMs = timeout;
   return s;
 }
 

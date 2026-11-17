@@ -206,8 +206,9 @@ export class Controller implements RuntimeHandle {
     try {
       available = await this.provider.listModels();
     } catch (err) {
-      // Hosted endpoints may not list models; only fail if we have nothing to go on.
-      if (!model) throw err;
+      // Hosted endpoints may not list models; only fail if we have nothing to go on,
+      // or if the server cannot be reached at all (retrying a chat request would not help).
+      if (!model || (err instanceof ProviderError && err.kind === 'connection')) throw err;
     }
     if (!model) {
       const ranked = rankModels(available ?? []);

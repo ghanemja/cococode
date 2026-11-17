@@ -304,8 +304,19 @@ describe('Bash tool', () => {
     const res = await sh('for i in $(seq 1 500); do echo "row $i"; done');
     assert.match(res.content, /characters truncated/);
     assert.ok(res.content.startsWith('row 1\n'));
-    assert.ok(res.content.endsWith('row 500'));
-    assert.ok(res.content.length < 800);
+    const [shown, note] = res.content.split('\n\n[The output was ');
+    assert.ok(shown!.endsWith('row 500'));
+    assert.ok(shown!.length < 800);
+    // Nothing is lost: the whole output is saved where the model can search it.
+    const saved = /All of it is saved at (\S+)\. Use Grep/.exec(note!)![1]!;
+    const lines = fs.readFileSync(saved, 'utf8').split('\n');
+    assert.equal(lines.length, 500);
+    assert.equal(lines[249], 'row 250');
+  });
+
+  test('output within the limit is returned as is, with nothing saved', async () => {
+    const res = await sh('echo short');
+    assert.equal(res.content, 'short');
   });
 
   test('label, read-only detection and the permission request', () => {

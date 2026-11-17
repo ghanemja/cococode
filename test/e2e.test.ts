@@ -172,12 +172,29 @@ describe('coco -p', () => {
     assert.equal(JSON.parse(res.stdout).subtype, 'error_max_turns');
   });
 
-  test('a server error is reported on stderr with exit code 1', async () => {
-    const server = await mock([{ error: { status: 500, message: 'out of memory' } }]);
+  test('a request the server rejects is reported on stderr with exit code 1', async () => {
+    const server = await mock([{ error: { status: 400, message: 'invalid request: out of memory' } }]);
     const res = await coco(project(), ['-p', 'hi', ...base(server)]);
     assert.equal(res.code, 1);
     assert.equal(res.stdout, '');
     assert.match(res.stderr, /out of memory/);
+    assert.equal(server.requests.length, 1);
+  });
+
+  test('a transient server error is retried and the run still succeeds', async () => {
+    const server = await mock([{ error: { status: 503, message: 'model is loading' } }, { text: 'Ready now.' }]);
+    const res = await coco(project(), ['-p', 'hi', ...base(server)]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(res.stdout, 'Ready now.\n');
+    assert.match(res.stderr, /model is loading Retrying in 500ms \(attempt 1 of 4\)/);
+    assert.equal(server.requests.length, 2);
+  });
+
+  test('retries can be switched off', async () => {
+    const server = await mock([{ error: { status: 503, message: 'model is loading' } }, { text: 'never' }]);
+    const res = await coco(project(), ['-p', 'hi', ...base(server)], { env: { COCO_MAX_RETRIES: '0' } });
+    assert.equal(res.code, 1);
+    assert.equal(server.requests.length, 1);
   });
 
   test('no prompt and no server are explained, not crashed on', async () => {

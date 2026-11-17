@@ -133,7 +133,7 @@ async function collect(gen: AsyncGenerator<StreamEvent>): Promise<Collected> {
     else if (ev.type === 'thinking') out.thinking += ev.text;
     else if (ev.type === 'tool_call') out.calls.push(ev.call);
     else if (ev.type === 'usage') out.usage = ev.usage;
-    else out.stop = ev.stopReason;
+    else if (ev.type === 'done') out.stop = ev.stopReason;
   }
   return out;
 }
@@ -1896,7 +1896,10 @@ describe('ModelClient.complete', () => {
     assert.deepEqual(req.messages, [{ role: 'user', content: 'Summarise this.' }]);
     assert.deepEqual(req.tools, []);
     assert.equal(req.maxTokens, 300);
-    assert.equal(req.signal, ctrl.signal);
+    // The request carries a signal that follows the caller's (combined with the stall guard).
+    assert.equal(req.signal!.aborted, false);
+    ctrl.abort();
+    assert.equal(req.signal!.aborted, true);
   });
 
   test('errors propagate', async () => {

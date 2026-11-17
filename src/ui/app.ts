@@ -833,6 +833,9 @@ export class App implements CommandIO {
         this.toolRuns.delete(ev.call.id);
         this.printToolResult(ev.call.id, ev.call.name, ev.result);
         break;
+      case 'progress':
+        this.streamChars += ev.chars;
+        break;
       case 'usage':
         this.turnOutputTokens += ev.usage.outputTokens;
         this.streamChars = 0;

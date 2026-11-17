@@ -80,13 +80,25 @@ export function recentTail(messages: Message[], maxTokens: number): Message[] {
   return [];
 }
 
-export function summaryMessage(summary: string, hasTail: boolean): Message {
+export interface CarriedState {
+  /** The task list, already rendered. */
+  todos?: string;
+  /** Files the model had read or edited, most recent last. */
+  files?: string[];
+}
+
+export function summaryMessage(summary: string, hasTail: boolean, state: CarriedState = {}): Message {
+  // The plan and the working set are restated exactly, not left to the summary to remember.
+  const extras: string[] = [];
+  if (state.todos) extras.push(`Your task list at this point:\n${state.todos}`);
+  if (state.files?.length) extras.push(`Files you had open (their contents are no longer in context; Read them again before relying on them): ${state.files.join(', ')}`);
   return {
     role: 'user',
     isMeta: true,
     content:
       'This session is continuing from an earlier conversation that was compacted to save context. Summary of what happened so far:\n\n' +
       summary.trim() +
+      (extras.length ? `\n\n${extras.join('\n\n')}` : '') +
       (hasTail
         ? '\n\nThe most recent messages follow unchanged.'
         : '\n\nContinue the work from where it left off. Do not ask the user to repeat anything; files may need to be Read again before editing.'),

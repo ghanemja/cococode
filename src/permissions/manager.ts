@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { PROJECT_DIR, configDir, displayPath, expandHome, readJsonFile } from '../config/paths.ts';
+import { PROJECT_DIR, configDir, displayPath, expandHome, readJsonFile, toolResultsDir } from '../config/paths.ts';
 import type { PermissionSettings, Settings, SettingsScope } from '../config/settings.ts';
 import { settingsPath, updateSettingsFile } from '../config/settings.ts';
 import type { SessionState } from '../session/state.ts';
@@ -264,6 +264,8 @@ export class PermissionManager {
     switch (req.kind) {
       case 'read':
         if (!req.target || this.session.inWorkingDirs(req.target)) return { behavior: 'allow' };
+        // Output this session saved because it was too large for the context.
+        if (isInside(realpathSafe(req.target), realpathSafe(toolResultsDir(this.session.id)))) return { behavior: 'allow' };
         return this.askOutcome(req);
       case 'edit':
         if (isProtected) return this.askOutcome(req, 'This file controls how coco, git or your shell behaves.');

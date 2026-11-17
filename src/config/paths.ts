@@ -44,6 +44,11 @@ export function fileHistoryDir(sessionId: string): string {
   return path.join(configDir(), 'file-history', sessionId);
 }
 
+/** Where tool output too large for the context is kept so the model can search it. */
+export function toolResultsDir(sessionId: string): string {
+  return path.join(configDir(), 'tool-results', sessionId);
+}
+
 /**
  * Nearest ancestor that looks like a project root (has .git or .coco).
  * Falls back to the directory itself.
