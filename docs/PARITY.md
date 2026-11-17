@@ -10,7 +10,7 @@ What coco does match is the core loop and the conventions around it: the tools, 
 
 ## What has been verified, and what has not
 
-- **Verified:** every behaviour listed as matched below has automated tests. They run the real program against a scripted model server that speaks both wire formats (Ollama and OpenAI-compatible), and drive the terminal UI through a pseudo-terminal.
+- **Verified:** about 2,360 automated tests. They run the real program against a scripted model server that speaks both wire formats (Ollama and OpenAI-compatible), and drive the terminal UI through a pseudo-terminal. Coverage is thorough for the mechanisms (recovery, tools, permissions, hooks, memory, skills, subagents, MCP, sessions, headless mode) and lighter for commands that only display something.
 - **Not verified:** coco has never been run against a real model. The environment it was built in could not run one. The scripted server reproduces failures (dropped connections, cut-off replies, malformed tool calls, tool calls written as text), but it cannot reproduce a real model's judgment.
 
 That gap matters. Much of what makes Claude Code effective is the model behind it, and no agent program can make a small local model reason like a large hosted one. What the program can do is avoid wasting the model's ability: keep the context window from being silently truncated, accept tool calls in whatever form the model writes them, repair near-miss arguments, and recover from failures instead of ending the turn. To find out where your own model stands, run:
@@ -97,7 +97,7 @@ Without a sandbox, permission rules are a guard against accidents, not a securit
 
 | | |
 | --- | --- |
-| Matched | `SKILL.md` and command files with front matter `description`, `when_to_use`, `argument-hint`, `arguments`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, `context: fork`, `agent`, `model`; `$ARGUMENTS`, positional and named arguments; `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}`, `${CLAUDE_PROJECT_DIR}`; inline and fenced `!` commands checked against `allowed-tools`; a listing in the system prompt sized to the context window; skills surviving compaction; user, project and `.claude` locations; namespaced commands |
+| Matched | `SKILL.md` and command files with front matter `description`, `when_to_use`, `argument-hint`, `arguments`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, `context: fork`, `agent`; `$ARGUMENTS`, positional and named arguments; `${CLAUDE_SKILL_DIR}`, `${CLAUDE_SESSION_ID}`, `${CLAUDE_PROJECT_DIR}`; inline and fenced `!` commands checked against `allowed-tools`; a listing in the system prompt sized to the context window; skills surviving compaction; user, project and `.claude` locations; namespaced commands |
 | Partial | `model` and `effort` on a skill are parsed but do not switch the model for the turn. `paths` (load a skill only for matching files) is parsed and not applied |
 | Missing | Skill-scoped hooks, plugin-provided skills, live reload when a skill file changes (use `/reload-skills`) |
 
@@ -126,7 +126,7 @@ Without a sandbox, permission rules are a guard against accidents, not a securit
 
 | | |
 | --- | --- |
-| Matched | Streaming Markdown with syntax highlighting; diffs in permission prompts; `@` file completion; `/` command completion; `!` shell mode; multi-line input (`\` + enter, alt+enter, ctrl+j, shift+enter where the terminal reports it, pasted text); message queueing while the model works; esc to interrupt and esc esc to rewind; shift+tab mode cycle; prompt history and reverse search; external editor; emacs-style line editing with kill, yank and undo; stashing a draft; background shells; task list; status line command; output styles; terminal bell |
+| Matched | Streaming Markdown with syntax highlighting; diffs in permission prompts; `@` file completion; `/` command completion; `!` shell mode; multi-line input (`\` + enter, alt+enter, ctrl+j, shift+enter where the terminal reports it, pasted text); message queueing while the model works, and taking a queued message back with up; esc to interrupt and esc esc to rewind; shift+tab mode cycle; prompt history and reverse search (ctrl+r); external editor (ctrl+g); emacs-style line editing with kill, yank and undo; stashing a draft (ctrl+s); moving a running command to the background (ctrl+b); task list (ctrl+t); model and thinking switches (alt+p, alt+t); the `?` shortcut panel; suspend (ctrl+z); status line command; output styles; terminal bell |
 | Missing | Vim mode, custom key bindings, themes, pasting images from the clipboard, the full-screen transcript viewer, prompt suggestions, voice input, mouse support |
 
 ### Sessions and headless mode
